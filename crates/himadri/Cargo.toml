@@ -1,0 +1,75 @@
+[package]
+name = "himadri"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "himadri"
+path = "src/main.rs"
+
+[[bench]]
+name = "gateway_bench"
+harness = false
+
+[features]
+default = []
+redis = [
+    "himadri-circuitbreaker/redis",
+    "himadri-ratelimit/redis",
+    "dep:redis",
+]
+
+[dependencies]
+himadri-core = { path = "../himadri-core" }
+himadri-provider = { path = "../himadri-provider" }
+himadri-plugin = { path = "../himadri-plugin" }
+himadri-plugins = { path = "../himadri-plugins" }
+himadri-admin = { path = "../himadri-admin", features = ["postgres"] }
+himadri-observability = { path = "../himadri-observability" }
+himadri-ratelimit = { path = "../himadri-ratelimit" }
+himadri-circuitbreaker = { path = "../himadri-circuitbreaker" }
+regex = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+clap = { workspace = true }
+async-stream = "0.3"
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+once_cell = "1"
+prometheus = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres"] }
+async-trait = "0.1"
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"], optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+himadri-core = { path = "../himadri-core" }
+himadri-provider = { path = "../himadri-provider" }
+himadri-plugin = { path = "../himadri-plugin" }
+himadri-plugins = { path = "../himadri-plugins" }
+himadri-admin = { path = "../himadri-admin" }
+himadri-observability = { path = "../himadri-observability" }
+himadri-ratelimit = { path = "../himadri-ratelimit" }
+himadri-circuitbreaker = { path = "../himadri-circuitbreaker" }
+himadri-auth = { path = "../himadri-auth" }
+himadri-gateway = { path = "../himadri", package = "himadri" }
+axum = { workspace = true }
+tower-http = { workspace = true }
+async-trait = { workspace = true }
+async-stream = "0.3"
+futures = { workspace = true }

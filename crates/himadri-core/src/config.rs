@@ -1,0 +1,425 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::error::ConfigError;
+use crate::types::Target;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub strategy: StrategyConfig,
+
+    #[serde(default)]
+    pub targets: Vec<Target>,
+
+    #[serde(default)]
+    pub plugins: Vec<PluginConfig>,
+
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+
+    #[serde(default)]
+    pub admin: AdminConfig,
+
+    #[serde(default)]
+    pub orgs: HashMap<String, OrgConfig>,
+
+    #[serde(default)]
+    pub cors: CorsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    #[serde(default = "default_cors_methods")]
+    pub allowed_methods: Vec<String>,
+
+    #[serde(default = "default_cors_headers")]
+    pub allowed_headers: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: Vec::new(),
+            allowed_methods: default_cors_methods(),
+            allowed_headers: default_cors_headers(),
+        }
+    }
+}
+
+fn default_cors_methods() -> Vec<String> {
+    vec![
+        "GET".into(),
+        "POST".into(),
+        "PUT".into(),
+        "DELETE".into(),
+        "OPTIONS".into(),
+    ]
+}
+
+fn default_cors_headers() -> Vec<String> {
+    vec!["Authorization".into(), "Content-Type".into()]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OrgConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub blocked_models: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+
+    #[serde(default)]
+    pub token_budget: Option<OrgTokenBudget>,
+
+    #[serde(default)]
+    pub guardrails: OrgGuardrailConfig,
+
+    #[serde(default)]
+    pub teams: HashMap<String, TeamConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TeamConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub blocked_models: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+
+    #[serde(default)]
+    pub token_budget: Option<OrgTokenBudget>,
+
+    #[serde(default)]
+    pub guardrails: OrgGuardrailConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OrgTokenBudget {
+    #[serde(default)]
+    pub max_tokens_per_request: Option<u32>,
+
+    #[serde(default)]
+    pub max_tokens_per_day: Option<u64>,
+
+    #[serde(default)]
+    pub max_tokens_per_month: Option<u64>,
+
+    #[serde(default)]
+    pub cost_limit_per_day: Option<f64>,
+
+    #[serde(default)]
+    pub cost_limit_per_month: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OrgGuardrailConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub blocked_words: Vec<String>,
+
+    #[serde(default)]
+    pub max_tokens_per_request: Option<u32>,
+
+    #[serde(default)]
+    pub content_filter: Option<ContentFilterConfig>,
+
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContentFilterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub block_pii: bool,
+
+    #[serde(default)]
+    pub block_toxicity: bool,
+
+    #[serde(default)]
+    pub custom_patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub log_requests: bool,
+
+    #[serde(default)]
+    pub log_responses: bool,
+
+    #[serde(default)]
+    pub redact_pii: bool,
+
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyConfig {
+    #[serde(default = "default_strategy_mode")]
+    pub mode: StrategyMode,
+
+    #[serde(default)]
+    pub fallback_timeout_ms: u64,
+}
+
+impl Default for StrategyConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_strategy_mode(),
+            fallback_timeout_ms: 30000,
+        }
+    }
+}
+
+fn default_strategy_mode() -> StrategyMode {
+    StrategyMode::Single
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StrategyMode {
+    Single,
+    Fallback,
+    LoadBalance,
+    LeastLatency,
+    CostOptimized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginConfig {
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub tracing: TracingConfig,
+
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TracingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+impl Default for TracingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: default_service_name(),
+            endpoint: None,
+            sample_ratio: default_sample_ratio(),
+        }
+    }
+}
+
+fn default_service_name() -> String {
+    "himadri".to_string()
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: default_metrics_path(),
+        }
+    }
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_rate_limit_rps")]
+    pub requests_per_second: u64,
+
+    #[serde(default = "default_rate_limit_burst")]
+    pub burst_size: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests_per_second: default_rate_limit_rps(),
+            burst_size: default_rate_limit_burst(),
+        }
+    }
+}
+
+fn default_rate_limit_rps() -> u64 {
+    100
+}
+
+fn default_rate_limit_burst() -> u64 {
+    200
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_enabled")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub master_key: Option<String>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            master_key: None,
+        }
+    }
+}
+
+fn default_admin_enabled() -> bool {
+    true
+}
+
+impl Config {
+    pub fn load_from_env() -> Result<Self, ConfigError> {
+        if let Ok(path) = std::env::var("GATEWAY_CONFIG") {
+            return Self::load_from_file(&path);
+        }
+
+        Ok(Self::default_config())
+    }
+
+    pub fn load_from_file(path: &str) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path)?;
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("json");
+
+        let config = match ext {
+            "json" => serde_json::from_str::<Config>(&content)
+                .map_err(|e| ConfigError::Parse(e.to_string()))?,
+            _ => {
+                return Err(ConfigError::InvalidValue {
+                    field: "config_file".to_string(),
+                    reason: format!("unsupported extension: {}", ext),
+                })
+            }
+        };
+
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.targets.is_empty() {
+            return Err(ConfigError::MissingField("targets".to_string()));
+        }
+
+        for target in &self.targets {
+            if target.provider.is_empty() {
+                return Err(ConfigError::MissingField("target.provider".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn default_config() -> Self {
+        Self {
+            strategy: StrategyConfig::default(),
+            targets: vec![Target {
+                provider: "openai".to_string(),
+                weight: 1.0,
+                models: None,
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
+                base_url: None,
+            }],
+            plugins: vec![],
+            observability: ObservabilityConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            admin: AdminConfig::default(),
+            orgs: HashMap::new(),
+            cors: CorsConfig::default(),
+        }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}

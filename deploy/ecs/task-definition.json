@@ -1,0 +1,53 @@
+{
+  "family": "himadri",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "256",
+  "executionRoleArn": "arn:aws:iam::ROLE/himadri-execution",
+  "taskRoleArn": "arn:aws:iam::ROLE/himadri-task",
+  "containerDefinitions": [
+    {
+      "name": "himadri",
+      "image": "ghcr.io/ferro-labs/ai-gateway-rust:latest",
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "PORT", "value": "8080" },
+        { "name": "RUST_LOG", "value": "himadri=info,tower_http=info" },
+        { "name": "API_KEY_STORE_BACKEND", "value": "postgres" }
+      ],
+      "secrets": [
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:himadri/database-url" },
+        { "name": "REDIS_URL", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:himadri/redis-url" },
+        { "name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:himadri/openai-api-key" },
+        { "name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:himadri/anthropic-api-key" },
+        { "name": "GEMINI_API_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:himadri/gemini-api-key" },
+        { "name": "MASTER_KEY", "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:himadri/master-key" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 15
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/himadri",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      },
+      "linuxParameters": {
+        "initProcessEnabled": true
+      }
+    }
+  ]
+}

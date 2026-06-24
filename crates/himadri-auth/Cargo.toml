@@ -1,0 +1,21 @@
+[package]
+name = "himadri-auth"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+himadri-core = { path = "../himadri-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = "2"
+jsonwebtoken = "9"
+reqwest = { workspace = true }
+chrono = { workspace = true }
+base64 = "0.22"
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+axum = { workspace = true }
+once_cell = "1"

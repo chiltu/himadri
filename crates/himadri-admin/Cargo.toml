@@ -1,0 +1,24 @@
+[package]
+name = "himadri-admin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+himadri-core = { path = "../himadri-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = "2"
+uuid = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+parking_lot = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"], optional = true }
+
+[features]
+default = []
+postgres = ["dep:sqlx"]

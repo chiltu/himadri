@@ -1,0 +1,30 @@
+{
+  "serviceName": "himadri",
+  "cluster": "himadri-production",
+  "taskDefinition": "himadri",
+  "desiredCount": 2,
+  "launchType": "FARGATE",
+  "networkConfiguration": {
+    "awsvpcConfiguration": {
+      "subnets": ["subnet-XXXXX", "subnet-YYYYY"],
+      "securityGroups": ["sg-XXXXX"],
+      "assignPublicIp": "DISABLED"
+    }
+  },
+  "loadBalancers": [
+    {
+      "targetGroupArn": "arn:aws:elasticloadbalancing:REGION:ACCOUNT:targetgroup/himadri/XXXXX",
+      "containerName": "himadri",
+      "containerPort": 8080
+    }
+  ],
+  "healthCheckGracePeriodSeconds": 60,
+  "deploymentConfiguration": {
+    "maximumPercent": 200,
+    "minimumHealthyPercent": 100,
+    "deploymentCircuitBreaker": {
+      "enable": true,
+      "rollback": true
+    }
+  }
+}

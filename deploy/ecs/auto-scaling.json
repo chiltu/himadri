@@ -1,0 +1,37 @@
+{
+  "scalableTargets": [
+    {
+      "ServiceNamespace": "ecs",
+      "ResourceId": "service/himadri-production/himadri",
+      "ScalableDimension": "ecs:service:DesiredCount",
+      "MinCapacity": 2,
+      "MaxCapacity": 20
+    }
+  ],
+  "scalingPolicies": [
+    {
+      "PolicyName": "himadri-cpu-scaling",
+      "PolicyType": "TargetTrackingScaling",
+      "TargetTrackingScalingPolicyConfiguration": {
+        "TargetedValue": 70.0,
+        "PredefinedMetricSpecification": {
+          "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
+        },
+        "ScaleInCooldown": 60,
+        "ScaleOutCooldown": 30
+      }
+    },
+    {
+      "PolicyName": "himadri-memory-scaling",
+      "PolicyType": "TargetTrackingScaling",
+      "TargetTrackingScalingPolicyConfiguration": {
+        "TargetedValue": 80.0,
+        "PredefinedMetricSpecification": {
+          "PredefinedMetricType": "ECSServiceAverageMemoryUtilization"
+        },
+        "ScaleInCooldown": 60,
+        "ScaleOutCooldown": 30
+      }
+    }
+  ]
+}

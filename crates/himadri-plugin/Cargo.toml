@@ -1,0 +1,12 @@
+[package]
+name = "himadri-plugin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+himadri-core = { path = "../himadri-core" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

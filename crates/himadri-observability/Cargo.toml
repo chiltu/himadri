@@ -1,0 +1,25 @@
+[package]
+name = "himadri-observability"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+himadri-core = { path = "../himadri-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+regex = "1"
+
+# OTel dependencies (optional, enabled via "otlp" feature)
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+
+[features]
+default = []
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]

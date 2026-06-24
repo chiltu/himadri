@@ -1,0 +1,20 @@
+[package]
+name = "load-test-sink"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "load_test_sink"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-stream = "0.3"
