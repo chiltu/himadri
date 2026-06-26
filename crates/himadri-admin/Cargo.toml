@@ -17,8 +17,9 @@ rand = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 parking_lot = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "chrono", "uuid"], optional = true }
 
 [features]
-default = []
-postgres = ["dep:sqlx"]
+default = ["sqlite"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+postgres = ["dep:sqlx", "sqlx/postgres"]

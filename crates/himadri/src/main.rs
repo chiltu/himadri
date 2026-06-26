@@ -232,7 +232,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let admin = Arc::new(AdminHandlers::new(store.clone(), master_key.clone()));
+    // Initialize provider and model stores if SQLite is configured
+    let mut admin = AdminHandlers::new(store.clone(), master_key.clone());
+    #[cfg(feature = "sqlite")]
+    if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        if database_url.starts_with("sqlite") {
+            if let Ok(pool) = sqlx::SqlitePool::connect(&format!("{}?mode=rwc", database_url)).await {
+                let provider_store = himadri_admin::ProviderStore::new(pool.clone());
+                let model_store = himadri_admin::ModelStore::new(pool.clone());
+                admin = admin.with_provider_model_stores(provider_store, model_store);
+                info!("Initialized provider and model stores");
+            }
+        }
+    }
+    let admin = Arc::new(admin);
     let auth = Arc::new(AuthMiddleware::new(store.clone(), master_key.clone()));
 
     let state = AppState {
@@ -264,6 +277,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/admin/keys/{id}", delete(delete_key))
         .route("/admin/keys/{id}/revoke", post(revoke_key))
         .route("/admin/keys/{id}/rotate", post(rotate_key))
+        .route("/admin/providers", get(list_providers))
+        .route("/admin/providers", post(create_provider))
+        .route("/admin/providers/{id}", get(get_provider))
+        .route("/admin/providers/{id}", put(update_provider))
+        .route("/admin/providers/{id}", delete(delete_provider))
+        .route("/admin/providers/{id}/toggle", post(toggle_provider))
+        .route("/admin/models", get(list_models_api))
+        .route("/admin/models", post(create_model))
+        .route("/admin/models/{id}", get(get_model))
+        .route("/admin/models/{id}", put(update_model))
+        .route("/admin/models/{id}", delete(delete_model))
+        .route("/admin/models/{id}/toggle", post(toggle_model))
         .route("/admin/dashboard", get(dashboard))
         .route("/admin/usage", get(usage_stats))
         .route("/admin/usage/{key_id}", get(key_usage_stats))
@@ -807,6 +832,180 @@ async fn delete_logs(
         .delete(query)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({ "deleted": deleted })))
+}
+
+// ─── Provider Handlers ───────────────────────────────────────────────
+
+async fn list_providers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<himadri_admin::Provider>>, (StatusCode, String)> {
+    let admin = state.admin.as_ref();
+    Ok(Json(admin.list_providers().await))
+}
+
+async fn create_provider(
+    State(state): State<AppState>,
+    Json(request): Json<himadri_admin::CreateProviderRequest>,
+) -> Result<(StatusCode, Json<himadri_admin::Provider>), (StatusCode, String)> {
+    let admin = state.admin.as_ref();
+    match admin.create_provider(request).await {
+        Some(p) => {
+            // Rebuild routing targets
+            let providers = admin.list_providers().await;
+            let models = admin.list_models().await;
+            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            Ok((StatusCode::CREATED, Json(p)))
+        }
+        None => Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to create provider".to_string())),
+    }
+}
+
+async fn get_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<himadri_admin::Provider>, StatusCode> {
+    let admin = state.admin.as_ref();
+    admin.get_provider(&id).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn update_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<himadri_admin::UpdateProviderRequest>,
+) -> Result<Json<himadri_admin::Provider>, StatusCode> {
+    let admin = state.admin.as_ref();
+    match admin.update_provider(&id, request).await {
+        Some(p) => {
+            // Rebuild routing targets
+            let providers = admin.list_providers().await;
+            let models = admin.list_models().await;
+            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            Ok(Json(p))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn delete_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let admin = state.admin.as_ref();
+    if admin.delete_provider(&id).await {
+        // Rebuild routing targets
+        let providers = admin.list_providers().await;
+        let models = admin.list_models().await;
+        state.gateway.rebuild_targets_from_db(&providers, &models).await;
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn toggle_provider(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<himadri_admin::Provider>, StatusCode> {
+    let admin = state.admin.as_ref();
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    match admin.toggle_provider(&id, enabled).await {
+        Some(p) => {
+            // Rebuild routing targets
+            let providers = admin.list_providers().await;
+            let models = admin.list_models().await;
+            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            Ok(Json(p))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+// ─── Model Handlers ──────────────────────────────────────────────────
+
+async fn list_models_api(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<himadri_admin::Model>>, (StatusCode, String)> {
+    let admin = state.admin.as_ref();
+    Ok(Json(admin.list_models().await))
+}
+
+async fn create_model(
+    State(state): State<AppState>,
+    Json(request): Json<himadri_admin::CreateModelRequest>,
+) -> Result<(StatusCode, Json<himadri_admin::Model>), (StatusCode, String)> {
+    let admin = state.admin.as_ref();
+    match admin.create_model(request).await {
+        Some(m) => {
+            // Rebuild routing targets
+            let providers = admin.list_providers().await;
+            let models = admin.list_models().await;
+            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            Ok((StatusCode::CREATED, Json(m)))
+        }
+        None => Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to create model".to_string())),
+    }
+}
+
+async fn get_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<himadri_admin::Model>, StatusCode> {
+    let admin = state.admin.as_ref();
+    admin.get_model(&id).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn update_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<himadri_admin::UpdateModelRequest>,
+) -> Result<Json<himadri_admin::Model>, StatusCode> {
+    let admin = state.admin.as_ref();
+    match admin.update_model(&id, request).await {
+        Some(m) => {
+            // Rebuild routing targets
+            let providers = admin.list_providers().await;
+            let models = admin.list_models().await;
+            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            Ok(Json(m))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn delete_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let admin = state.admin.as_ref();
+    if admin.delete_model(&id).await {
+        // Rebuild routing targets
+        let providers = admin.list_providers().await;
+        let models = admin.list_models().await;
+        state.gateway.rebuild_targets_from_db(&providers, &models).await;
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn toggle_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<himadri_admin::Model>, StatusCode> {
+    let admin = state.admin.as_ref();
+    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    match admin.toggle_model(&id, enabled).await {
+        Some(m) => {
+            // Rebuild routing targets
+            let providers = admin.list_providers().await;
+            let models = admin.list_models().await;
+            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            Ok(Json(m))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 fn error_to_response(e: GatewayError) -> Response {

@@ -108,23 +108,45 @@ pub enum StoreBackend {
     Memory(Arc<ApiKeyStore>),
     #[cfg(feature = "postgres")]
     Postgres(Arc<PostgresStore>),
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<SqliteStore>),
 }
 
 impl StoreBackend {
     pub async fn new() -> Self {
+        // Check for Postgres first
         #[cfg(feature = "postgres")]
         if let Ok(database_url) = std::env::var("DATABASE_URL") {
-            match PostgresStore::new(&database_url).await {
-                Ok(store) => {
-                    tracing::info!("Connected to Postgres store");
-                    return StoreBackend::Postgres(Arc::new(store));
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to Postgres: {}, using in-memory", e);
+            if database_url.starts_with("postgres") {
+                match PostgresStore::new(&database_url).await {
+                    Ok(store) => {
+                        tracing::info!("Connected to Postgres store");
+                        return StoreBackend::Postgres(Arc::new(store));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to Postgres: {}, falling back", e);
+                    }
                 }
             }
         }
-        tracing::info!("Using in-memory store (set DATABASE_URL for Postgres)");
+
+        // Check for SQLite
+        #[cfg(feature = "sqlite")]
+        if let Ok(database_url) = std::env::var("DATABASE_URL") {
+            if database_url.starts_with("sqlite") {
+                match SqliteStore::new(&database_url).await {
+                    Ok(store) => {
+                        tracing::info!("Connected to SQLite store");
+                        return StoreBackend::Sqlite(Arc::new(store));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to connect to SQLite: {}, falling back", e);
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Using in-memory store (set DATABASE_URL for Postgres/SQLite)");
         StoreBackend::Memory(Arc::new(ApiKeyStore::new()))
     }
 
@@ -133,6 +155,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.create(request)),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.create(request).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.create(request).await.map_err(|e| e.to_string()),
         }
     }
 
@@ -141,6 +165,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.get(id)),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.get(id).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.get(id).await.map_err(|e| e.to_string()),
         }
     }
 
@@ -149,6 +175,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.list()),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.list().await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.list().await.map_err(|e| e.to_string()),
         }
     }
 
@@ -163,6 +191,10 @@ impl StoreBackend {
             StoreBackend::Postgres(store) => {
                 store.update(id, request).await.map_err(|e| e.to_string())
             }
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => {
+                store.update(id, request).await.map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -171,6 +203,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.delete(id)),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.delete(id).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.delete(id).await.map_err(|e| e.to_string()),
         }
     }
 
@@ -179,6 +213,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.validate(key)),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.validate(key).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.validate(key).await.map_err(|e| e.to_string()),
         }
     }
 
@@ -187,6 +223,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.revoke(id)),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.revoke(id).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.revoke(id).await.map_err(|e| e.to_string()),
         }
     }
 
@@ -195,6 +233,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => Ok(store.rotate(id)),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(store) => store.rotate(id).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.rotate(id).await.map_err(|e| e.to_string()),
         }
     }
 
@@ -203,6 +243,8 @@ impl StoreBackend {
             StoreBackend::Memory(store) => store.list().is_empty(),
             #[cfg(feature = "postgres")]
             StoreBackend::Postgres(_) => false,
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(_) => false,
         }
     }
 }
@@ -363,40 +405,12 @@ pub struct PostgresStore {
 impl PostgresStore {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = sqlx::PgPool::connect(database_url).await?;
-        Self::run_migrations(&pool).await?;
+        // Run embedded migrations - tracks version, only applies pending ones
+        sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
-    }
-
-    async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS api_keys (
-                id UUID PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                key VARCHAR(255) NOT NULL UNIQUE,
-                scopes JSONB NOT NULL DEFAULT '[]',
-                enabled BOOLEAN NOT NULL DEFAULT true,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_used_at TIMESTAMPTZ,
-                expires_at TIMESTAMPTZ,
-                usage_count BIGINT NOT NULL DEFAULT 0,
-                metadata JSONB,
-                org_id VARCHAR(255),
-                team_id VARCHAR(255),
-                user_id VARCHAR(255),
-                models JSONB,
-                rate_limit_override JSONB,
-                token_budget JSONB
-            );
-            CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
-            CREATE INDEX IF NOT EXISTS idx_api_keys_enabled ON api_keys(enabled);
-            CREATE INDEX IF NOT EXISTS idx_api_keys_org_id ON api_keys(org_id);
-            CREATE INDEX IF NOT EXISTS idx_api_keys_team_id ON api_keys(team_id);
-            "#,
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, sqlx::Error> {
@@ -624,6 +638,176 @@ impl From<ApiKeyRow> for ApiKey {
                 .rate_limit_override
                 .and_then(|v| serde_json::from_value(v).ok()),
             token_budget: r.token_budget.and_then(|v| serde_json::from_value(v).ok()),
+        }
+    }
+}
+
+// ─── SQLite Store ────────────────────────────────────────────────────
+
+#[cfg(feature = "sqlite")]
+pub struct SqliteStore {
+    pool: sqlx::SqlitePool,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteStore {
+    pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+        // Ensure SQLite creates the file if it doesn't exist
+        let url = if database_url.contains('?') {
+            database_url.to_string()
+        } else {
+            format!("{}?mode=rwc", database_url)
+        };
+        let pool = sqlx::SqlitePool::connect(&url).await?;
+        // Run embedded migrations - tracks version, only applies pending ones
+        sqlx::migrate!("migrations/sqlite")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
+        Ok(Self { pool })
+    }
+
+    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, sqlx::Error> {
+        let id = Uuid::new_v4().to_string();
+        let key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let scopes = serde_json::to_value(&request.scopes).unwrap_or_default();
+        let models = request.models.as_ref().map(|m| serde_json::to_value(m).unwrap_or_default());
+        let rate_limit = request.rate_limit_override.as_ref().map(|r| serde_json::to_value(r).unwrap_or_default());
+        let budget = request.token_budget.as_ref().map(|b| serde_json::to_value(b).unwrap_or_default());
+
+        sqlx::query(
+            r#"INSERT INTO api_keys (id, name, key, scopes, enabled, created_at, expires_at, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget)
+               VALUES (?, ?, ?, ?, 1, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&id).bind(&request.name).bind(&key).bind(&scopes)
+        .bind(request.expires_at.map(|dt| dt.to_rfc3339())).bind(request.metadata.map(|m| m.to_string()))
+        .bind(&request.org_id).bind(&request.team_id).bind(&request.user_id)
+        .bind(models.map(|m| m.to_string())).bind(rate_limit.map(|r| r.to_string())).bind(budget.map(|b| b.to_string()))
+        .execute(&self.pool)
+        .await?;
+
+        self.get(&id).await?.ok_or(sqlx::Error::RowNotFound)
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+        let row = sqlx::query_as::<_, SqliteApiKeyRow>(
+            "SELECT id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget FROM api_keys WHERE id = ?",
+        ).bind(id).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn list(&self) -> Result<Vec<ApiKey>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, SqliteApiKeyRow>(
+            "SELECT id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget FROM api_keys ORDER BY created_at DESC",
+        ).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    pub async fn update(&self, id: &str, request: UpdateApiKeyRequest) -> Result<Option<ApiKey>, sqlx::Error> {
+        // Fetch current record, apply changes, save back
+        let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
+
+        let name = request.name.unwrap_or(current.name);
+        let scopes = request.scopes.unwrap_or(current.scopes);
+        let enabled = request.enabled.unwrap_or(current.enabled);
+        let metadata = request.metadata.unwrap_or(current.metadata);
+        let org_id = request.org_id.unwrap_or(current.org_id);
+        let team_id = request.team_id.unwrap_or(current.team_id);
+        let user_id = request.user_id.unwrap_or(current.user_id);
+
+        let scopes_json = serde_json::to_value(&scopes).unwrap_or_default().to_string();
+        let enabled_int = enabled as i32;
+        let metadata_str = metadata.as_ref().map(|m| m.to_string());
+
+        sqlx::query(
+            "UPDATE api_keys SET name = ?, scopes = ?, enabled = ?, metadata = ?, org_id = ?, team_id = ?, user_id = ? WHERE id = ?",
+        )
+        .bind(&name).bind(&scopes_json).bind(enabled_int).bind(&metadata_str)
+        .bind(&org_id).bind(&team_id).bind(&user_id).bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        self.get(id).await
+    }
+
+    pub async fn delete(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let r = sqlx::query("DELETE FROM api_keys WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+        let row = sqlx::query_as::<_, SqliteApiKeyRow>(
+            r#"UPDATE api_keys SET last_used_at = datetime('now'), usage_count = usage_count + 1
+               WHERE key = ? AND enabled = 1 AND (expires_at IS NULL OR expires_at > datetime('now'))
+               RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget"#,
+        ).bind(key).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn revoke(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let r = sqlx::query("UPDATE api_keys SET enabled = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+        let new_key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        sqlx::query("UPDATE api_keys SET key = ? WHERE id = ?")
+            .bind(&new_key).bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.get(id).await
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Debug, sqlx::FromRow)]
+struct SqliteApiKeyRow {
+    id: String,
+    name: String,
+    key: String,
+    scopes: String,
+    enabled: i32,
+    created_at: String,
+    last_used_at: Option<String>,
+    expires_at: Option<String>,
+    usage_count: i64,
+    metadata: Option<String>,
+    org_id: Option<String>,
+    team_id: Option<String>,
+    user_id: Option<String>,
+    models: Option<String>,
+    rate_limit_override: Option<String>,
+    token_budget: Option<String>,
+}
+
+#[cfg(feature = "sqlite")]
+impl From<SqliteApiKeyRow> for ApiKey {
+    fn from(r: SqliteApiKeyRow) -> Self {
+        ApiKey {
+            id: r.id,
+            name: r.name,
+            key: r.key,
+            scopes: serde_json::from_str(&r.scopes).unwrap_or_default(),
+            enabled: r.enabled != 0,
+            created_at: DateTime::parse_from_rfc3339(&r.created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_default(),
+            last_used_at: r.last_used_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
+            expires_at: r.expires_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
+            usage_count: r.usage_count as u64,
+            metadata: r.metadata.and_then(|s| serde_json::from_str(&s).ok()),
+            org_id: r.org_id,
+            team_id: r.team_id,
+            user_id: r.user_id,
+            models: r.models.and_then(|s| serde_json::from_str(&s).ok()),
+            rate_limit_override: r.rate_limit_override.and_then(|s| serde_json::from_str(&s).ok()),
+            token_budget: r.token_budget.and_then(|s| serde_json::from_str(&s).ok()),
         }
     }
 }

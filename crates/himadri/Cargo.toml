@@ -12,7 +12,17 @@ name = "gateway_bench"
 harness = false
 
 [features]
-default = []
+default = ["sqlite"]
+sqlite = [
+    "dep:sqlx",
+    "sqlx/sqlite",
+    "himadri-admin/sqlite",
+]
+postgres = [
+    "dep:sqlx",
+    "sqlx/postgres",
+    "himadri-admin/postgres",
+]
 redis = [
     "himadri-circuitbreaker/redis",
     "himadri-ratelimit/redis",
@@ -48,7 +58,7 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 once_cell = "1"
 prometheus = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls"], optional = true }
 async-trait = "0.1"
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"], optional = true }
 

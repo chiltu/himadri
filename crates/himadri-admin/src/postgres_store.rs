@@ -11,38 +11,19 @@ pub struct PostgresStore {
 impl PostgresStore {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = sqlx::PgPool::connect(database_url).await?;
-        Self::run_migrations(&pool).await?;
+        sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
     }
 
     pub async fn from_pool(pool: sqlx::PgPool) -> Result<Self, sqlx::Error> {
-        Self::run_migrations(&pool).await?;
+        sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
-    }
-
-    async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS api_keys (
-                id UUID PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                key VARCHAR(255) NOT NULL UNIQUE,
-                scopes JSONB NOT NULL DEFAULT '[]',
-                enabled BOOLEAN NOT NULL DEFAULT true,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_used_at TIMESTAMPTZ,
-                expires_at TIMESTAMPTZ,
-                usage_count BIGINT NOT NULL DEFAULT 0,
-                metadata JSONB
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
-            CREATE INDEX IF NOT EXISTS idx_api_keys_enabled ON api_keys(enabled);
-            "#,
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, sqlx::Error> {

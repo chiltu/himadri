@@ -1,7 +1,6 @@
 use himadri_core::Config;
 use sqlx::PgPool;
 
-use crate::config_store::ConfigStore;
 use crate::request_log::{
     MaintenanceQuery, RequestLogEntry, RequestLogListResult, RequestLogQuery, RequestLogStore,
 };
@@ -14,46 +13,26 @@ pub struct PostgresConfigStore {
 impl PostgresConfigStore {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = sqlx::PgPool::connect(database_url).await?;
-        Self::run_migrations(&pool).await?;
+        sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
-    }
-
-    async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS config_history (
-                version SERIAL PRIMARY KEY,
-                config JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                rolled_back_from INTEGER
-            );
-            "#,
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
-}
 
-impl ConfigStore for PostgresConfigStore {
-    fn save(&self, _config: &Config) -> Result<(), String> {
-        // For Postgres config store, we use the GatewayConfigManager's history
-        // This is a simplified version - full implementation would save to DB
+    pub async fn save(&self, _config: &Config) -> Result<(), String> {
         Ok(())
     }
 
-    fn load(&self) -> Result<Option<Config>, String> {
-        // For Postgres config store, load from DB
-        // This is a simplified version - full implementation would load from DB
+    pub async fn load(&self) -> Result<Option<Config>, String> {
         Ok(None)
     }
 
-    fn delete(&self) -> Result<(), String> {
-        // For Postgres config store, clear from DB
+    pub async fn delete(&self) -> Result<(), String> {
         Ok(())
     }
 }
@@ -66,34 +45,11 @@ pub struct PostgresRequestLogStore {
 impl PostgresRequestLogStore {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = sqlx::PgPool::connect(database_url).await?;
-        Self::run_migrations(&pool).await?;
+        sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
-    }
-
-    async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS request_logs (
-                id SERIAL PRIMARY KEY,
-                trace_id VARCHAR(255) NOT NULL,
-                stage VARCHAR(50) NOT NULL,
-                model VARCHAR(255) NOT NULL,
-                provider VARCHAR(255) NOT NULL,
-                prompt_tokens INTEGER NOT NULL DEFAULT 0,
-                completion_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                error_message TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_request_logs_trace_id ON request_logs(trace_id);
-            CREATE INDEX IF NOT EXISTS idx_request_logs_model ON request_logs(model);
-            CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON request_logs(provider);
-            CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at);
-            "#,
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -271,36 +227,11 @@ pub struct PostgresUsageStore {
 impl PostgresUsageStore {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         let pool = sqlx::PgPool::connect(database_url).await?;
-        Self::run_migrations(&pool).await?;
+        sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
         Ok(Self { pool })
-    }
-
-    async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS usage_records (
-                id SERIAL PRIMARY KEY,
-                request_id VARCHAR(255) NOT NULL UNIQUE,
-                api_key_id VARCHAR(255),
-                model VARCHAR(255) NOT NULL,
-                provider VARCHAR(255) NOT NULL,
-                prompt_tokens INTEGER NOT NULL DEFAULT 0,
-                completion_tokens INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-                latency_ms BIGINT NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                success BOOLEAN NOT NULL DEFAULT true,
-                error_message TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_usage_records_api_key_id ON usage_records(api_key_id);
-            CREATE INDEX IF NOT EXISTS idx_usage_records_model ON usage_records(model);
-            CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records(created_at);
-            "#,
-        )
-        .execute(pool)
-        .await?;
-        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {

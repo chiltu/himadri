@@ -511,6 +511,51 @@ impl Gateway {
         self.request_log.clone()
     }
 
+    /// Rebuild targets from database providers/models.
+    /// Called when a provider or model is created, updated, deleted, or toggled.
+    pub async fn rebuild_targets_from_db(
+        &self,
+        providers: &[himadri_admin::Provider],
+        models: &[himadri_admin::Model],
+    ) {
+        let mut targets = self.targets.write().await;
+        targets.clear();
+
+        // Build targets from enabled providers
+        for provider in providers {
+            if !provider.enabled {
+                continue;
+            }
+
+            // Get enabled models for this provider
+            let provider_models: Vec<String> = models
+                .iter()
+                .filter(|m| m.provider_id == provider.id && m.enabled)
+                .map(|m| m.name.clone())
+                .collect();
+
+            targets.push(Target {
+                provider: provider.name.clone(),
+                weight: provider.weight,
+                models: if provider_models.is_empty() {
+                    None
+                } else {
+                    Some(provider_models)
+                },
+                api_key_env: None, // API key is now in provider.api_key
+                base_url: provider.base_url.clone(),
+            });
+        }
+
+        // Update config targets
+        let mut config = self.config.write().await;
+        config.targets = targets.clone();
+
+        // Clear stale rate limiter and circuit breaker state
+        self.rate_limiter.clear();
+        self.circuit_breakers.clear();
+    }
+
     #[allow(dead_code)]
     pub async fn get_org_config(&self, org_id: &str) -> Option<OrgConfig> {
         let config = self.config.read().await;

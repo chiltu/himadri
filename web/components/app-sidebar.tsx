@@ -56,15 +56,7 @@ const data = {
       isActive: true,
       items: [
         {
-          title: "History",
-          url: "#",
-        },
-        {
-          title: "Starred",
-          url: "#",
-        },
-        {
-          title: "Settings",
+          title: "Try out",
           url: "#",
         },
       ],
@@ -77,41 +69,25 @@ const data = {
       ),
       items: [
         {
-          title: "Genesis",
-          url: "#",
+          title: "All Models",
+          url: "/dashboard/models",
         },
         {
-          title: "Explorer",
-          url: "#",
-        },
-        {
-          title: "Quantum",
-          url: "#",
+          title: "Usage",
+          url: "/dashboard/usage",
         },
       ],
     },
     {
-      title: "Documentation",
+      title: "Cost",
       url: "#",
       icon: (
         <HugeiconsIcon icon={BookOpen02Icon} strokeWidth={2} />
       ),
       items: [
         {
-          title: "Introduction",
-          url: "#",
-        },
-        {
-          title: "Get Started",
-          url: "#",
-        },
-        {
-          title: "Tutorials",
-          url: "#",
-        },
-        {
-          title: "Changelog",
-          url: "#",
+          title: "Usage",
+          url: "/dashboard/usage",
         },
       ],
     },
@@ -123,20 +99,12 @@ const data = {
       ),
       items: [
         {
-          title: "General",
-          url: "#",
+          title: "Config",
+          url: "/dashboard/config",
         },
         {
-          title: "Team",
-          url: "#",
-        },
-        {
-          title: "Billing",
-          url: "#",
-        },
-        {
-          title: "Limits",
-          url: "#",
+          title: "Keys",
+          url: "/dashboard/config",
         },
       ],
     },
