@@ -63,6 +63,8 @@ fn bench_request_building(c: &mut Criterion) {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     };
 

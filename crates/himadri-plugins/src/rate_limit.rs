@@ -411,6 +411,8 @@ mod tests {
                 presence_penalty: None,
                 frequency_penalty: None,
                 user: None,
+                tools: None,
+                tool_choice: None,
                 extra: Default::default(),
             },
             None,

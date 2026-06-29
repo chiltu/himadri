@@ -3,7 +3,9 @@ use futures::Stream;
 use std::pin::Pin;
 
 use crate::error::ProviderError;
-use himadri_core::{ChatCompletionRequest, ChatCompletionResponse, StreamChunk};
+use himadri_core::{
+    ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest, EmbeddingResponse, StreamChunk,
+};
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 
@@ -35,4 +37,17 @@ pub trait Provider: Send + Sync {
         request: &ChatCompletionRequest,
         api_key: &str,
     ) -> Result<BoxStream<'static, Result<StreamChunk, ProviderError>>, ProviderError>;
+
+    /// Generate embeddings. Defaults to unsupported; providers that offer an
+    /// embeddings API override this.
+    async fn embed(
+        &self,
+        _request: &EmbeddingRequest,
+        _api_key: &str,
+    ) -> Result<EmbeddingResponse, ProviderError> {
+        Err(ProviderError::Unsupported(format!(
+            "{} does not support embeddings",
+            self.name()
+        )))
+    }
 }

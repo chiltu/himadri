@@ -19,6 +19,8 @@ fn test_request(model: &str) -> ChatCompletionRequest {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     }
 }
@@ -309,6 +311,8 @@ async fn test_content_based_prompt_contains() {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     };
 
@@ -354,6 +358,8 @@ async fn test_content_based_prompt_not_contains() {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     };
 
@@ -400,6 +406,8 @@ async fn test_content_based_prompt_regex() {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     };
 
@@ -451,6 +459,8 @@ async fn test_content_based_fallback() {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     };
 
@@ -512,6 +522,8 @@ async fn test_content_based_only_checks_user_messages() {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     };
 
@@ -675,4 +687,197 @@ async fn test_all_modes_create_valid_strategies() {
     let req = test_request("gpt-4");
     let result = strategy.select(&req, &targets).await;
     assert!(result.is_ok(), "LeastLatency strategy failed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// select_ordered — failover ordering
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_select_ordered_fallback_preserves_all_targets_in_order() {
+    let strategy = Strategy::from_mode(StrategyMode::Fallback);
+    let targets = test_targets();
+    let req = test_request("gpt-4");
+    let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
+    assert_eq!(ordered.len(), 2);
+    assert_eq!(ordered[0].provider, "openai");
+    assert_eq!(ordered[1].provider, "anthropic");
+}
+
+#[tokio::test]
+async fn test_select_ordered_single_returns_only_primary() {
+    let strategy = Strategy::from_mode(StrategyMode::Single);
+    let targets = test_targets();
+    let req = test_request("gpt-4");
+    let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
+    assert_eq!(ordered.len(), 1);
+    assert_eq!(ordered[0].provider, "openai");
+}
+
+#[tokio::test]
+async fn test_select_ordered_cost_optimized_sorts_cheapest_first() {
+    let strategy = Strategy::from_mode(StrategyMode::CostOptimized);
+    let targets = test_targets(); // openai weight 1.0, anthropic weight 2.0
+    let req = test_request("gpt-4");
+    let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
+    assert_eq!(ordered.len(), 2);
+    assert_eq!(ordered[0].provider, "openai"); // lower weight = cheaper, tried first
+    assert_eq!(ordered[1].provider, "anthropic");
+}
+
+#[tokio::test]
+async fn test_select_ordered_load_balance_includes_all_as_fallbacks() {
+    let strategy = Strategy::from_mode(StrategyMode::LoadBalance);
+    let targets = test_targets();
+    let req = test_request("gpt-4");
+    let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
+    // Both providers present so a failed primary can fall back to the other.
+    assert_eq!(ordered.len(), 2);
+    let mut providers: Vec<_> = ordered.iter().map(|t| t.provider.clone()).collect();
+    providers.sort();
+    assert_eq!(providers, vec!["anthropic".to_string(), "openai".to_string()]);
+}
+
+#[tokio::test]
+async fn test_select_ordered_dedups_identical_endpoints() {
+    let strategy = Strategy::from_mode(StrategyMode::Fallback);
+    let targets = vec![
+        Target {
+            provider: "openai".to_string(),
+            weight: 1.0,
+            models: None,
+            api_key_env: None,
+            base_url: None,
+        },
+        Target {
+            provider: "openai".to_string(),
+            weight: 1.0,
+            models: None,
+            api_key_env: None,
+            base_url: None,
+        },
+    ];
+    let req = test_request("gpt-4");
+    let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
+    assert_eq!(ordered.len(), 1, "identical endpoints should be de-duplicated");
+}
+
+#[tokio::test]
+async fn test_select_ordered_empty_targets_errors() {
+    let strategy = Strategy::from_mode(StrategyMode::Fallback);
+    let req = test_request("gpt-4");
+    let result = strategy.select_ordered(&req, &[]).await;
+    assert!(result.is_err());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// from_strategy_config — advanced strategies built from config
+// ═══════════════════════════════════════════════════════════════════════
+
+use himadri_core::config::{
+    ABVariantConfig, ConditionKeyConfig, ConditionalRuleConfig, ContentConditionTypeConfig,
+    ContentRuleConfig, StrategyConfig, StrategyMode as Mode,
+};
+
+fn target(provider: &str) -> Target {
+    Target {
+        provider: provider.to_string(),
+        weight: 1.0,
+        models: None,
+        api_key_env: None,
+        base_url: None,
+    }
+}
+
+#[tokio::test]
+async fn test_from_config_conditional_routes_by_model() {
+    let config = StrategyConfig {
+        mode: Mode::Conditional,
+        conditional_rules: vec![ConditionalRuleConfig {
+            key: ConditionKeyConfig::Model,
+            value: "claude-3".to_string(),
+            target: target("anthropic"),
+        }],
+        strategy_fallback: Some(target("openai")),
+        ..Default::default()
+    };
+    let strategy = Strategy::from_strategy_config(&config);
+    let targets = test_targets();
+
+    let matched = strategy
+        .select(&test_request("claude-3"), &targets)
+        .await
+        .unwrap();
+    assert_eq!(matched.provider, "anthropic");
+
+    let fallback = strategy
+        .select(&test_request("gpt-4"), &targets)
+        .await
+        .unwrap();
+    assert_eq!(fallback.provider, "openai");
+}
+
+#[tokio::test]
+async fn test_from_config_content_based_prompt_contains() {
+    let config = StrategyConfig {
+        mode: Mode::ContentBased,
+        content_rules: vec![ContentRuleConfig {
+            condition_type: ContentConditionTypeConfig::PromptContains,
+            value: "translate".to_string(),
+            target: target("anthropic"),
+        }],
+        strategy_fallback: Some(target("openai")),
+        ..Default::default()
+    };
+    let strategy = Strategy::from_strategy_config(&config);
+    let targets = test_targets();
+
+    let mut req = test_request("gpt-4");
+    req.messages[0].content = Some(MessageContent::Text("Please translate this".to_string()));
+    let matched = strategy.select(&req, &targets).await.unwrap();
+    assert_eq!(matched.provider, "anthropic");
+}
+
+#[tokio::test]
+async fn test_from_config_ab_test_picks_a_variant() {
+    let config = StrategyConfig {
+        mode: Mode::ABTest,
+        ab_variants: vec![
+            ABVariantConfig {
+                target: target("openai"),
+                weight: 1.0,
+                label: "a".to_string(),
+            },
+            ABVariantConfig {
+                target: target("anthropic"),
+                weight: 1.0,
+                label: "b".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
+    let strategy = Strategy::from_strategy_config(&config);
+    let targets = test_targets();
+    let chosen = strategy
+        .select(&test_request("gpt-4"), &targets)
+        .await
+        .unwrap();
+    assert!(chosen.provider == "openai" || chosen.provider == "anthropic");
+}
+
+#[tokio::test]
+async fn test_strategy_mode_serde_roundtrip_advanced() {
+    // Ensure the new variants deserialize from their config spellings.
+    assert_eq!(
+        serde_json::from_str::<Mode>("\"conditional\"").unwrap(),
+        Mode::Conditional
+    );
+    assert_eq!(
+        serde_json::from_str::<Mode>("\"content_based\"").unwrap(),
+        Mode::ContentBased
+    );
+    assert_eq!(
+        serde_json::from_str::<Mode>("\"ab_test\"").unwrap(),
+        Mode::ABTest
+    );
 }

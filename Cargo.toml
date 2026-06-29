@@ -5,6 +5,7 @@ members = [
     "crates/himadri-plugin",
     "crates/himadri-plugins",
     "crates/himadri-admin",
+    "crates/himadri-auth",
     "crates/himadri-observability",
     "crates/himadri-ratelimit",
     "crates/himadri-circuitbreaker",

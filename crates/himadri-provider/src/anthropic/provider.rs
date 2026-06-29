@@ -86,7 +86,52 @@ impl AnthropicProvider {
             body["stop_sequences"] = serde_json::json!(stop);
         }
 
+        // Translate OpenAI-shaped tools into Anthropic's schema.
+        if let Some(tools) = &request.tools {
+            let anthropic_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "input_schema": t.function.parameters
+                            .clone()
+                            .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(anthropic_tools);
+
+            if let Some(choice) = &request.tool_choice {
+                if let Some(translated) = Self::translate_tool_choice(choice) {
+                    body["tool_choice"] = translated;
+                }
+            }
+        }
+
         body
+    }
+
+    /// Map an OpenAI `tool_choice` to Anthropic's `tool_choice` object.
+    /// `"auto"` -> {type:auto}, `"required"` -> {type:any}, `"none"` -> {type:none},
+    /// `{type:function, function:{name}}` -> {type:tool, name}.
+    fn translate_tool_choice(choice: &serde_json::Value) -> Option<serde_json::Value> {
+        match choice {
+            serde_json::Value::String(s) => match s.as_str() {
+                "auto" => Some(serde_json::json!({"type": "auto"})),
+                "required" => Some(serde_json::json!({"type": "any"})),
+                "none" => Some(serde_json::json!({"type": "none"})),
+                _ => None,
+            },
+            serde_json::Value::Object(obj) => {
+                let name = obj
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str());
+                name.map(|n| serde_json::json!({"type": "tool", "name": n}))
+            }
+            _ => None,
+        }
     }
 
     fn parse_response(
@@ -378,5 +423,70 @@ impl Clone for AnthropicProvider {
         Self {
             base_url: self.base_url.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use himadri_core::{ChatCompletionRequest, Message, Role, Tool, ToolFunction};
+
+    fn request_with_tools(tool_choice: serde_json::Value) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "claude-3-5-sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Some(MessageContent::Text("weather?".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object"})),
+                },
+            }]),
+            tool_choice: Some(tool_choice),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn tools_translated_to_anthropic_schema() {
+        let provider = AnthropicProvider::new(None);
+        let body = provider.build_request_body(&request_with_tools(serde_json::json!("auto")), false);
+        // Anthropic uses name/description/input_schema, not {type, function}.
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert!(body["tools"][0].get("function").is_none());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn tool_choice_required_maps_to_any() {
+        assert_eq!(
+            AnthropicProvider::translate_tool_choice(&serde_json::json!("required")).unwrap(),
+            serde_json::json!({"type": "any"})
+        );
+    }
+
+    #[test]
+    fn tool_choice_specific_function_maps_to_tool() {
+        let choice = serde_json::json!({"type": "function", "function": {"name": "get_weather"}});
+        assert_eq!(
+            AnthropicProvider::translate_tool_choice(&choice).unwrap(),
+            serde_json::json!({"type": "tool", "name": "get_weather"})
+        );
     }
 }

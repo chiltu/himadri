@@ -8,7 +8,9 @@ pub struct JwtClaims {
     /// Issuer (e.g., Zitadel URL)
     pub iss: String,
 
-    /// Audience (client ID)
+    /// Audience (client ID). Per RFC 7519 this may be a single string or an
+    /// array of strings; multiple values are joined with commas.
+    #[serde(deserialize_with = "deserialize_aud")]
     pub aud: String,
 
     /// Expiration time (Unix timestamp)
@@ -60,6 +62,27 @@ pub struct JwtClaims {
     /// Custom claims
     #[serde(flatten)]
     pub custom: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Deserialize the `aud` claim from either a string or an array of strings.
+fn deserialize_aud<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Array(arr) => Ok(arr
+            .into_iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                other => Some(other.to_string()),
+            })
+            .collect::<Vec<_>>()
+            .join(",")),
+        serde_json::Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
 }
 
 fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>

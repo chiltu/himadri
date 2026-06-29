@@ -92,7 +92,51 @@ impl GeminiProvider {
             body["systemInstruction"] = system;
         }
 
+        // Translate OpenAI-shaped tools into Gemini's functionDeclarations.
+        if let Some(tools) = &request.tools {
+            let declarations: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    let mut decl = serde_json::json!({ "name": t.function.name });
+                    if let Some(desc) = &t.function.description {
+                        decl["description"] = serde_json::json!(desc);
+                    }
+                    if let Some(params) = &t.function.parameters {
+                        decl["parameters"] = params.clone();
+                    }
+                    decl
+                })
+                .collect();
+            body["tools"] = serde_json::json!([{ "functionDeclarations": declarations }]);
+
+            if let Some(mode) = request
+                .tool_choice
+                .as_ref()
+                .and_then(Self::translate_tool_choice_mode)
+            {
+                body["toolConfig"] = serde_json::json!({
+                    "functionCallingConfig": { "mode": mode }
+                });
+            }
+        }
+
         body
+    }
+
+    /// Map an OpenAI `tool_choice` to Gemini's functionCallingConfig mode.
+    /// `"auto"` -> AUTO, `"required"` / a specific function -> ANY, `"none"` -> NONE.
+    fn translate_tool_choice_mode(choice: &serde_json::Value) -> Option<String> {
+        match choice {
+            serde_json::Value::String(s) => match s.as_str() {
+                "auto" => Some("AUTO".to_string()),
+                "required" => Some("ANY".to_string()),
+                "none" => Some("NONE".to_string()),
+                _ => None,
+            },
+            // An explicit tool object forces a call.
+            serde_json::Value::Object(_) => Some("ANY".to_string()),
+            _ => None,
+        }
     }
 
     fn parse_response(
@@ -363,5 +407,68 @@ impl Clone for GeminiProvider {
         Self {
             base_url: self.base_url.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use himadri_core::{ChatCompletionRequest, Message, Role, Tool, ToolFunction};
+
+    fn request_with_tools(tool_choice: serde_json::Value) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gemini-1.5-pro".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Some(MessageContent::Text("weather?".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: "get_weather".to_string(),
+                    description: Some("Get weather".to_string()),
+                    parameters: Some(serde_json::json!({"type": "object"})),
+                },
+            }]),
+            tool_choice: Some(tool_choice),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn tools_translated_to_function_declarations() {
+        let provider = GeminiProvider::new(None);
+        let body = provider.build_request_body(&request_with_tools(serde_json::json!("required")));
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
+        );
+    }
+
+    #[test]
+    fn tool_choice_modes_map_correctly() {
+        assert_eq!(
+            GeminiProvider::translate_tool_choice_mode(&serde_json::json!("auto")).unwrap(),
+            "AUTO"
+        );
+        assert_eq!(
+            GeminiProvider::translate_tool_choice_mode(&serde_json::json!("none")).unwrap(),
+            "NONE"
+        );
     }
 }

@@ -25,6 +25,9 @@ pub enum ProviderError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("operation not supported: {0}")]
+    Unsupported(String),
 }
 
 impl ProviderError {
@@ -49,6 +52,7 @@ impl ProviderError {
             ProviderError::Network(_) => 502,
             ProviderError::Parse(_) => 500,
             ProviderError::Internal(_) => 500,
+            ProviderError::Unsupported(_) => 501,
         }
     }
 }

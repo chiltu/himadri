@@ -33,6 +33,57 @@ impl AuthMiddleware {
         Self { store, master_key }
     }
 
+    /// Whether authentication is bypassed (no master key configured — dev mode).
+    pub fn is_bypass(&self) -> bool {
+        self.master_key.is_none()
+    }
+
+    /// Validate a bearer token as either the master key or a stored API key.
+    ///
+    /// Returns `Ok(Some(ctx))` for a valid token, `Ok(None)` for an unknown or
+    /// invalid token, and `Err(())` on a store backend error.
+    pub async fn authenticate(&self, api_key: &str) -> Result<Option<AuthContext>, ()> {
+        if let Some(master_key) = &self.master_key {
+            if constant_time_eq(api_key.as_bytes(), master_key.as_bytes()) {
+                return Ok(Some(AuthContext {
+                    api_key: api_key.to_string(),
+                    key_id: None,
+                    scope: AuthScope::Admin,
+                    org_id: None,
+                    team_id: None,
+                    user_id: None,
+                    rate_limit_override: None,
+                }));
+            }
+        }
+
+        match self.store.validate(api_key).await {
+            Ok(Some(key)) => {
+                let rate_limit_override = key.rate_limit_override.map(|r| RateLimitOverride {
+                    requests_per_second: r.requests_per_second,
+                    burst_size: r.burst_size,
+                });
+                Ok(Some(AuthContext {
+                    api_key: api_key.to_string(),
+                    key_id: Some(key.id),
+                    scope: if key.scopes.contains(&"admin".to_string()) {
+                        AuthScope::Admin
+                    } else if key.scopes.contains(&"read-only".to_string()) {
+                        AuthScope::ReadOnly
+                    } else {
+                        AuthScope::ApiKey
+                    },
+                    org_id: key.org_id,
+                    team_id: key.team_id,
+                    user_id: key.user_id,
+                    rate_limit_override,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
     pub async fn middleware(
         State(auth): State<Arc<Self>>,
         headers: HeaderMap,
@@ -40,7 +91,7 @@ impl AuthMiddleware {
         next: Next,
     ) -> Result<Response, StatusCode> {
         // If no master_key configured, bypass auth (testing mode)
-        if auth.master_key.is_none() {
+        if auth.is_bypass() {
             let ctx = AuthContext::anonymous();
             request.extensions_mut().insert(Some(ctx));
             return Ok(next.run(request).await);
@@ -59,43 +110,8 @@ impl AuthMiddleware {
             }
         };
 
-        if let Some(master_key) = &auth.master_key {
-            if constant_time_eq(api_key.as_bytes(), master_key.as_bytes()) {
-                let ctx = AuthContext {
-                    api_key,
-                    key_id: None,
-                    scope: AuthScope::Admin,
-                    org_id: None,
-                    team_id: None,
-                    user_id: None,
-                    rate_limit_override: None,
-                };
-                request.extensions_mut().insert(Some(ctx));
-                return Ok(next.run(request).await);
-            }
-        }
-
-        match auth.store.validate(&api_key).await {
-            Ok(Some(key)) => {
-                let rate_limit_override = key.rate_limit_override.map(|r| RateLimitOverride {
-                    requests_per_second: r.requests_per_second,
-                    burst_size: r.burst_size,
-                });
-                let ctx = AuthContext {
-                    api_key,
-                    key_id: Some(key.id),
-                    scope: if key.scopes.contains(&"admin".to_string()) {
-                        AuthScope::Admin
-                    } else if key.scopes.contains(&"read-only".to_string()) {
-                        AuthScope::ReadOnly
-                    } else {
-                        AuthScope::ApiKey
-                    },
-                    org_id: key.org_id,
-                    team_id: key.team_id,
-                    user_id: key.user_id,
-                    rate_limit_override,
-                };
+        match auth.authenticate(&api_key).await {
+            Ok(Some(ctx)) => {
                 request.extensions_mut().insert(Some(ctx));
                 Ok(next.run(request).await)
             }
@@ -103,7 +119,7 @@ impl AuthMiddleware {
                 request.extensions_mut().insert(None::<AuthContext>);
                 Err(StatusCode::UNAUTHORIZED)
             }
-            Err(_) => {
+            Err(()) => {
                 request.extensions_mut().insert(None::<AuthContext>);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }

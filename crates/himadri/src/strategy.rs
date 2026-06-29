@@ -120,6 +120,7 @@ pub struct ABTestVariant {
 }
 
 impl Strategy {
+    #[allow(dead_code)]
     pub fn from_config_mode(mode: &StrategyMode) -> Self {
         Self::from_mode(*mode)
     }
@@ -135,6 +136,95 @@ impl Strategy {
                 store: Arc::new(InMemoryLatencyStore::new()),
             }),
             StrategyMode::CostOptimized => Strategy::CostOptimized(CostOptimizedConfig::default()),
+            // The advanced strategies carry per-rule configuration; without it
+            // they degrade to selecting the first target. Use
+            // `from_strategy_config` to supply rules/variants.
+            StrategyMode::Conditional => Strategy::Conditional(ConditionalConfig {
+                rules: Vec::new(),
+                fallback: None,
+            }),
+            StrategyMode::ContentBased => Strategy::ContentBased(ContentBasedConfig {
+                rules: Vec::new(),
+                fallback: None,
+            }),
+            StrategyMode::ABTest => Strategy::ABTest(ABTestConfig {
+                variants: Vec::new(),
+            }),
+        }
+    }
+
+    /// Build a strategy from the full `StrategyConfig`, wiring rules/variants
+    /// for the advanced strategies. Simple strategies ignore the extra fields.
+    pub fn from_strategy_config(config: &himadri_core::config::StrategyConfig) -> Self {
+        use himadri_core::config::{
+            ConditionKeyConfig, ContentConditionTypeConfig, StrategyMode as Mode,
+        };
+
+        match config.mode {
+            Mode::Conditional => {
+                let rules = config
+                    .conditional_rules
+                    .iter()
+                    .map(|r| ConditionRule {
+                        key: match r.key {
+                            ConditionKeyConfig::Model => ConditionKey::Model,
+                            ConditionKeyConfig::ModelPrefix => ConditionKey::ModelPrefix,
+                        },
+                        value: r.value.clone(),
+                        target: r.target.clone(),
+                    })
+                    .collect();
+                Strategy::Conditional(ConditionalConfig {
+                    rules,
+                    fallback: config.strategy_fallback.clone(),
+                })
+            }
+            Mode::ContentBased => {
+                let rules = config
+                    .content_rules
+                    .iter()
+                    .map(|r| {
+                        let condition_type = match r.condition_type {
+                            ContentConditionTypeConfig::PromptContains => {
+                                ContentConditionType::PromptContains
+                            }
+                            ContentConditionTypeConfig::PromptNotContains => {
+                                ContentConditionType::PromptNotContains
+                            }
+                            ContentConditionTypeConfig::PromptRegex => {
+                                ContentConditionType::PromptRegex
+                            }
+                        };
+                        let compiled_regex = match r.condition_type {
+                            ContentConditionTypeConfig::PromptRegex => Regex::new(&r.value).ok(),
+                            _ => None,
+                        };
+                        ContentRule {
+                            condition_type,
+                            value: r.value.clone(),
+                            target: r.target.clone(),
+                            compiled_regex,
+                        }
+                    })
+                    .collect();
+                Strategy::ContentBased(ContentBasedConfig {
+                    rules,
+                    fallback: config.strategy_fallback.clone(),
+                })
+            }
+            Mode::ABTest => {
+                let variants = config
+                    .ab_variants
+                    .iter()
+                    .map(|v| ABTestVariant {
+                        target: v.target.clone(),
+                        weight: v.weight,
+                        label: v.label.clone(),
+                    })
+                    .collect();
+                Strategy::ABTest(ABTestConfig { variants })
+            }
+            other => Self::from_mode(other),
         }
     }
 
@@ -146,6 +236,9 @@ impl Strategy {
         }
     }
 
+    /// Select a single primary target. Retained for tests and callers that do
+    /// not need failover; the routing path uses [`Strategy::select_ordered`].
+    #[allow(dead_code)]
     pub async fn select(
         &self,
         request: &ChatCompletionRequest,
@@ -230,6 +323,122 @@ impl Strategy {
             }
             Strategy::ABTest(config) => Self::select_ab_test_variant(config, targets),
         }
+    }
+
+    /// Select targets in priority order for failover.
+    ///
+    /// The first element is the primary choice (identical to `select`); the
+    /// remaining elements are the fallback order the caller should try if the
+    /// primary fails with a retryable error. Targets are de-duplicated by
+    /// endpoint so the same provider/key/base_url is never tried twice.
+    pub async fn select_ordered(
+        &self,
+        request: &ChatCompletionRequest,
+        targets: &[Target],
+    ) -> Result<Vec<Target>, GatewayError> {
+        if targets.is_empty() {
+            return Err(GatewayError::Internal("No targets configured".to_string()));
+        }
+
+        let ordered = match self {
+            Strategy::Single => vec![targets[0].clone()],
+            Strategy::Fallback(_config) => targets.to_vec(),
+            Strategy::LoadBalance(_state) => {
+                // Weighted-random primary, remaining targets as fallbacks in a
+                // further weighted-random order.
+                let mut remaining: Vec<Target> = targets.to_vec();
+                let mut ordered = Vec::with_capacity(remaining.len());
+                let mut rng = rand::thread_rng();
+                while !remaining.is_empty() {
+                    let total: f64 = remaining.iter().map(|t| t.weight.max(0.0)).sum();
+                    let idx = if total <= 0.0 {
+                        0
+                    } else {
+                        let mut r = rng.gen_range(0.0..total);
+                        let mut chosen = remaining.len() - 1;
+                        for (i, t) in remaining.iter().enumerate() {
+                            r -= t.weight.max(0.0);
+                            if r <= 0.0 {
+                                chosen = i;
+                                break;
+                            }
+                        }
+                        chosen
+                    };
+                    ordered.push(remaining.remove(idx));
+                }
+                ordered
+            }
+            Strategy::LeastLatency(state) => {
+                let mut with_latency = Vec::with_capacity(targets.len());
+                for t in targets {
+                    let avg = state.store.get_avg_latency(&t.provider).await;
+                    with_latency.push((avg, t.clone()));
+                }
+                with_latency.sort_by_key(|a| a.0);
+                with_latency.into_iter().map(|(_, t)| t).collect()
+            }
+            Strategy::CostOptimized(_config) => {
+                let mut sorted = targets.to_vec();
+                sorted.sort_by(|a, b| {
+                    a.weight
+                        .partial_cmp(&b.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                sorted
+            }
+            Strategy::Conditional(config) => {
+                let primary = config
+                    .rules
+                    .iter()
+                    .find(|rule| Self::matches_condition(rule, request))
+                    .map(|rule| rule.target.clone())
+                    .or_else(|| config.fallback.clone());
+                Self::ordered_with_primary(primary, targets)
+            }
+            Strategy::ContentBased(config) => {
+                let primary = config
+                    .rules
+                    .iter()
+                    .find(|rule| Self::matches_content_rule(rule, request))
+                    .map(|rule| rule.target.clone())
+                    .or_else(|| config.fallback.clone());
+                Self::ordered_with_primary(primary, targets)
+            }
+            Strategy::ABTest(config) => {
+                let primary = Self::select_ab_test_variant(config, targets).ok();
+                Self::ordered_with_primary(primary, targets)
+            }
+        };
+
+        Ok(Self::dedup_targets(ordered))
+    }
+
+    /// Build an ordered list starting with `primary` (if any), followed by the
+    /// remaining configured targets as fallbacks.
+    fn ordered_with_primary(primary: Option<Target>, targets: &[Target]) -> Vec<Target> {
+        let mut ordered = Vec::with_capacity(targets.len() + 1);
+        if let Some(p) = primary {
+            ordered.push(p);
+        }
+        ordered.extend(targets.iter().cloned());
+        ordered
+    }
+
+    /// De-duplicate targets by endpoint identity (provider + key env + base
+    /// url) preserving order, so failover never retries the same endpoint.
+    fn dedup_targets(targets: Vec<Target>) -> Vec<Target> {
+        let mut seen = std::collections::HashSet::new();
+        targets
+            .into_iter()
+            .filter(|t| {
+                seen.insert((
+                    t.provider.clone(),
+                    t.api_key_env.clone(),
+                    t.base_url.clone(),
+                ))
+            })
+            .collect()
     }
 
     fn matches_condition(rule: &ConditionRule, request: &ChatCompletionRequest) -> bool {

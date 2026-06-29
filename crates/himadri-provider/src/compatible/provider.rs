@@ -178,6 +178,12 @@ impl OpenAiCompatibleProvider {
         if let Some(user) = &request.user {
             body["user"] = serde_json::Value::String(user.clone());
         }
+        if let Some(tools) = &request.tools {
+            body["tools"] = serde_json::json!(tools);
+        }
+        if let Some(tool_choice) = &request.tool_choice {
+            body["tool_choice"] = tool_choice.clone();
+        }
 
         body
     }
@@ -199,7 +205,11 @@ impl OpenAiCompatibleProvider {
                         message: ResponseMessage {
                             role: himadri_core::Role::Assistant,
                             content: c["message"]["content"].as_str().map(|s| s.to_string()),
-                            tool_calls: None,
+                            tool_calls: serde_json::from_value(
+                                c["message"]["tool_calls"].clone(),
+                            )
+                            .ok()
+                            .filter(|tc: &Vec<himadri_core::ToolCall>| !tc.is_empty()),
                         },
                         finish_reason: c["finish_reason"].as_str().map(|s| s.to_string()),
                     })
@@ -248,7 +258,9 @@ impl OpenAiCompatibleProvider {
                                     _ => himadri_core::Role::Assistant,
                                 }),
                                 content: delta["content"].as_str().map(|s| s.to_string()),
-                                tool_calls: None,
+                                tool_calls: serde_json::from_value(delta["tool_calls"].clone())
+                                    .ok()
+                                    .filter(|tc: &Vec<himadri_core::ToolCallDelta>| !tc.is_empty()),
                             },
                             finish_reason: c["finish_reason"].as_str().map(|s| s.to_string()),
                         }
@@ -310,6 +322,10 @@ impl OpenAiCompatibleProvider {
             "{}{}",
             self.config.base_url, self.config.chat_completions_path
         )
+    }
+
+    fn get_embeddings_url(&self) -> String {
+        format!("{}/embeddings", self.config.base_url.trim_end_matches('/'))
     }
 }
 
@@ -437,6 +453,36 @@ impl Provider for OpenAiCompatibleProvider {
         };
 
         Ok(Box::pin(stream))
+    }
+
+    #[instrument(skip(self, request, api_key), fields(model = %request.model))]
+    async fn embed(
+        &self,
+        request: &himadri_core::EmbeddingRequest,
+        api_key: &str,
+    ) -> Result<himadri_core::EmbeddingResponse, ProviderError> {
+        let client = CLIENT_POOL.for_provider(&self.config.name);
+        let (auth_header_name, auth_header_value) = self.build_auth_header(api_key);
+
+        let mut req_builder = client
+            .post(self.get_embeddings_url())
+            .header(&auth_header_name, &auth_header_value)
+            .header("Content-Type", "application/json");
+
+        for (name, value) in &self.config.extra_headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+
+        let response = req_builder.json(request).send().await?;
+
+        if !response.status().is_success() {
+            return Err(self.handle_error(response).await);
+        }
+
+        response
+            .json::<himadri_core::EmbeddingResponse>()
+            .await
+            .map_err(|e| ProviderError::Parse(e.to_string()))
     }
 }
 
@@ -583,5 +629,104 @@ impl OpenAiCompatibleConfig {
                 "meta-llama/llama-3.1-8b-instruct".to_string(),
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use himadri_core::{Message, Role, Tool, ToolFunction};
+
+    fn provider() -> OpenAiCompatibleProvider {
+        OpenAiCompatibleProvider::new(OpenAiCompatibleConfig::openai())
+    }
+
+    fn request_with_tools() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Some(MessageContent::Text("What is the weather?".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: "get_weather".to_string(),
+                    description: Some("Get the weather".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } }
+                    })),
+                },
+            }]),
+            tool_choice: Some(serde_json::json!("auto")),
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn build_request_body_forwards_tools_and_choice() {
+        let body = provider().build_request_body(&request_with_tools(), false);
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn parse_response_surfaces_tool_calls() {
+        let response = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "created": 1,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let parsed = provider().parse_response(response).unwrap();
+        let tool_calls = parsed.choices[0]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls should be surfaced");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(tool_calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn parse_response_without_tool_calls_is_none() {
+        let response = serde_json::json!({
+            "id": "chatcmpl-2",
+            "model": "gpt-4o",
+            "created": 1,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hello" },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed = provider().parse_response(response).unwrap();
+        assert!(parsed.choices[0].message.tool_calls.is_none());
     }
 }

@@ -35,6 +35,7 @@ himadri-provider = { path = "../himadri-provider" }
 himadri-plugin = { path = "../himadri-plugin" }
 himadri-plugins = { path = "../himadri-plugins" }
 himadri-admin = { path = "../himadri-admin", features = ["postgres"] }
+himadri-auth = { path = "../himadri-auth" }
 himadri-observability = { path = "../himadri-observability" }
 himadri-ratelimit = { path = "../himadri-ratelimit" }
 himadri-circuitbreaker = { path = "../himadri-circuitbreaker" }

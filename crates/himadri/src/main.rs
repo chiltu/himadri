@@ -1,3 +1,4 @@
+mod combined_auth;
 mod gateway;
 mod latency_store;
 mod strategy;
@@ -23,7 +24,7 @@ use himadri_core::{
 use himadri_observability::Metrics;
 use himadri_plugins::{
     BudgetConfig, BudgetPlugin, MaxTokenPlugin, RateLimitConfig, RateLimitPlugin,
-    RequestLoggerPlugin, WordFilterPlugin,
+    RequestLoggerPlugin, ResponseCachePlugin, WordFilterPlugin,
 };
 use himadri_provider::{
     AnthropicProvider, BedrockProvider, GeminiProvider, OpenAiCompatibleConfig,
@@ -70,6 +71,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("OpenAI base URL overridden: {}", openai_config.base_url);
     }
     gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(openai_config)));
+
+    // Register a secondary OpenAI-compatible upstream (for multi-endpoint /
+    // failover setups). Provider name: "openai-secondary".
+    if let Ok(base_url) = std::env::var("OPENAI_SECONDARY_BASE_URL") {
+        let mut cfg = OpenAiCompatibleConfig::openai();
+        cfg.name = "openai-secondary".to_string();
+        cfg.display_name = "OpenAI Secondary".to_string();
+        cfg.base_url = base_url;
+        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(cfg)));
+        info!("Registered secondary OpenAI-compatible provider: openai-secondary");
+    }
 
     // Register Anthropic (different API format)
     gateway.register_provider(Arc::new(AnthropicProvider::new(None)));
@@ -221,6 +233,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     gateway.set_plugin_manager(plugin_manager);
 
+    // Persist request logs to Postgres when configured; otherwise they remain
+    // in-memory and are lost on restart.
+    #[cfg(feature = "postgres")]
+    if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        if database_url.starts_with("postgres") {
+            match himadri_admin::PostgresRequestLogStore::new(&database_url).await {
+                Ok(store) => {
+                    gateway.set_request_log_store(Arc::new(store));
+                    info!("Request logs persisted to Postgres");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to initialize Postgres request log store ({}); \
+                         falling back to in-memory logs",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Enable response caching if configured (CACHE_TTL_SECS, optional CACHE_MAX_ENTRIES).
+    if let Ok(ttl_secs) = std::env::var("CACHE_TTL_SECS") {
+        if let Ok(ttl) = ttl_secs.parse::<u64>() {
+            let max_entries = std::env::var("CACHE_MAX_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10_000);
+            let cache =
+                ResponseCachePlugin::new(max_entries, std::time::Duration::from_secs(ttl));
+            gateway.set_response_cache(cache);
+            info!(
+                "Registered response cache ({}s TTL, {} max entries)",
+                ttl, max_entries
+            );
+        }
+    }
+
     let gateway = Arc::new(gateway);
     let store = StoreBackend::new().await;
     let master_key = config.admin.master_key.clone();
@@ -248,6 +298,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin = Arc::new(admin);
     let auth = Arc::new(AuthMiddleware::new(store.clone(), master_key.clone()));
 
+    // Optionally enable JWT/OIDC auth (Phase 1) when JWT_ISSUER is configured.
+    // Tokens are validated against the OIDC provider's JWKS; API keys continue
+    // to work alongside JWTs on the same /v1 endpoints.
+    let jwt_discovery = match std::env::var("JWT_ISSUER") {
+        Ok(issuer) if !issuer.is_empty() => {
+            let audience = std::env::var("JWT_AUDIENCE").unwrap_or_default();
+            let jwks_uri = std::env::var("JWT_JWKS_URI").ok();
+            match himadri_auth::OidcDiscovery::new(&issuer, &audience, jwks_uri.as_deref()).await {
+                Ok(discovery) => {
+                    info!("JWT/OIDC authentication enabled (issuer: {})", issuer);
+                    // Periodically refresh the JWKS so rotated signing keys are
+                    // picked up without a restart.
+                    let refresh_secs = std::env::var("JWT_JWKS_REFRESH_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(3600);
+                    let refresher = discovery.clone();
+                    tokio::spawn(async move {
+                        let interval = std::time::Duration::from_secs(refresh_secs);
+                        loop {
+                            tokio::time::sleep(interval).await;
+                            if let Err(e) = refresher.refresh_jwks().await {
+                                tracing::warn!("JWKS refresh failed: {}", e);
+                            }
+                        }
+                    });
+                    Some(discovery)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to initialize JWT/OIDC discovery ({}); JWT auth disabled",
+                        e
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let combined_auth = Arc::new(combined_auth::CombinedAuth::new(
+        auth.clone(),
+        jwt_discovery,
+    ));
+
     let state = AppState {
         gateway: gateway.clone(),
         admin,
@@ -263,10 +358,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_routes = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .fallback(passthrough)
         .layer(middleware::from_fn_with_state(
-            auth.clone(),
-            AuthMiddleware::middleware,
+            combined_auth.clone(),
+            combined_auth::CombinedAuth::middleware,
         ));
 
     let admin_routes = Router::new()
@@ -621,6 +717,17 @@ async fn completions(
     }
 }
 
+async fn embeddings(
+    State(state): State<AppState>,
+    axum::extract::Extension(auth): axum::extract::Extension<Option<AuthContext>>,
+    Json(request): Json<himadri_core::EmbeddingRequest>,
+) -> Response {
+    match state.gateway.embed(request, auth.as_ref()).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => error_to_response(e),
+    }
+}
+
 async fn list_keys(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<himadri_admin::ApiKey>>, (StatusCode, String)> {
@@ -792,22 +899,28 @@ async fn update_config(
 }
 
 async fn config_history(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let history = state.gateway.config_history().await;
     let config = state.gateway.get_config().await;
     Json(serde_json::json!({
-        "data": [],
-        "summary": { "total_versions": 1 },
+        "data": history,
+        "summary": { "total_versions": history.len() },
         "current_config": config,
     }))
 }
 
 async fn config_rollback(
-    State(_state): State<AppState>,
-    Path(_version): Path<u32>,
+    State(state): State<AppState>,
+    Path(version): Path<u32>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        "Rollback not yet implemented".to_string(),
-    ))
+    state
+        .gateway
+        .rollback_config(version)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "status": "rolled_back",
+        "version": version,
+    })))
 }
 
 async fn list_logs(

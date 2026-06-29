@@ -471,4 +471,76 @@ mod tests {
         assert!(admin.delete_key(&key.id).await);
         assert!(admin.get_key(&key.id).await.is_none());
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // AuthMiddleware::authenticate / is_bypass
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn authenticate_master_key_grants_admin() {
+        use crate::middleware::AuthMiddleware;
+        use crate::store::StoreBackend;
+
+        let auth = AuthMiddleware::new(StoreBackend::new().await, Some("master-key".to_string()));
+        assert!(!auth.is_bypass());
+
+        let ctx = auth
+            .authenticate("master-key")
+            .await
+            .expect("no store error")
+            .expect("master key should authenticate");
+        assert_eq!(ctx.scope, AuthScope::Admin);
+    }
+
+    #[tokio::test]
+    async fn authenticate_unknown_key_returns_none() {
+        use crate::middleware::AuthMiddleware;
+        use crate::store::StoreBackend;
+
+        let auth = AuthMiddleware::new(StoreBackend::new().await, Some("master-key".to_string()));
+        let result = auth.authenticate("not-a-real-key").await.expect("no store error");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticate_stored_key_returns_context_with_scope() {
+        use crate::middleware::AuthMiddleware;
+        use crate::store::{ApiKeyStore, StoreBackend};
+
+        // Seed a key in an in-memory store, then authenticate against it.
+        let store = ApiKeyStore::new();
+        let created = store.create(CreateApiKeyRequest {
+            name: "svc".to_string(),
+            scopes: vec!["read-only".to_string()],
+            expires_at: None,
+            metadata: None,
+            org_id: Some("org-1".to_string()),
+            team_id: None,
+            user_id: None,
+            models: None,
+            rate_limit_override: None,
+            token_budget: None,
+        });
+
+        let auth = AuthMiddleware::new(
+            StoreBackend::Memory(std::sync::Arc::new(store)),
+            Some("master-key".to_string()),
+        );
+        let ctx = auth
+            .authenticate(&created.key)
+            .await
+            .expect("no store error")
+            .expect("stored key should authenticate");
+        assert_eq!(ctx.scope, AuthScope::ReadOnly);
+        assert_eq!(ctx.org_id.as_deref(), Some("org-1"));
+    }
+
+    #[tokio::test]
+    async fn auth_is_bypass_when_no_master_key() {
+        use crate::middleware::AuthMiddleware;
+        use crate::store::StoreBackend;
+
+        let auth = AuthMiddleware::new(StoreBackend::new().await, None);
+        assert!(auth.is_bypass());
+    }
 }

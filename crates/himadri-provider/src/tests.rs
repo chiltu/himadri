@@ -205,4 +205,38 @@ mod tests {
             418
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Embeddings
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn embedding_input_serde_roundtrip() {
+        use himadri_core::EmbeddingInput;
+
+        let single: EmbeddingInput = serde_json::from_str("\"hello\"").unwrap();
+        assert!(matches!(single, EmbeddingInput::Single(s) if s == "hello"));
+
+        let multiple: EmbeddingInput = serde_json::from_str("[\"a\",\"b\"]").unwrap();
+        assert!(matches!(multiple, EmbeddingInput::Multiple(v) if v.len() == 2));
+    }
+
+    #[tokio::test]
+    async fn default_embed_is_unsupported() {
+        use crate::AnthropicProvider;
+        use himadri_core::{EmbeddingInput, EmbeddingRequest};
+
+        let provider = AnthropicProvider::new(None);
+        let request = EmbeddingRequest {
+            model: "text-embedding-3-small".to_string(),
+            input: EmbeddingInput::Single("hello".to_string()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+            extra: Default::default(),
+        };
+        let err = provider.embed(&request, "key").await.unwrap_err();
+        assert!(matches!(err, ProviderError::Unsupported(_)));
+        assert_eq!(err.status_code(), 501);
+    }
 }

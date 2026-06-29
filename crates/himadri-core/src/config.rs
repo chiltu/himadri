@@ -199,6 +199,22 @@ pub struct StrategyConfig {
 
     #[serde(default)]
     pub fallback_timeout_ms: u64,
+
+    /// Rules for the `conditional` strategy (matched in order).
+    #[serde(default)]
+    pub conditional_rules: Vec<ConditionalRuleConfig>,
+
+    /// Rules for the `content_based` strategy (matched in order).
+    #[serde(default)]
+    pub content_rules: Vec<ContentRuleConfig>,
+
+    /// Variants for the `ab_test` strategy.
+    #[serde(default)]
+    pub ab_variants: Vec<ABVariantConfig>,
+
+    /// Fallback target for `conditional` / `content_based` when no rule matches.
+    #[serde(default)]
+    pub strategy_fallback: Option<Target>,
 }
 
 impl Default for StrategyConfig {
@@ -206,6 +222,10 @@ impl Default for StrategyConfig {
         Self {
             mode: default_strategy_mode(),
             fallback_timeout_ms: 30000,
+            conditional_rules: Vec::new(),
+            content_rules: Vec::new(),
+            ab_variants: Vec::new(),
+            strategy_fallback: None,
         }
     }
 }
@@ -222,6 +242,55 @@ pub enum StrategyMode {
     LoadBalance,
     LeastLatency,
     CostOptimized,
+    Conditional,
+    #[serde(rename = "content_based")]
+    ContentBased,
+    #[serde(rename = "ab_test")]
+    ABTest,
+}
+
+/// Key a `conditional` rule matches against.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionKeyConfig {
+    Model,
+    ModelPrefix,
+}
+
+/// A single `conditional` strategy rule: if `key` matches `value`, route to
+/// `target`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalRuleConfig {
+    pub key: ConditionKeyConfig,
+    pub value: String,
+    pub target: Target,
+}
+
+/// Match type for a `content_based` rule.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentConditionTypeConfig {
+    PromptContains,
+    PromptNotContains,
+    PromptRegex,
+}
+
+/// A single `content_based` strategy rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentRuleConfig {
+    pub condition_type: ContentConditionTypeConfig,
+    pub value: String,
+    pub target: Target,
+}
+
+/// A single `ab_test` variant. A non-positive `weight` is treated as 1.0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ABVariantConfig {
+    pub target: Target,
+    #[serde(default)]
+    pub weight: f64,
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use futures::Stream;
 use himadri_circuitbreaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerTrait};
@@ -68,11 +68,34 @@ pub struct Gateway {
     model_index: RwLock<ModelLookupIndex>,
     usage_store: Arc<himadri_admin::UsageStore>,
     request_log: Arc<dyn himadri_admin::RequestLogStore>,
+    response_cache: Option<Arc<himadri_plugins::ResponseCachePlugin>>,
+    config_history: RwLock<ConfigHistory>,
+}
+
+/// In-memory record of applied config versions, enabling `/admin/config/history`
+/// and rollback. Backend-agnostic so it works in every build.
+#[derive(Default)]
+struct ConfigHistory {
+    entries: Vec<himadri_admin::ConfigHistoryEntry>,
+    next_version: u32,
+}
+
+impl ConfigHistory {
+    fn record(&mut self, config: Config, rolled_back_from: Option<u32>) {
+        let version = self.next_version.max(1);
+        self.next_version = version + 1;
+        self.entries.push(himadri_admin::ConfigHistoryEntry {
+            version,
+            updated_at: chrono::Utc::now(),
+            config,
+            rolled_back_from,
+        });
+    }
 }
 
 impl Gateway {
     pub fn new(config: Config, metrics: Arc<Metrics>) -> Self {
-        let strategy = Strategy::from_config_mode(&config.strategy.mode);
+        let strategy = Strategy::from_strategy_config(&config.strategy);
         let plugin_manager = Arc::new(PluginManager::new());
         let rate_limiter = RateLimiter::new(
             config.rate_limit.requests_per_second,
@@ -83,6 +106,9 @@ impl Gateway {
         let usage_store = Arc::new(himadri_admin::UsageStore::new());
         let request_log: Arc<dyn himadri_admin::RequestLogStore> =
             Arc::new(himadri_admin::InMemoryRequestLogStore::new());
+
+        let mut history = ConfigHistory::default();
+        history.record(config.clone(), None);
 
         Self {
             config: RwLock::new(config.clone()),
@@ -97,7 +123,23 @@ impl Gateway {
             model_index,
             usage_store,
             request_log,
+            response_cache: None,
+            config_history: RwLock::new(history),
         }
+    }
+
+    /// Enable exact-match response caching. When set, non-streaming completions
+    /// are served from cache on a hit and populated on a successful miss.
+    pub fn set_response_cache(&mut self, cache: Arc<himadri_plugins::ResponseCachePlugin>) {
+        self.response_cache = Some(cache);
+    }
+
+    /// Replace the request-log store. Defaults to an in-memory store (lost on
+    /// restart); call this with a persistent backend (e.g. Postgres) to durably
+    /// retain request logs.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub fn set_request_log_store(&mut self, store: Arc<dyn himadri_admin::RequestLogStore>) {
+        self.request_log = store;
     }
 
     pub fn register_provider(&self, provider: Arc<dyn Provider>) {
@@ -117,6 +159,161 @@ impl Gateway {
 
     pub fn set_plugin_manager(&mut self, manager: PluginManager) {
         self.plugin_manager = Arc::new(manager);
+    }
+
+    /// Execute a completion against an ordered list of targets, advancing to
+    /// the next target when a circuit breaker is open or the provider returns a
+    /// retryable error. Returns the target actually used, its result, and the
+    /// observed latency.
+    async fn execute_with_fallback(
+        &self,
+        request: &ChatCompletionRequest,
+        ordered: &[Target],
+    ) -> (
+        Target,
+        Result<ChatCompletionResponse, himadri_provider::ProviderError>,
+        std::time::Duration,
+    ) {
+        let mut last_target = ordered[0].clone();
+        let mut last_result = Err(himadri_provider::ProviderError::Internal(
+            "No targets attempted".to_string(),
+        ));
+        let mut last_latency = std::time::Duration::ZERO;
+
+        let last_idx = ordered.len() - 1;
+        for (idx, candidate) in ordered.iter().enumerate() {
+            let is_last = idx == last_idx;
+            last_target = candidate.clone();
+
+            // Circuit breaker for this provider (clone the Arc so we hold no
+            // DashMap reference across await points).
+            let cb = self
+                .circuit_breakers
+                .entry(candidate.provider.clone())
+                .or_insert_with(|| Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())))
+                .clone();
+
+            if !cb.allow().await {
+                last_result = Err(himadri_provider::ProviderError::Internal(format!(
+                    "Circuit breaker open for provider {}",
+                    candidate.provider
+                )));
+                if is_last {
+                    break;
+                }
+                continue;
+            }
+
+            // Provider lookup.
+            let provider = match self.providers.get(&candidate.provider) {
+                Some(p) => p.clone(),
+                None => {
+                    last_result = Err(himadri_provider::ProviderError::Internal(format!(
+                        "Provider not found: {}",
+                        candidate.provider
+                    )));
+                    if is_last {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // API key.
+            let api_key = match self.get_api_key(candidate) {
+                Ok(k) => k,
+                Err(e) => {
+                    last_result = Err(himadri_provider::ProviderError::Internal(e.to_string()));
+                    if is_last {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            // Execute.
+            let start = std::time::Instant::now();
+            let result = provider.complete(request, &api_key).await;
+            last_latency = start.elapsed();
+
+            // Circuit breaker + latency bookkeeping for this attempt.
+            match &result {
+                Ok(_) => cb.record_success().await,
+                Err(e) if e.retryable() => cb.record_failure().await,
+                Err(_) => {}
+            }
+            let attempt_ms = last_latency.as_millis() as u64;
+            if let Strategy::LeastLatency(state) = &*self.strategy.read().await {
+                state.store.record(&candidate.provider, attempt_ms).await;
+            }
+
+            match result {
+                Ok(resp) => {
+                    last_result = Ok(resp);
+                    break;
+                }
+                Err(e) if e.retryable() && !is_last => {
+                    warn!(
+                        "Provider {} failed with retryable error, falling back: {}",
+                        candidate.provider, e
+                    );
+                    last_result = Err(e);
+                    continue;
+                }
+                Err(e) => {
+                    last_result = Err(e);
+                    break;
+                }
+            }
+        }
+
+        (last_target, last_result, last_latency)
+    }
+
+    /// Generate embeddings, trying configured targets in order and falling back
+    /// when a provider doesn't support embeddings or returns a retryable error.
+    #[instrument(skip(self, request, auth), fields(model = %request.model))]
+    pub async fn embed(
+        &self,
+        request: himadri_core::EmbeddingRequest,
+        auth: Option<&AuthContext>,
+    ) -> Result<himadri_core::EmbeddingResponse, GatewayError> {
+        let config = self.config.read().await;
+        self.check_rate_limits(auth, &config)?;
+        drop(config);
+
+        let targets = self.targets.read().await.clone();
+        if targets.is_empty() {
+            return Err(GatewayError::Internal("No targets configured".to_string()));
+        }
+
+        let mut last_err =
+            GatewayError::Internal("No provider produced embeddings".to_string());
+
+        for target in &targets {
+            let provider = match self.providers.get(&target.provider) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            let api_key = match self.get_api_key(target) {
+                Ok(k) => k,
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+            };
+            match provider.embed(&request, &api_key).await {
+                Ok(resp) => return Ok(resp),
+                Err(himadri_provider::ProviderError::Unsupported(_)) => continue,
+                Err(e) if e.retryable() => {
+                    last_err = GatewayError::Provider(e.to_string());
+                    continue;
+                }
+                Err(e) => return Err(GatewayError::Provider(e.to_string())),
+            }
+        }
+
+        Err(last_err)
     }
 
     #[instrument(skip(self, request, auth), fields(model = %request.model))]
@@ -141,49 +338,29 @@ impl Gateway {
             .await
             .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
 
-        // Select provider via strategy
+        // Serve from response cache on an exact-match hit (non-streaming only).
+        if !request.stream {
+            if let Some(cache) = &self.response_cache {
+                if let Some(cached) = cache.get(&request).await {
+                    debug!("Response cache hit for model {}", request.model);
+                    self.metrics.cache_hits_total.inc();
+                    return Ok(cached);
+                }
+                self.metrics.cache_misses_total.inc();
+            }
+        }
+
+        // Select provider(s) via strategy, in priority order for failover.
         let strategy = self.strategy.read().await;
         let targets = self.targets.read().await;
-        let target = strategy.select(&request, &targets).await?;
+        let ordered = strategy.select_ordered(&request, &targets).await?;
         drop(strategy);
         drop(targets);
 
-        // Get circuit breaker
-        let cb = self
-            .circuit_breakers
-            .entry(target.provider.clone())
-            .or_insert_with(|| Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())));
-
-        if !cb.allow().await {
-            return Err(GatewayError::CircuitOpen(target.provider));
-        }
-
-        // Get provider
-        let provider = self
-            .providers
-            .get(&target.provider)
-            .ok_or_else(|| GatewayError::ProviderNotFound(target.provider.clone()))?;
-
-        // Get API key
-        let api_key = self.get_api_key(&target)?;
-
-        // Execute request
-        let start = std::time::Instant::now();
-        let result = provider.complete(&request, &api_key).await;
-        let latency = start.elapsed();
-
-        // Record circuit breaker state
-        match &result {
-            Ok(_) => cb.record_success().await,
-            Err(e) if e.retryable() => cb.record_failure().await,
-            Err(_) => {}
-        }
-
-        // Record latency for strategy (if applicable)
+        // Try targets in priority order, falling back on retryable failures or
+        // open circuit breakers.
+        let (target, result, latency) = self.execute_with_fallback(&request, &ordered).await;
         let latency_ms = latency.as_millis() as u64;
-        if let Strategy::LeastLatency(state) = &*self.strategy.read().await {
-            state.store.record(&target.provider, latency_ms).await;
-        }
 
         // Run after-request plugins
         let mut ctx = himadri_plugin::PluginContext::from_request(&request, auth);
@@ -345,6 +522,13 @@ impl Gateway {
             created_at: chrono::Utc::now(),
         });
 
+        // Populate the response cache on a successful, non-streaming completion.
+        if !request.stream {
+            if let (Some(cache), Ok(response)) = (&self.response_cache, &result) {
+                cache.insert(&request, response.clone()).await;
+            }
+        }
+
         result.map_err(|e| GatewayError::Provider(e.to_string()))
     }
 
@@ -373,37 +557,92 @@ impl Gateway {
             .await
             .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
 
-        // Select provider via strategy
+        // Select provider(s) via strategy, in priority order for failover.
         let strategy = self.strategy.read().await;
         let targets = self.targets.read().await;
-        let target = strategy.select(&request, &targets).await?;
+        let ordered = strategy.select_ordered(&request, &targets).await?;
         drop(strategy);
         drop(targets);
 
-        // Get circuit breaker
-        let cb = self
-            .circuit_breakers
-            .entry(target.provider.clone())
-            .or_insert_with(|| Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())));
+        // Try targets in priority order until one opens a stream. Failover for
+        // streaming only applies before the first chunk is produced — once a
+        // stream is established we cannot transparently switch providers.
+        let mut target = ordered[0].clone();
+        let mut stream = None;
+        let mut last_err: Option<GatewayError> = None;
+        let last_idx = ordered.len() - 1;
+        for (idx, candidate) in ordered.iter().enumerate() {
+            let is_last = idx == last_idx;
+            target = candidate.clone();
 
-        if !cb.allow().await {
-            return Err(GatewayError::CircuitOpen(target.provider));
+            let cb = self
+                .circuit_breakers
+                .entry(candidate.provider.clone())
+                .or_insert_with(|| Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())))
+                .clone();
+
+            if !cb.allow().await {
+                last_err = Some(GatewayError::CircuitOpen(candidate.provider.clone()));
+                if is_last {
+                    break;
+                }
+                continue;
+            }
+
+            let provider = match self.providers.get(&candidate.provider) {
+                Some(p) => p.clone(),
+                None => {
+                    last_err = Some(GatewayError::ProviderNotFound(candidate.provider.clone()));
+                    if is_last {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            let api_key = match self.get_api_key(candidate) {
+                Ok(k) => k,
+                Err(e) => {
+                    last_err = Some(e);
+                    if is_last {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            match provider.complete_stream(&request, &api_key).await {
+                Ok(s) => {
+                    cb.record_success().await;
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    if e.retryable() {
+                        cb.record_failure().await;
+                    }
+                    if e.retryable() && !is_last {
+                        warn!(
+                            "Provider {} failed to open stream, falling back: {}",
+                            candidate.provider, e
+                        );
+                        last_err = Some(GatewayError::Provider(e.to_string()));
+                        continue;
+                    }
+                    last_err = Some(GatewayError::Provider(e.to_string()));
+                    break;
+                }
+            }
         }
 
-        // Get provider
-        let provider = self
-            .providers
-            .get(&target.provider)
-            .ok_or_else(|| GatewayError::ProviderNotFound(target.provider.clone()))?;
-
-        // Get API key
-        let api_key = self.get_api_key(&target)?;
-
-        // Execute streaming request
-        let stream = provider
-            .complete_stream(&request, &api_key)
-            .await
-            .map_err(|e| GatewayError::Provider(e.to_string()))?;
+        let stream = match stream {
+            Some(s) => s,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    GatewayError::Internal("No targets produced a stream".to_string())
+                }))
+            }
+        };
 
         // Log audit event for stream start
         {
@@ -463,13 +702,15 @@ impl Gateway {
         Ok(Box::pin(wrapped_stream))
     }
 
-    pub async fn reload_config(&self, config: Config) -> Result<(), GatewayError> {
+    /// Validate and apply a config to the live gateway (strategy, targets,
+    /// limiter/circuit-breaker state) without touching version history.
+    async fn apply_config(&self, config: Config) -> Result<(), GatewayError> {
         config.validate()?;
         // Hold all 3 write locks simultaneously to prevent inconsistent reads
         let mut strategy = self.strategy.write().await;
         let mut cfg = self.config.write().await;
         let mut targets = self.targets.write().await;
-        *strategy = Strategy::from_config_mode(&config.strategy.mode);
+        *strategy = Strategy::from_strategy_config(&config.strategy);
         *cfg = config.clone();
         *targets = config.targets;
         drop(strategy);
@@ -478,6 +719,43 @@ impl Gateway {
         // Clear stale rate limiter and circuit breaker state
         self.rate_limiter.clear();
         self.circuit_breakers.clear();
+        Ok(())
+    }
+
+    pub async fn reload_config(&self, config: Config) -> Result<(), GatewayError> {
+        self.apply_config(config.clone()).await?;
+        self.config_history.write().await.record(config, None);
+        Ok(())
+    }
+
+    /// Return the recorded config versions, newest first.
+    pub async fn config_history(&self) -> Vec<himadri_admin::ConfigHistoryEntry> {
+        let mut entries = self.config_history.read().await.entries.clone();
+        entries.reverse();
+        entries
+    }
+
+    /// Roll back to a previously recorded config version. The restored config is
+    /// applied and recorded as a new version tagged with the version it was
+    /// rolled back from.
+    pub async fn rollback_config(&self, version: u32) -> Result<(), GatewayError> {
+        let target = self
+            .config_history
+            .read()
+            .await
+            .entries
+            .iter()
+            .find(|e| e.version == version)
+            .map(|e| e.config.clone())
+            .ok_or_else(|| {
+                GatewayError::BadRequest(format!("Config version {} not found", version))
+            })?;
+
+        self.apply_config(target.clone()).await?;
+        self.config_history
+            .write()
+            .await
+            .record(target, Some(version));
         Ok(())
     }
 
@@ -986,5 +1264,65 @@ where
         request,
         auth,
         guardrails_ran: false,
+    }
+}
+
+#[cfg(test)]
+mod config_history_tests {
+    use super::*;
+    use himadri_core::Config;
+    use himadri_observability::Metrics;
+
+    fn gateway() -> Gateway {
+        Gateway::new(Config::default(), Arc::new(Metrics::new()))
+    }
+
+    #[tokio::test]
+    async fn history_seeded_with_initial_version() {
+        let gw = gateway();
+        let history = gw.config_history().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, 1);
+        assert!(history[0].rolled_back_from.is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_appends_a_version() {
+        let gw = gateway();
+        let mut cfg = Config::default();
+        cfg.strategy.fallback_timeout_ms = 12345;
+        gw.reload_config(cfg).await.unwrap();
+
+        let history = gw.config_history().await;
+        assert_eq!(history.len(), 2);
+        // Newest first.
+        assert_eq!(history[0].version, 2);
+        assert_eq!(history[0].config.strategy.fallback_timeout_ms, 12345);
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_and_records_new_version() {
+        let gw = gateway();
+
+        // v2 with a distinctive value.
+        let mut cfg = Config::default();
+        cfg.strategy.fallback_timeout_ms = 999;
+        gw.reload_config(cfg).await.unwrap();
+        assert_eq!(gw.get_config().await.strategy.fallback_timeout_ms, 999);
+
+        // Roll back to v1 (default timeout 30000).
+        gw.rollback_config(1).await.unwrap();
+        assert_eq!(gw.get_config().await.strategy.fallback_timeout_ms, 30000);
+
+        let history = gw.config_history().await;
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].version, 3);
+        assert_eq!(history[0].rolled_back_from, Some(1));
+    }
+
+    #[tokio::test]
+    async fn rollback_unknown_version_errors() {
+        let gw = gateway();
+        assert!(gw.rollback_config(999).await.is_err());
     }
 }

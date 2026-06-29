@@ -10,6 +10,7 @@ use crate::jwt::JwtClaims;
 /// OIDC discovery and JWKS management
 pub struct OidcDiscovery {
     issuer: String,
+    audience: String,
     jwks_uri: String,
     jwks: RwLock<Vec<jsonwebtoken::jwk::Jwk>>,
     last_refresh: parking_lot::Mutex<std::time::Instant>,
@@ -28,8 +29,14 @@ struct OidcConfig {
 }
 
 impl OidcDiscovery {
-    /// Create a new OIDC discovery instance
-    pub async fn new(issuer: &str, jwks_uri: Option<&str>) -> Result<Arc<Self>, AuthError> {
+    /// Create a new OIDC discovery instance.
+    ///
+    /// `audience` is the expected `aud` claim (typically the OAuth client id).
+    pub async fn new(
+        issuer: &str,
+        audience: &str,
+        jwks_uri: Option<&str>,
+    ) -> Result<Arc<Self>, AuthError> {
         let client = reqwest::Client::new();
 
         let jwks_uri = if let Some(uri) = jwks_uri {
@@ -64,6 +71,7 @@ impl OidcDiscovery {
 
         let discovery = Arc::new(Self {
             issuer: issuer.to_string(),
+            audience: audience.to_string(),
             jwks_uri,
             jwks: RwLock::new(jwks.keys),
             last_refresh: parking_lot::Mutex::new(std::time::Instant::now()),
@@ -97,7 +105,7 @@ impl OidcDiscovery {
 
         // Decode and validate
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-        validation.set_audience(&[&self.issuer]);
+        validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
 
         let token_data = jsonwebtoken::decode::<JwtClaims>(
@@ -164,14 +172,16 @@ static DISCOVERY_CACHE: once_cell::sync::Lazy<DashMap<String, Arc<OidcDiscovery>
 /// Get or create an OIDC discovery instance
 pub async fn get_or_create_discovery(
     issuer: &str,
+    audience: &str,
     jwks_uri: Option<&str>,
 ) -> Result<Arc<OidcDiscovery>, AuthError> {
-    if let Some(discovery) = DISCOVERY_CACHE.get(issuer) {
+    let cache_key = format!("{}|{}", issuer, audience);
+    if let Some(discovery) = DISCOVERY_CACHE.get(&cache_key) {
         return Ok(discovery.clone());
     }
 
-    let discovery = OidcDiscovery::new(issuer, jwks_uri).await?;
-    DISCOVERY_CACHE.insert(issuer.to_string(), discovery.clone());
+    let discovery = OidcDiscovery::new(issuer, audience, jwks_uri).await?;
+    DISCOVERY_CACHE.insert(cache_key, discovery.clone());
 
     Ok(discovery)
 }

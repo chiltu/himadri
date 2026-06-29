@@ -134,6 +134,8 @@ fn test_request(model: &str) -> ChatCompletionRequest {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
+        tools: None,
+        tool_choice: None,
         extra: Default::default(),
     }
 }
@@ -676,6 +678,8 @@ async fn test_word_filter_rejects_blocked_content() {
             presence_penalty: None,
             frequency_penalty: None,
             user: None,
+            tools: None,
+            tool_choice: None,
             extra: Default::default(),
         },
         None,
@@ -704,6 +708,8 @@ async fn test_max_token_rejects_over_limit() {
             presence_penalty: None,
             frequency_penalty: None,
             user: None,
+            tools: None,
+            tool_choice: None,
             extra: Default::default(),
         },
         None,

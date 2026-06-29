@@ -44,6 +44,29 @@ mod tests {
     }
 
     #[test]
+    fn test_jwt_claims_aud_accepts_array() {
+        // Zitadel (and many OIDC providers) issue `aud` as an array. RFC 7519
+        // permits both a string and an array of strings.
+        let json = serde_json::json!({
+            "sub": "u1", "iss": "http://localhost:8080",
+            "aud": ["proj-123", "client-456"],
+            "exp": 9999999999u64, "iat": 0
+        });
+        let claims: JwtClaims = serde_json::from_value(json).unwrap();
+        assert_eq!(claims.aud, "proj-123,client-456");
+    }
+
+    #[test]
+    fn test_jwt_claims_aud_accepts_string() {
+        let json = serde_json::json!({
+            "sub": "u1", "iss": "http://localhost:8080",
+            "aud": "single-aud", "exp": 9999999999u64, "iat": 0
+        });
+        let claims: JwtClaims = serde_json::from_value(json).unwrap();
+        assert_eq!(claims.aud, "single-aud");
+    }
+
+    #[test]
     fn test_jwt_claims_is_expired() {
         assert!(make_test_claims(0).is_expired());
     }

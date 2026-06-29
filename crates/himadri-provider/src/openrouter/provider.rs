@@ -107,6 +107,12 @@ impl OpenRouterProvider {
         if let Some(user) = &request.user {
             body["user"] = serde_json::Value::String(user.clone());
         }
+        if let Some(tools) = &request.tools {
+            body["tools"] = serde_json::json!(tools);
+        }
+        if let Some(tool_choice) = &request.tool_choice {
+            body["tool_choice"] = tool_choice.clone();
+        }
 
         body
     }

@@ -112,6 +112,43 @@ impl BedrockProvider {
             body["stop_sequences"] = serde_json::json!(stop);
         }
 
+        // Bedrock Claude models use the Anthropic tool schema.
+        if let Some(tools) = &request.tools {
+            let anthropic_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "input_schema": t.function.parameters
+                            .clone()
+                            .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(anthropic_tools);
+
+            if let Some(choice) = &request.tool_choice {
+                let translated = match choice {
+                    serde_json::Value::String(s) => match s.as_str() {
+                        "auto" => Some(serde_json::json!({"type": "auto"})),
+                        "required" => Some(serde_json::json!({"type": "any"})),
+                        "none" => Some(serde_json::json!({"type": "none"})),
+                        _ => None,
+                    },
+                    serde_json::Value::Object(obj) => obj
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|n| serde_json::json!({"type": "tool", "name": n})),
+                    _ => None,
+                };
+                if let Some(tc) = translated {
+                    body["tool_choice"] = tc;
+                }
+            }
+        }
+
         body
     }
 

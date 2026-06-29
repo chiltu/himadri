@@ -27,7 +27,34 @@ impl ResponseCachePlugin {
         })
     }
 
-    fn cache_key(request: &himadri_core::ChatCompletionRequest) -> String {
+    /// Look up a previously cached response for this request, if any.
+    pub async fn get(
+        &self,
+        request: &himadri_core::ChatCompletionRequest,
+    ) -> Option<himadri_core::ChatCompletionResponse> {
+        let key = Self::cache_key(request);
+        self.cache.get(&key).await.map(|c| c.response)
+    }
+
+    /// Store a response for this request.
+    pub async fn insert(
+        &self,
+        request: &himadri_core::ChatCompletionRequest,
+        response: himadri_core::ChatCompletionResponse,
+    ) {
+        let key = Self::cache_key(request);
+        self.cache
+            .insert(
+                key,
+                CachedResponse {
+                    response,
+                    cached_at: chrono::Utc::now(),
+                },
+            )
+            .await;
+    }
+
+    pub fn cache_key(request: &himadri_core::ChatCompletionRequest) -> String {
         let mut hasher = Sha256::new();
         hasher.update(&request.model);
 
@@ -87,5 +114,103 @@ impl Plugin for ResponseCachePlugin {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use himadri_core::{
+        ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent,
+        ResponseMessage, Role,
+    };
+
+    fn request(model: &str, prompt: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Some(MessageContent::Text(prompt.to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stop: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+            extra: Default::default(),
+        }
+    }
+
+    fn response(content: &str) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "resp-1".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ResponseMessage {
+                    role: Role::Assistant,
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+            system_fingerprint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn miss_then_hit_roundtrip() {
+        let cache = ResponseCachePlugin::new(100, Duration::from_secs(60));
+        let req = request("gpt-4", "hello");
+
+        assert!(cache.get(&req).await.is_none(), "cold cache should miss");
+
+        cache.insert(&req, response("hi there")).await;
+
+        let hit = cache.get(&req).await.expect("warm cache should hit");
+        assert_eq!(hit.choices[0].message.content.as_deref(), Some("hi there"));
+    }
+
+    #[tokio::test]
+    async fn different_prompts_do_not_collide() {
+        let cache = ResponseCachePlugin::new(100, Duration::from_secs(60));
+        cache.insert(&request("gpt-4", "first"), response("A")).await;
+        cache
+            .insert(&request("gpt-4", "second"), response("B"))
+            .await;
+
+        assert_eq!(
+            cache
+                .get(&request("gpt-4", "first"))
+                .await
+                .unwrap()
+                .choices[0]
+                .message
+                .content
+                .as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            cache
+                .get(&request("gpt-4", "second"))
+                .await
+                .unwrap()
+                .choices[0]
+                .message
+                .content
+                .as_deref(),
+            Some("B")
+        );
     }
 }

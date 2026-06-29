@@ -15,6 +15,8 @@ pub struct Metrics {
     pub rate_limit_rejections: IntCounter,
     pub circuit_breaker_state: IntGauge,
     pub active_connections: IntGauge,
+    pub cache_hits_total: IntCounter,
+    pub cache_misses_total: IntCounter,
 }
 
 impl Metrics {
@@ -83,6 +85,18 @@ impl Metrics {
         ))
         .unwrap();
 
+        let cache_hits_total = IntCounter::with_opts(Opts::new(
+            "himadri_cache_hits_total",
+            "Total response cache hits",
+        ))
+        .unwrap();
+
+        let cache_misses_total = IntCounter::with_opts(Opts::new(
+            "himadri_cache_misses_total",
+            "Total response cache misses",
+        ))
+        .unwrap();
+
         registry.register(Box::new(requests_total.clone())).unwrap();
         registry
             .register(Box::new(request_duration.clone()))
@@ -106,6 +120,12 @@ impl Metrics {
         registry
             .register(Box::new(active_connections.clone()))
             .unwrap();
+        registry
+            .register(Box::new(cache_hits_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(cache_misses_total.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -118,6 +138,8 @@ impl Metrics {
             rate_limit_rejections,
             circuit_breaker_state,
             active_connections,
+            cache_hits_total,
+            cache_misses_total,
         }
     }
 
