@@ -102,6 +102,47 @@ mod tests {
     }
 
     #[test]
+    fn test_jwt_claims_zitadel_project_roles() {
+        // Zitadel emits granted project roles under a URN-namespaced claim whose
+        // value is an object keyed by role name. It should land in `custom` and
+        // be surfaced by roles()/into_auth_context().
+        let json = serde_json::json!({
+            "sub": "user123", "iss": "http://localhost:8080",
+            "aud": "client", "exp": 9999999999u64, "iat": 0,
+            "urn:zitadel:iam:org:project:roles": {
+                "admin": { "orgid1": "example.com" },
+                "user": { "orgid1": "example.com" }
+            }
+        });
+        let claims: JwtClaims = serde_json::from_value(json).unwrap();
+
+        let roles = claims.roles();
+        assert!(roles.contains(&"admin".to_string()));
+        assert!(roles.contains(&"user".to_string()));
+
+        let auth_ctx = claims.into_auth_context();
+        assert_eq!(auth_ctx.scope, himadri_core::AuthScope::Admin);
+        assert!(auth_ctx.has_role("user"));
+        assert!(auth_ctx.has_role("admin"));
+    }
+
+    #[test]
+    fn test_jwt_claims_project_scoped_roles_claim() {
+        // The project-scoped variant urn:...:project:{id}:roles is also honored.
+        let json = serde_json::json!({
+            "sub": "user123", "iss": "http://localhost:8080",
+            "aud": "client", "exp": 9999999999u64, "iat": 0,
+            "urn:zitadel:iam:org:project:300000000000000001:roles": {
+                "read-only": { "orgid1": "example.com" }
+            }
+        });
+        let claims: JwtClaims = serde_json::from_value(json).unwrap();
+        let auth_ctx = claims.into_auth_context();
+        assert_eq!(auth_ctx.scope, himadri_core::AuthScope::ReadOnly);
+        assert!(auth_ctx.has_role("read-only"));
+    }
+
+    #[test]
     fn test_jwt_claims_rate_limit_override() {
         let mut claims = make_test_claims(9999999999);
         claims.rate_limit_rpm = Some(600);

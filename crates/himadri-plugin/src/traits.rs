@@ -27,6 +27,14 @@ pub trait Plugin: Send + Sync {
 
     fn stage(&self) -> Stage;
 
+    /// Whether this plugin should *also* run during the after-request stage, in
+    /// addition to its primary `stage()`. Used by plugins that both gate a
+    /// request (before) and record an outcome from the response (after), such as
+    /// the budget plugin. Defaults to `false`.
+    fn also_after_request(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, ctx: &mut PluginContext) -> Result<(), PluginError>;
 }
 

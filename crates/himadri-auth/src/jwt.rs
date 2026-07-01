@@ -142,11 +142,49 @@ impl JwtClaims {
             .unwrap_or_default()
     }
 
-    /// Convert to AuthContext with rate limit overrides from claims
+    /// Collect all roles granted to the principal.
+    ///
+    /// Combines two sources:
+    /// 1. The flat `roles` claim (a JSON array of strings), if present.
+    /// 2. Zitadel project-role claims. Zitadel emits granted project roles under
+    ///    a URN-namespaced key — either `urn:zitadel:iam:org:project:roles` or
+    ///    the project-scoped `urn:zitadel:iam:org:project:{project_id}:roles` —
+    ///    whose value is an object whose *keys* are the role names, e.g.
+    ///    `{ "admin": { "<org_id>": "<domain>" }, "user": { ... } }`.
+    pub fn roles(&self) -> Vec<String> {
+        let mut roles: Vec<String> = self.roles.clone().unwrap_or_default();
+
+        for (key, value) in &self.custom {
+            if key.starts_with("urn:zitadel:iam:org:project:") && key.ends_with(":roles") {
+                if let Some(map) = value.as_object() {
+                    roles.extend(map.keys().cloned());
+                }
+            }
+        }
+
+        roles.sort();
+        roles.dedup();
+        roles
+    }
+
+    /// Convert to AuthContext with roles and rate limit overrides from claims.
+    ///
+    /// Scope is derived from roles first (so Zitadel RBAC drives the gateway's
+    /// Admin/ReadOnly distinction) and falls back to the OAuth `scope` string.
     pub fn into_auth_context(self) -> himadri_core::AuthContext {
-        let scope = if self.scopes().contains(&"admin".to_string()) {
+        let roles = self.roles();
+        let scopes = self.scopes();
+
+        let is_admin = roles.iter().any(|r| r == "admin" || r == "gateway-admin")
+            || scopes.contains(&"admin".to_string());
+        let is_readonly = roles
+            .iter()
+            .any(|r| r == "read-only" || r == "readonly" || r == "read")
+            || scopes.contains(&"read".to_string());
+
+        let scope = if is_admin {
             himadri_core::AuthScope::Admin
-        } else if self.scopes().contains(&"read".to_string()) {
+        } else if is_readonly {
             himadri_core::AuthScope::ReadOnly
         } else {
             himadri_core::AuthScope::ApiKey
@@ -168,6 +206,8 @@ impl JwtClaims {
             team_id: self.team_id.clone(),
             user_id: Some(self.sub),
             rate_limit_override,
+            roles,
+            budget_limit_usd: self.budget_limit_usd,
         }
     }
 }

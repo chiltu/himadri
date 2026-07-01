@@ -20,6 +20,8 @@ mod tests {
             team_id: None,
             user_id: None,
             rate_limit_override: None,
+            roles: Vec::new(),
+            budget_limit_usd: None,
         };
         assert_eq!(ctx.scope, AuthScope::Admin);
     }
@@ -34,6 +36,8 @@ mod tests {
             team_id: None,
             user_id: None,
             rate_limit_override: None,
+            roles: Vec::new(),
+            budget_limit_usd: None,
         };
         assert_eq!(ctx.scope, AuthScope::ReadOnly);
     }
@@ -48,6 +52,8 @@ mod tests {
             team_id: None,
             user_id: None,
             rate_limit_override: None,
+            roles: Vec::new(),
+            budget_limit_usd: None,
         };
         assert_eq!(ctx.scope, AuthScope::ApiKey);
     }

@@ -41,6 +41,10 @@ pub enum AuditStatus {
     Error,
     RateLimited,
     GuardrailBlocked,
+    /// Authentication failed (401): missing/invalid/expired token.
+    Unauthorized,
+    /// Authenticated but not permitted (403): failed role/RBAC check.
+    Forbidden,
 }
 
 pub struct AuditLog {
@@ -77,6 +81,47 @@ impl AuditLog {
             }
         }
         let _ = self.sender.send(event);
+    }
+
+    /// Record an authentication/authorization failure (401/403). Only minimal
+    /// context is available at the auth boundary — no request body — so the
+    /// model/messages fields are left empty and the cause goes in `error`.
+    pub fn log_auth_failure(
+        &self,
+        status: AuditStatus,
+        reason: impl Into<String>,
+        remote_ip: Option<String>,
+        user_id: Option<String>,
+        key_id: Option<String>,
+    ) {
+        let reason = reason.into();
+        let error = match remote_ip {
+            Some(ip) => format!("{} (ip: {})", reason, ip),
+            None => reason,
+        };
+        self.log(AuditEvent {
+            request_id: format!(
+                "auth-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ),
+            timestamp: Utc::now(),
+            org_id: None,
+            team_id: None,
+            user_id,
+            key_id,
+            model: String::new(),
+            provider: None,
+            messages: Vec::new(),
+            response: None,
+            latency_ms: 0,
+            tokens_prompt: None,
+            tokens_completion: None,
+            tokens_total: None,
+            status,
+            error: Some(error),
+            guardrail_actions: Vec::new(),
+            stream: false,
+        });
     }
 
     async fn write_loop(dir: PathBuf, mut receiver: mpsc::UnboundedReceiver<AuditEvent>) {

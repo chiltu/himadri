@@ -63,6 +63,7 @@ impl IntrospectionResult {
         let sub = self.sub.unwrap_or_else(|| "unknown".to_string());
 
         let scope = self.scope.as_deref().unwrap_or("");
+        let roles: Vec<String> = scope.split_whitespace().map(|s| s.to_string()).collect();
         let auth_scope = if scope.contains("admin") {
             himadri_core::AuthScope::Admin
         } else if scope.contains("read") {
@@ -79,6 +80,8 @@ impl IntrospectionResult {
             team_id: None,
             user_id: Some(sub),
             rate_limit_override: None,
+            roles,
+            budget_limit_usd: None,
         })
     }
 }

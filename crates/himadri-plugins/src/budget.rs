@@ -204,6 +204,11 @@ impl Plugin for BudgetPlugin {
         Stage::BeforeRequest
     }
 
+    fn also_after_request(&self) -> bool {
+        // Run again after the request so we can record cost from the response.
+        true
+    }
+
     async fn execute(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
         let key = match Self::get_api_key(ctx) {
             Some(k) => k,
@@ -214,8 +219,10 @@ impl Plugin for BudgetPlugin {
             // After-request stage: record cost
             self.record_cost(ctx, &key);
         } else {
-            // Before-request stage: check budget
-            self.check_budget(&key)?;
+            // Before-request stage: check budget. A per-principal cap from the
+            // auth context (e.g. JWT `budget_limit_usd`) overrides the global one.
+            let per_principal = ctx.auth.as_ref().and_then(|a| a.budget_limit_usd);
+            self.check_budget(&key, per_principal)?;
         }
 
         Ok(())
@@ -223,18 +230,29 @@ impl Plugin for BudgetPlugin {
 }
 
 impl BudgetPlugin {
-    fn check_budget(&self, key: &str) -> Result<(), PluginError> {
-        if self.spend_limit_usd <= 0.0 {
+    /// Resolve the effective cumulative spend cap: a positive per-principal cap
+    /// takes precedence over the gateway's global limit. `0`/`None` means the
+    /// global limit applies; a global limit of `0` means unlimited.
+    fn effective_limit(&self, per_principal: Option<f64>) -> f64 {
+        match per_principal {
+            Some(limit) if limit > 0.0 => limit,
+            _ => self.spend_limit_usd,
+        }
+    }
+
+    fn check_budget(&self, key: &str, per_principal: Option<f64>) -> Result<(), PluginError> {
+        let limit = self.effective_limit(per_principal);
+        if limit <= 0.0 {
             return Ok(()); // Unlimited
         }
 
         let current = self.store.get(key);
-        if current >= self.spend_limit_usd {
+        if current >= limit {
             return Err(PluginError::Rejected {
                 name: self.name().to_string(),
                 reason: format!(
                     "budget exceeded: spent ${:.4} of ${:.2} limit",
-                    current, self.spend_limit_usd
+                    current, limit
                 ),
             });
         }
@@ -315,6 +333,109 @@ mod tests {
             system_fingerprint: None,
         });
         ctx
+    }
+
+    fn auth_with_budget(api_key: &str, budget: Option<f64>) -> himadri_core::AuthContext {
+        himadri_core::AuthContext {
+            api_key: api_key.to_string(),
+            key_id: None,
+            scope: himadri_core::AuthScope::ApiKey,
+            org_id: None,
+            team_id: None,
+            user_id: None,
+            rate_limit_override: None,
+            roles: Vec::new(),
+            budget_limit_usd: budget,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_per_principal_limit_overrides_global() {
+        // Global limit is generous; the principal's own $0.001 cap is stricter.
+        let plugin = BudgetPlugin::new(BudgetConfig {
+            store_id: Some("test-per-principal".to_string()),
+            spend_limit_usd: Some(1000.0),
+            input_per_m_tokens: Some(3.0),
+            output_per_m_tokens: Some(15.0),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let api_key = "jwt:user-pp";
+
+        // Record (100/1M*3)+(50/1M*15) = 0.00105 USD against the principal.
+        let mut after = make_response_ctx(api_key, 100, 50);
+        after.auth = Some(auth_with_budget(api_key, Some(0.001)));
+        plugin.execute(&mut after).await.unwrap();
+
+        // Below the generous global limit, but over the $0.001 per-principal cap.
+        let mut before = make_request_ctx(Some(api_key));
+        before.auth = Some(auth_with_budget(api_key, Some(0.001)));
+        let result = plugin.execute(&mut before).await;
+        assert!(matches!(result, Err(PluginError::Rejected { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_per_principal_limit_with_no_global() {
+        // No global limit (0 = unlimited globally); enforcement comes purely
+        // from the per-principal cap.
+        let plugin = BudgetPlugin::new(BudgetConfig {
+            store_id: Some("test-pp-no-global".to_string()),
+            spend_limit_usd: Some(0.0),
+            input_per_m_tokens: Some(3.0),
+            output_per_m_tokens: Some(15.0),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let api_key = "jwt:user-pp2";
+
+        let mut after = make_response_ctx(api_key, 100, 50);
+        after.auth = Some(auth_with_budget(api_key, Some(0.001)));
+        plugin.execute(&mut after).await.unwrap();
+
+        let mut before = make_request_ctx(Some(api_key));
+        before.auth = Some(auth_with_budget(api_key, Some(0.001)));
+        assert!(plugin.execute(&mut before).await.is_err());
+
+        // A different principal with no cap is unaffected (unlimited).
+        let mut other = make_request_ctx(Some("jwt:user-free"));
+        other.auth = Some(auth_with_budget("jwt:user-free", None));
+        assert!(plugin.execute(&mut other).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_records_cost_through_plugin_manager() {
+        // Regression: the budget plugin must record cost during the after-request
+        // stage when driven through PluginManager (it registers in both stages).
+        use himadri_plugin::manager::PluginManager;
+
+        let plugin = BudgetPlugin::new(BudgetConfig {
+            store_id: Some("test-via-manager".to_string()),
+            spend_limit_usd: Some(0.001),
+            input_per_m_tokens: Some(3.0),
+            output_per_m_tokens: Some(15.0),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut manager = PluginManager::new();
+        manager.register(plugin);
+
+        let api_key = "key-mgr";
+
+        // First request passes the budget check.
+        let mut before = make_request_ctx(Some(api_key));
+        manager.run_before(&mut before).await.unwrap();
+
+        // After the request, cost is recorded via the after-request stage.
+        let mut after = make_response_ctx(api_key, 100, 50);
+        manager.run_after(&mut after).await.unwrap();
+
+        // The next request is now over budget.
+        let mut before2 = make_request_ctx(Some(api_key));
+        let result = manager.run_before(&mut before2).await;
+        assert!(matches!(result, Err(PluginError::Rejected { .. })));
     }
 
     #[test]

@@ -94,57 +94,16 @@ impl Routes {
         let providers = routes.gateway.list_providers();
         let mut models = Vec::new();
 
-        for provider in &providers {
-            match provider.as_str() {
-                "openai" => {
+        for provider_name in &providers {
+            if let Some(provider) = routes.gateway.get_provider(provider_name) {
+                for model_id in provider.supported_models() {
                     models.push(ModelObject {
-                        id: "gpt-4".to_string(),
+                        id: model_id,
                         object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "openai".to_string(),
-                    });
-                    models.push(ModelObject {
-                        id: "gpt-4o".to_string(),
-                        object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "openai".to_string(),
-                    });
-                    models.push(ModelObject {
-                        id: "gpt-3.5-turbo".to_string(),
-                        object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "openai".to_string(),
+                        created: 0,
+                        owned_by: provider_name.clone(),
                     });
                 }
-                "anthropic" => {
-                    models.push(ModelObject {
-                        id: "claude-3-5-sonnet-20241022".to_string(),
-                        object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "anthropic".to_string(),
-                    });
-                    models.push(ModelObject {
-                        id: "claude-3-opus-20240229".to_string(),
-                        object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "anthropic".to_string(),
-                    });
-                }
-                "gemini" => {
-                    models.push(ModelObject {
-                        id: "gemini-2.0-flash".to_string(),
-                        object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "google".to_string(),
-                    });
-                    models.push(ModelObject {
-                        id: "gemini-1.5-pro".to_string(),
-                        object: "model".to_string(),
-                        created: 1686935002,
-                        owned_by: "google".to_string(),
-                    });
-                }
-                _ => {}
             }
         }
 

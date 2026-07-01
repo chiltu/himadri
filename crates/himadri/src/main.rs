@@ -185,22 +185,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     plugin_manager.register(MaxTokenPlugin::new(4096));
     plugin_manager.register(RequestLoggerPlugin::new());
 
-    // Register budget plugin if configured
-    if let Ok(spend_limit) = std::env::var("BUDGET_SPEND_LIMIT_USD") {
-        if let Ok(limit) = spend_limit.parse::<f64>() {
-            if let Ok(budget_plugin) = BudgetPlugin::new(BudgetConfig {
-                spend_limit_usd: Some(limit),
-                input_per_m_tokens: std::env::var("BUDGET_INPUT_PER_M_TOKENS")
-                    .ok()
-                    .and_then(|v| v.parse().ok()),
-                output_per_m_tokens: std::env::var("BUDGET_OUTPUT_PER_M_TOKENS")
-                    .ok()
-                    .and_then(|v| v.parse().ok()),
-                ..Default::default()
-            }) {
+    // Register the budget plugin when a global spend limit and/or token pricing
+    // is configured. Pricing alone is enough: per-principal caps (e.g. a JWT
+    // `budget_limit_usd` claim) are enforced against accumulated cost, which
+    // requires pricing but not a global limit.
+    let global_spend_limit = std::env::var("BUDGET_SPEND_LIMIT_USD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let input_per_m = std::env::var("BUDGET_INPUT_PER_M_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let output_per_m = std::env::var("BUDGET_OUTPUT_PER_M_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+
+    if global_spend_limit.is_some() || input_per_m.is_some() || output_per_m.is_some() {
+        match BudgetPlugin::new(BudgetConfig {
+            spend_limit_usd: Some(global_spend_limit.unwrap_or(0.0)),
+            input_per_m_tokens: input_per_m,
+            output_per_m_tokens: output_per_m,
+            ..Default::default()
+        }) {
+            Ok(budget_plugin) => {
                 plugin_manager.register(budget_plugin);
-                info!("Registered budget plugin with ${:.2} limit", limit);
+                match global_spend_limit {
+                    Some(limit) => info!(
+                        "Registered budget plugin (global ${:.2} limit; per-principal caps honored)",
+                        limit
+                    ),
+                    None => info!(
+                        "Registered budget plugin (no global limit; per-principal caps honored)"
+                    ),
+                }
             }
+            Err(e) => tracing::error!("Budget plugin not registered: {}", e),
         }
     }
 
@@ -341,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let combined_auth = Arc::new(combined_auth::CombinedAuth::new(
         auth.clone(),
         jwt_discovery,
+        Some(gateway.audit_log_arc()),
     ));
 
     let state = AppState {
@@ -466,184 +485,26 @@ async fn metrics_handler(State(state): State<AppState>) -> String {
 }
 
 async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
+    let admin_models = state.admin.list_enabled_models_for_api().await;
+    if !admin_models.is_empty() {
+        return Json(ModelListResponse {
+            object: "list".to_string(),
+            data: admin_models,
+        });
+    }
+
     let providers = state.gateway.list_providers();
     let mut models = Vec::new();
-
-    for provider in &providers {
-        match provider.as_str() {
-            "openai" => {
+    for provider_name in &providers {
+        if let Some(provider) = state.gateway.get_provider(provider_name) {
+            for model_id in provider.supported_models() {
                 models.push(ModelObject {
-                    id: "gpt-4".to_string(),
+                    id: model_id,
                     object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gpt-4-turbo".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gpt-4o".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gpt-4o-mini".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gpt-3.5-turbo".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "o1".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "o1-mini".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openai".to_string(),
+                    created: 0,
+                    owned_by: provider_name.clone(),
                 });
             }
-            "anthropic" => {
-                models.push(ModelObject {
-                    id: "claude-3-5-sonnet-20241022".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "anthropic".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "claude-3-5-haiku-20241022".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "anthropic".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "claude-3-opus-20240229".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "anthropic".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "claude-3-haiku-20240307".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "anthropic".to_string(),
-                });
-            }
-            "gemini" => {
-                models.push(ModelObject {
-                    id: "gemini-2.0-flash".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "google".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gemini-1.5-pro".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "google".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gemini-1.5-flash".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "google".to_string(),
-                });
-            }
-            "azure-openai" => {
-                models.push(ModelObject {
-                    id: "gpt-4".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "azure".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "gpt-4o".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "azure".to_string(),
-                });
-            }
-            "bedrock" => {
-                models.push(ModelObject {
-                    id: "anthropic.claude-3-5-sonnet-20241022-v2:0".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "aws".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "anthropic.claude-3-opus-20240229-v1:0".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "aws".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "meta.llama3-70b-instruct-v1:0".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "aws".to_string(),
-                });
-            }
-            "openrouter" => {
-                models.push(ModelObject {
-                    id: "openrouter/auto".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openrouter".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "openai/gpt-4o".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openrouter".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "anthropic/claude-3.5-sonnet".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "openrouter".to_string(),
-                });
-            }
-            "together" => {
-                models.push(ModelObject {
-                    id: "meta-llama/Llama-3-70b-chat-hf".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "together".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "mistralai/Mixtral-8x7B-Instruct-v0.1".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "together".to_string(),
-                });
-            }
-            "groq" => {
-                models.push(ModelObject {
-                    id: "llama3-70b-8192".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "groq".to_string(),
-                });
-                models.push(ModelObject {
-                    id: "mixtral-8x7b-32768".to_string(),
-                    object: "model".to_string(),
-                    created: 1686935002,
-                    owned_by: "groq".to_string(),
-                });
-            }
-            _ => {}
         }
     }
 
@@ -827,10 +688,34 @@ async fn rotate_key(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn passthrough(State(_state): State<AppState>, _request: axum::extract::Request) -> Response {
-    error_to_response(GatewayError::NotFound(
-        "Endpoint not implemented".to_string(),
-    ))
+async fn passthrough(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(_peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Extension(_auth): axum::extract::Extension<Option<AuthContext>>,
+    req: axum::extract::Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let method = parts.method.as_str().to_string();
+    let uri = parts.uri.path().to_string();
+
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+
+    match state
+        .gateway
+        .proxy(&method, &uri, &parts.headers, body_bytes)
+        .await
+    {
+        Ok((status, resp_headers, resp_body)) => {
+            let mut response = axum::response::Response::builder().status(status);
+            for (key, value) in resp_headers.iter() {
+                response = response.header(key, value);
+            }
+            response
+                .body(axum::body::Body::from(resp_body))
+                .unwrap_or_else(|e| error_to_response(GatewayError::Internal(e.to_string())))
+        }
+        Err(e) => error_to_response(e),
+    }
 }
 
 async fn reload_config(

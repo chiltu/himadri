@@ -30,6 +30,49 @@ pub struct Config {
 
     #[serde(default)]
     pub cors: CorsConfig,
+
+    #[serde(default)]
+    pub rbac: RbacConfig,
+}
+
+/// Role-based access control policy. Maps roles (e.g. Zitadel project roles
+/// carried in the JWT) to the models and providers a principal may use, enabling
+/// tiered/differentiated access on the `/v1` endpoints.
+///
+/// Semantics:
+/// - When `enabled` is false, RBAC is a no-op (all access allowed).
+/// - A principal with `AuthScope::Admin` bypasses RBAC entirely.
+/// - The effective policy is the **union** across all of a principal's roles
+///   that appear in `roles` (most-permissive wins).
+/// - If none of a principal's roles match and `default_role` is set, that role's
+///   policy applies; if `default_role` is unset and no role matches, access is
+///   **denied**.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RbacConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub roles: HashMap<String, RolePolicy>,
+
+    /// Fallback role applied to authenticated principals whose roles don't match
+    /// any entry in `roles` (e.g. API-key principals, or users without a tier).
+    #[serde(default)]
+    pub default_role: Option<String>,
+}
+
+/// Access policy for a single role.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RolePolicy {
+    /// Allowed model patterns (supports `*` wildcards, e.g. `claude-*`, `*`).
+    /// `None` means no model restriction for this role (all models allowed).
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+
+    /// Allowed provider names (exact match, supports `*`). `None` means no
+    /// provider restriction for this role (all providers allowed).
+    #[serde(default)]
+    pub providers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -483,6 +526,7 @@ impl Config {
             admin: AdminConfig::default(),
             orgs: HashMap::new(),
             cors: CorsConfig::default(),
+            rbac: RbacConfig::default(),
         }
     }
 }

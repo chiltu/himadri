@@ -53,6 +53,8 @@ impl AuthMiddleware {
                     team_id: None,
                     user_id: None,
                     rate_limit_override: None,
+                    roles: vec!["admin".to_string()],
+                    budget_limit_usd: None,
                 }));
             }
         }
@@ -77,6 +79,11 @@ impl AuthMiddleware {
                     team_id: key.team_id,
                     user_id: key.user_id,
                     rate_limit_override,
+                    roles: key.scopes,
+                    budget_limit_usd: key
+                        .token_budget
+                        .as_ref()
+                        .and_then(|b| b.cost_limit_per_month),
                 }))
             }
             Ok(None) => Ok(None),

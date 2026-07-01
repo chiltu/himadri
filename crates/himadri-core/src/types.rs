@@ -309,6 +309,13 @@ pub struct AuthContext {
     pub team_id: Option<String>,
     pub user_id: Option<String>,
     pub rate_limit_override: Option<RateLimitOverride>,
+    /// Roles granted to the principal (e.g. mapped from Zitadel project roles
+    /// or from an API key's stored scopes). Used for role-based authorization.
+    pub roles: Vec<String>,
+    /// Cumulative USD spend cap for this principal (e.g. from a JWT
+    /// `budget_limit_usd` claim). `None` falls back to the gateway's global
+    /// budget limit. Enforced by the budget plugin.
+    pub budget_limit_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +341,8 @@ impl AuthContext {
             team_id: None,
             user_id: None,
             rate_limit_override: None,
+            roles: Vec::new(),
+            budget_limit_usd: None,
         }
     }
 
@@ -343,5 +352,15 @@ impl AuthContext {
 
     pub fn team_id_or_empty(&self) -> &str {
         self.team_id.as_deref().unwrap_or("")
+    }
+
+    /// Whether the principal holds the named role (case-sensitive).
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|r| r == role)
+    }
+
+    /// Whether the principal holds any of the named roles.
+    pub fn has_any_role(&self, roles: &[String]) -> bool {
+        roles.iter().any(|r| self.has_role(r))
     }
 }

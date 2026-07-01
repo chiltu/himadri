@@ -24,6 +24,12 @@ impl PluginManager {
     }
 
     pub fn register(&mut self, plugin: Arc<dyn Plugin>) {
+        // Opt-in second registration in the after-request stage (e.g. budget
+        // plugin records cost from the response). Skip if the primary stage is
+        // already AfterRequest to avoid running it twice.
+        if plugin.also_after_request() && plugin.stage() != Stage::AfterRequest {
+            self.after_request.push(plugin.clone());
+        }
         match plugin.stage() {
             Stage::BeforeRequest => self.before_request.push(plugin),
             Stage::AfterRequest => self.after_request.push(plugin),

@@ -6,8 +6,8 @@ use tracing::{debug, instrument, warn};
 use futures::Stream;
 use himadri_circuitbreaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerTrait};
 use himadri_core::{
-    AuthContext, ChatCompletionRequest, ChatCompletionResponse, Config, GatewayError, OrgConfig,
-    StreamChunk, Target,
+    AuthContext, AuthScope, ChatCompletionRequest, ChatCompletionResponse, Config, GatewayError,
+    OrgConfig, StreamChunk, Target,
 };
 use himadri_observability::{AuditEvent, AuditLog, AuditMessage, AuditStatus, Metrics};
 use himadri_plugin::traits::ResponseAction;
@@ -16,6 +16,14 @@ use himadri_provider::traits::{BoxStream, Provider};
 use himadri_ratelimit::RateLimiter;
 
 use crate::strategy::Strategy;
+
+static PROXY_CLIENT: once_cell::sync::Lazy<reqwest::Client> = once_cell::sync::Lazy::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .expect("Failed to create proxy HTTP client")
+});
 
 /// Pre-built index for fast model-to-provider lookups.
 #[derive(Debug, Default)]
@@ -280,12 +288,14 @@ impl Gateway {
     ) -> Result<himadri_core::EmbeddingResponse, GatewayError> {
         let config = self.config.read().await;
         self.check_rate_limits(auth, &config)?;
+        self.check_rbac_model(auth, &config, &request.model)?;
         drop(config);
 
         let targets = self.targets.read().await.clone();
         if targets.is_empty() {
             return Err(GatewayError::Internal("No targets configured".to_string()));
         }
+        let targets = self.filter_targets_by_rbac(auth, targets).await?;
 
         let mut last_err =
             GatewayError::Internal("No provider produced embeddings".to_string());
@@ -328,6 +338,7 @@ impl Gateway {
         self.check_rate_limits(auth, &config)?;
         self.check_token_budgets(auth, &config, &request)?;
         self.check_org_guardrails(auth, &config, &request)?;
+        self.check_rbac_model(auth, &config, &request.model)?;
         drop(config);
 
         // Run before-request plugins
@@ -356,6 +367,7 @@ impl Gateway {
         let ordered = strategy.select_ordered(&request, &targets).await?;
         drop(strategy);
         drop(targets);
+        let ordered = self.filter_targets_by_rbac(auth, ordered).await?;
 
         // Try targets in priority order, falling back on retryable failures or
         // open circuit breakers.
@@ -370,6 +382,9 @@ impl Gateway {
             if let Some(usage) = &response.usage {
                 ctx.set_tokens(usage.total_tokens);
             }
+            // Expose the response so after-request plugins (e.g. budget) can
+            // record cost from its usage.
+            ctx.set_response(response.clone());
         }
         self.plugin_manager
             .run_after(&mut ctx)
@@ -547,6 +562,7 @@ impl Gateway {
         self.check_rate_limits(auth, &config)?;
         self.check_token_budgets(auth, &config, &request)?;
         self.check_org_guardrails(auth, &config, &request)?;
+        self.check_rbac_model(auth, &config, &request.model)?;
         drop(config);
 
         // Run before-request plugins (input guardrails)
@@ -563,6 +579,7 @@ impl Gateway {
         let ordered = strategy.select_ordered(&request, &targets).await?;
         drop(strategy);
         drop(targets);
+        let ordered = self.filter_targets_by_rbac(auth, ordered).await?;
 
         // Try targets in priority order until one opens a stream. Failover for
         // streaming only applies before the first chunk is produced — once a
@@ -767,6 +784,10 @@ impl Gateway {
         self.providers.iter().map(|r| r.key().clone()).collect()
     }
 
+    pub fn get_provider(&self, name: &str) -> Option<std::sync::Arc<dyn Provider>> {
+        self.providers.get(name).map(|r| r.value().clone())
+    }
+
     #[allow(dead_code)]
     pub fn rate_limiter(&self) -> &RateLimiter {
         &self.rate_limiter
@@ -775,6 +796,12 @@ impl Gateway {
     #[allow(dead_code)]
     pub fn audit_log(&self) -> &AuditLog {
         &self.audit_log
+    }
+
+    /// Shared handle to the audit log, for components outside the gateway (e.g.
+    /// the auth middleware recording auth failures).
+    pub fn audit_log_arc(&self) -> Arc<AuditLog> {
+        self.audit_log.clone()
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -876,6 +903,152 @@ impl Gateway {
         }
 
         models
+    }
+
+    pub async fn proxy(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, axum::body::Bytes), GatewayError>
+    {
+        let targets = self.targets.read().await;
+        let target = targets.first().ok_or_else(|| {
+            GatewayError::Internal("No targets configured for proxy".to_string())
+        })?;
+
+        let provider = self.providers.get(&target.provider).ok_or_else(|| {
+            GatewayError::ProviderNotFound(target.provider.clone())
+        })?;
+
+        let base_url = target.base_url.clone().unwrap_or_else(|| {
+            match provider.name() {
+                "openai" => "https://api.openai.com/v1".to_string(),
+                "anthropic" => "https://api.anthropic.com".to_string(),
+                "gemini" => "https://generativelanguage.googleapis.com".to_string(),
+                _ => "https://api.openai.com/v1".to_string(),
+            }
+        });
+
+        let api_key = self.get_api_key(target)?;
+        let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+
+        let mut req_builder = match method {
+            "GET" => PROXY_CLIENT.get(&url),
+            "POST" => PROXY_CLIENT.post(&url),
+            "PUT" => PROXY_CLIENT.put(&url),
+            "DELETE" => PROXY_CLIENT.delete(&url),
+            "PATCH" => PROXY_CLIENT.patch(&url),
+            _ => {
+                let m: reqwest::Method = method
+                    .parse()
+                    .map_err(|_| GatewayError::BadRequest(format!("Invalid method: {}", method)))?;
+                PROXY_CLIENT.request(m, &url)
+            }
+        };
+
+        for (key, value) in headers.iter() {
+            if key == "authorization" || key == "host" || key == "content-length" {
+                continue;
+            }
+            req_builder = req_builder.header(key, value);
+        }
+
+        if !api_key.is_empty() {
+            req_builder = req_builder.header("authorization", format!("Bearer {}", api_key));
+        }
+
+        req_builder = req_builder.body(body);
+
+        let resp = req_builder
+            .send()
+            .await
+            .map_err(|e| GatewayError::Provider(format!("Proxy request failed: {}", e)))?;
+
+        let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let mut resp_headers = axum::http::HeaderMap::new();
+        for (key, value) in resp.headers().iter() {
+            if key == "transfer-encoding" || key == "connection" {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                axum::http::HeaderName::from_bytes(key.as_str().as_bytes()),
+                axum::http::HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                resp_headers.insert(name, val);
+            }
+        }
+
+        let resp_body = resp
+            .bytes()
+            .await
+            .map_err(|e| GatewayError::Provider(format!("Failed to read proxy response: {}", e)))?;
+
+        Ok((status, resp_headers, resp_body))
+    }
+
+    /// Enforce role-based model access. Admin-scope principals bypass RBAC.
+    /// A principal whose roles grant no access is rejected with `403`.
+    fn check_rbac_model(
+        &self,
+        auth: Option<&AuthContext>,
+        config: &Config,
+        model: &str,
+    ) -> Result<(), GatewayError> {
+        if !config.rbac.enabled {
+            return Ok(());
+        }
+        let (roles, is_admin): (&[String], bool) = match auth {
+            Some(ctx) => (&ctx.roles, ctx.scope == AuthScope::Admin),
+            None => (&[], false),
+        };
+        config
+            .rbac
+            .check_model(roles, is_admin, model)
+            .map_err(|d| GatewayError::Forbidden(d.to_string()))
+    }
+
+    /// Retain only the targets whose provider the principal's roles permit,
+    /// preserving priority order. Errors with `403` if RBAC leaves no target.
+    async fn filter_targets_by_rbac(
+        &self,
+        auth: Option<&AuthContext>,
+        ordered: Vec<Target>,
+    ) -> Result<Vec<Target>, GatewayError> {
+        let config = self.config.read().await;
+        if !config.rbac.enabled {
+            return Ok(ordered);
+        }
+        let (roles, is_admin): (&[String], bool) = match auth {
+            Some(ctx) => (&ctx.roles, ctx.scope == AuthScope::Admin),
+            None => (&[], false),
+        };
+        if is_admin {
+            return Ok(ordered);
+        }
+
+        let mut last_denial: Option<himadri_core::RbacDenial> = None;
+        let allowed: Vec<Target> = ordered
+            .into_iter()
+            .filter(|t| match config.rbac.check_provider(roles, is_admin, &t.provider) {
+                Ok(()) => true,
+                Err(d) => {
+                    last_denial = Some(d);
+                    false
+                }
+            })
+            .collect();
+
+        if allowed.is_empty() {
+            let reason = last_denial
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "no permitted provider for your role".to_string());
+            return Err(GatewayError::Forbidden(reason));
+        }
+        Ok(allowed)
     }
 
     fn check_org_guardrails(

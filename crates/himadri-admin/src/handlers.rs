@@ -183,4 +183,26 @@ impl AdminHandlers {
             None => None,
         }
     }
+
+    pub async fn list_enabled_models_for_api(&self) -> Vec<himadri_core::ModelObject> {
+        let models = self.list_enabled_models().await;
+        let providers = self.list_providers().await;
+        let provider_map: std::collections::HashMap<String, String> = providers
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+
+        models
+            .into_iter()
+            .filter_map(|m| {
+                let owned_by = provider_map.get(&m.provider_id)?.clone();
+                Some(himadri_core::ModelObject {
+                    id: m.name.clone(),
+                    object: "model".to_string(),
+                    created: m.created_at.timestamp() as u64,
+                    owned_by,
+                })
+            })
+            .collect()
+    }
 }

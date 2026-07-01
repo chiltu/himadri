@@ -410,3 +410,116 @@ async fn embed_errors_when_no_provider_supports_embeddings() {
 
     assert!(result.is_err(), "no embedding-capable provider should error");
 }
+
+// ─── RBAC (tiered access) ────────────────────────────────────────────
+
+use himadri_core::config::{RbacConfig, RolePolicy};
+use himadri_core::{AuthContext, AuthScope};
+use std::collections::HashMap;
+
+fn auth(roles: &[&str], admin: bool) -> AuthContext {
+    AuthContext {
+        api_key: "test".to_string(),
+        key_id: None,
+        scope: if admin {
+            AuthScope::Admin
+        } else {
+            AuthScope::ApiKey
+        },
+        org_id: None,
+        team_id: None,
+        user_id: Some("u1".to_string()),
+        rate_limit_override: None,
+        roles: roles.iter().map(|s| s.to_string()).collect(),
+        budget_limit_usd: None,
+    }
+}
+
+fn rbac_config(providers: &[&str], roles: Vec<(&str, RolePolicy)>) -> Config {
+    let mut role_map = HashMap::new();
+    for (name, policy) in roles {
+        role_map.insert(name.to_string(), policy);
+    }
+    Config {
+        targets: providers.iter().map(|p| target(p)).collect(),
+        rbac: RbacConfig {
+            enabled: true,
+            roles: role_map,
+            default_role: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn role(models: Option<&[&str]>, providers: Option<&[&str]>) -> RolePolicy {
+    RolePolicy {
+        models: models.map(|m| m.iter().map(|s| s.to_string()).collect()),
+        providers: providers.map(|p| p.iter().map(|s| s.to_string()).collect()),
+    }
+}
+
+#[tokio::test]
+async fn rbac_denies_model_outside_role() {
+    let gw = himadri::Gateway::new(
+        rbac_config(&["healthy"], vec![("analyst", role(Some(&["gpt-4o-mini"]), None))]),
+        metrics(),
+    );
+    gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
+
+    // analyst may not use gpt-4o
+    let denied = gw
+        .route(request("gpt-4o", "hello"), Some(&auth(&["analyst"], false)), None)
+        .await;
+    assert!(matches!(denied, Err(himadri_core::GatewayError::Forbidden(_))));
+
+    // analyst may use gpt-4o-mini
+    let allowed = gw
+        .route(request("gpt-4o-mini", "hello"), Some(&auth(&["analyst"], false)), None)
+        .await;
+    assert!(allowed.is_ok());
+}
+
+#[tokio::test]
+async fn rbac_admin_scope_bypasses() {
+    let gw = himadri::Gateway::new(
+        rbac_config(&["healthy"], vec![("analyst", role(Some(&["gpt-4o-mini"]), None))]),
+        metrics(),
+    );
+    gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
+
+    // Admin scope ignores the model allow-list.
+    let allowed = gw
+        .route(request("gpt-4o", "hello"), Some(&auth(&[], true)), None)
+        .await;
+    assert!(allowed.is_ok());
+}
+
+#[tokio::test]
+async fn rbac_unknown_role_denied() {
+    let gw = himadri::Gateway::new(
+        rbac_config(&["healthy"], vec![("analyst", role(Some(&["gpt-4o-mini"]), None))]),
+        metrics(),
+    );
+    gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
+
+    let denied = gw
+        .route(request("gpt-4o-mini", "hello"), Some(&auth(&["stranger"], false)), None)
+        .await;
+    assert!(matches!(denied, Err(himadri_core::GatewayError::Forbidden(_))));
+}
+
+#[tokio::test]
+async fn rbac_denies_provider_outside_role() {
+    // Role allows any model but only the "openai" provider; the only target is
+    // "healthy", so provider filtering leaves nothing → Forbidden.
+    let gw = himadri::Gateway::new(
+        rbac_config(&["healthy"], vec![("engineer", role(None, Some(&["openai"])))]),
+        metrics(),
+    );
+    gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
+
+    let denied = gw
+        .route(request("gpt-4o", "hello"), Some(&auth(&["engineer"], false)), None)
+        .await;
+    assert!(matches!(denied, Err(himadri_core::GatewayError::Forbidden(_))));
+}
