@@ -2,14 +2,14 @@ use crate::models::{
     CreateModelRequest, CreateProviderRequest, Model, Provider, UpdateModelRequest,
     UpdateProviderRequest,
 };
-use crate::provider_store::{ModelStore, ProviderStore};
+use crate::provider_backend::{ModelStoreBackend, ProviderStoreBackend};
 use crate::store::StoreBackend;
 use crate::{ApiKey, CreateApiKeyRequest, UpdateApiKeyRequest};
 
 pub struct AdminHandlers {
     store: StoreBackend,
-    provider_store: Option<ProviderStore>,
-    model_store: Option<ModelStore>,
+    provider_store: Option<ProviderStoreBackend>,
+    model_store: Option<ModelStoreBackend>,
     _master_key: Option<String>,
 }
 
@@ -25,19 +25,19 @@ impl AdminHandlers {
 
     pub fn with_provider_model_stores(
         mut self,
-        provider_store: ProviderStore,
-        model_store: ModelStore,
+        provider_store: ProviderStoreBackend,
+        model_store: ModelStoreBackend,
     ) -> Self {
         self.provider_store = Some(provider_store);
         self.model_store = Some(model_store);
         self
     }
 
-    pub fn provider_store(&self) -> Option<&ProviderStore> {
+    pub fn provider_store(&self) -> Option<&ProviderStoreBackend> {
         self.provider_store.as_ref()
     }
 
-    pub fn model_store(&self) -> Option<&ModelStore> {
+    pub fn model_store(&self) -> Option<&ModelStoreBackend> {
         self.model_store.as_ref()
     }
 
@@ -47,8 +47,8 @@ impl AdminHandlers {
         self.store.list().await.unwrap_or_default()
     }
 
-    pub async fn create_key(&self, request: CreateApiKeyRequest) -> ApiKey {
-        self.store.create(request).await.unwrap()
+    pub async fn create_key(&self, request: CreateApiKeyRequest) -> Result<ApiKey, String> {
+        self.store.create(request).await
     }
 
     pub async fn get_key(&self, id: &str) -> Option<ApiKey> {

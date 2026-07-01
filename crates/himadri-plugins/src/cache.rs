@@ -185,17 +185,15 @@ mod tests {
     #[tokio::test]
     async fn different_prompts_do_not_collide() {
         let cache = ResponseCachePlugin::new(100, Duration::from_secs(60));
-        cache.insert(&request("gpt-4", "first"), response("A")).await;
+        cache
+            .insert(&request("gpt-4", "first"), response("A"))
+            .await;
         cache
             .insert(&request("gpt-4", "second"), response("B"))
             .await;
 
         assert_eq!(
-            cache
-                .get(&request("gpt-4", "first"))
-                .await
-                .unwrap()
-                .choices[0]
+            cache.get(&request("gpt-4", "first")).await.unwrap().choices[0]
                 .message
                 .content
                 .as_deref(),

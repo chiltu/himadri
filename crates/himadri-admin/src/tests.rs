@@ -472,7 +472,8 @@ mod tests {
                 rate_limit_override: None,
                 token_budget: None,
             })
-            .await;
+            .await
+            .unwrap();
         assert!(admin.get_key(&key.id).await.is_some());
         assert!(admin.delete_key(&key.id).await);
         assert!(admin.get_key(&key.id).await.is_none());
@@ -504,7 +505,10 @@ mod tests {
         use crate::store::StoreBackend;
 
         let auth = AuthMiddleware::new(StoreBackend::new().await, Some("master-key".to_string()));
-        let result = auth.authenticate("not-a-real-key").await.expect("no store error");
+        let result = auth
+            .authenticate("not-a-real-key")
+            .await
+            .expect("no store error");
         assert!(result.is_none());
     }
 

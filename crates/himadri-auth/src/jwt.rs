@@ -74,9 +74,9 @@ where
         serde_json::Value::String(s) => Ok(s),
         serde_json::Value::Array(arr) => Ok(arr
             .into_iter()
-            .filter_map(|v| match v {
-                serde_json::Value::String(s) => Some(s),
-                other => Some(other.to_string()),
+            .map(|v| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
             })
             .collect::<Vec<_>>()
             .join(",")),

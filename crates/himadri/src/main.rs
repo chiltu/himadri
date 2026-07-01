@@ -36,9 +36,7 @@ use gateway::Gateway;
 #[derive(Clone)]
 struct AppState {
     gateway: Arc<Gateway>,
-    #[allow(dead_code)]
     admin: Arc<AdminHandlers>,
-    store: StoreBackend,
     metrics: Arc<Metrics>,
 }
 
@@ -279,8 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(10_000);
-            let cache =
-                ResponseCachePlugin::new(max_entries, std::time::Duration::from_secs(ttl));
+            let cache = ResponseCachePlugin::new(max_entries, std::time::Duration::from_secs(ttl));
             gateway.set_response_cache(cache);
             info!(
                 "Registered response cache ({}s TTL, {} max entries)",
@@ -300,17 +297,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Initialize provider and model stores if SQLite is configured
+    // Initialize provider and model stores (SQLite or Postgres, selected by
+    // DATABASE_URL's scheme — see himadri_admin::provider_backend).
     let mut admin = AdminHandlers::new(store.clone(), master_key.clone());
-    #[cfg(feature = "sqlite")]
+    let cipher = himadri_admin::CipherKey::from_env();
+    if cipher.is_none() {
+        tracing::warn!(
+            "SECURITY: PROVIDER_ENCRYPTION_KEY not set — provider API keys are stored in \
+             plaintext in the database. Set PROVIDER_ENCRYPTION_KEY (32-byte base64, e.g. \
+             `openssl rand -base64 32`) in production."
+        );
+    }
     if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        if database_url.starts_with("sqlite") {
-            if let Ok(pool) = sqlx::SqlitePool::connect(&format!("{}?mode=rwc", database_url)).await {
-                let provider_store = himadri_admin::ProviderStore::new(pool.clone());
-                let model_store = himadri_admin::ModelStore::new(pool.clone());
-                admin = admin.with_provider_model_stores(provider_store, model_store);
-                info!("Initialized provider and model stores");
-            }
+        if let Some((provider_store, model_store)) =
+            himadri_admin::connect_provider_model_stores(&database_url, cipher).await
+        {
+            admin = admin.with_provider_model_stores(provider_store, model_store);
+            info!("Initialized provider and model stores");
         }
     }
     let admin = Arc::new(admin);
@@ -365,7 +368,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         gateway: gateway.clone(),
         admin,
-        store,
         metrics: gateway.metrics(),
     };
 
@@ -592,12 +594,7 @@ async fn embeddings(
 async fn list_keys(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<himadri_admin::ApiKey>>, (StatusCode, String)> {
-    state
-        .store
-        .list()
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+    Ok(Json(state.admin.list_keys().await))
 }
 
 async fn create_key(
@@ -605,8 +602,8 @@ async fn create_key(
     Json(request): Json<himadri_admin::CreateApiKeyRequest>,
 ) -> Result<(StatusCode, Json<himadri_admin::ApiKey>), (StatusCode, String)> {
     state
-        .store
-        .create(request)
+        .admin
+        .create_key(request)
         .await
         .map(|key| (StatusCode::CREATED, Json(key)))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
@@ -617,10 +614,9 @@ async fn get_key(
     Path(id): Path<String>,
 ) -> Result<Json<himadri_admin::ApiKey>, StatusCode> {
     state
-        .store
-        .get(&id)
+        .admin
+        .get_key(&id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -631,10 +627,9 @@ async fn update_key(
     Json(request): Json<himadri_admin::UpdateApiKeyRequest>,
 ) -> Result<Json<himadri_admin::ApiKey>, StatusCode> {
     state
-        .store
-        .update(&id, request)
+        .admin
+        .update_key(&id, request)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -643,36 +638,22 @@ async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    state
-        .store
-        .delete(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        .map(|deleted| {
-            if deleted {
-                StatusCode::NO_CONTENT
-            } else {
-                StatusCode::NOT_FOUND
-            }
-        })
+    if state.admin.delete_key(&id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 async fn revoke_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    state
-        .store
-        .revoke(&id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        .map(|revoked| {
-            if revoked {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            }
-        })
+    if state.admin.revoke_key(&id).await {
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 async fn rotate_key(
@@ -680,10 +661,9 @@ async fn rotate_key(
     Path(id): Path<String>,
 ) -> Result<Json<himadri_admin::ApiKey>, StatusCode> {
     state
-        .store
-        .rotate(&id)
+        .admin
+        .rotate_key(&id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -698,7 +678,9 @@ async fn passthrough(
     let method = parts.method.as_str().to_string();
     let uri = parts.uri.path().to_string();
 
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
 
     match state
         .gateway
@@ -738,7 +720,7 @@ async fn reload_config(
 // ─── New Admin Endpoints ─────────────────────────────────────────────
 
 async fn dashboard(State(state): State<AppState>) -> Json<himadri_admin::DashboardSummary> {
-    let key_count = state.store.list().await.map(|k| k.len()).unwrap_or(0);
+    let key_count = state.admin.list_keys().await.len();
     let dashboard = state.gateway.usage_store().get_dashboard(key_count);
     Json(dashboard)
 }
@@ -851,10 +833,16 @@ async fn create_provider(
             // Rebuild routing targets
             let providers = admin.list_providers().await;
             let models = admin.list_models().await;
-            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            state
+                .gateway
+                .rebuild_targets_from_db(&providers, &models)
+                .await;
             Ok((StatusCode::CREATED, Json(p)))
         }
-        None => Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to create provider".to_string())),
+        None => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create provider".to_string(),
+        )),
     }
 }
 
@@ -863,7 +851,11 @@ async fn get_provider(
     Path(id): Path<String>,
 ) -> Result<Json<himadri_admin::Provider>, StatusCode> {
     let admin = state.admin.as_ref();
-    admin.get_provider(&id).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+    admin
+        .get_provider(&id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn update_provider(
@@ -877,7 +869,10 @@ async fn update_provider(
             // Rebuild routing targets
             let providers = admin.list_providers().await;
             let models = admin.list_models().await;
-            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            state
+                .gateway
+                .rebuild_targets_from_db(&providers, &models)
+                .await;
             Ok(Json(p))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -893,7 +888,10 @@ async fn delete_provider(
         // Rebuild routing targets
         let providers = admin.list_providers().await;
         let models = admin.list_models().await;
-        state.gateway.rebuild_targets_from_db(&providers, &models).await;
+        state
+            .gateway
+            .rebuild_targets_from_db(&providers, &models)
+            .await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -906,13 +904,19 @@ async fn toggle_provider(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<himadri_admin::Provider>, StatusCode> {
     let admin = state.admin.as_ref();
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     match admin.toggle_provider(&id, enabled).await {
         Some(p) => {
             // Rebuild routing targets
             let providers = admin.list_providers().await;
             let models = admin.list_models().await;
-            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            state
+                .gateway
+                .rebuild_targets_from_db(&providers, &models)
+                .await;
             Ok(Json(p))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -938,10 +942,16 @@ async fn create_model(
             // Rebuild routing targets
             let providers = admin.list_providers().await;
             let models = admin.list_models().await;
-            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            state
+                .gateway
+                .rebuild_targets_from_db(&providers, &models)
+                .await;
             Ok((StatusCode::CREATED, Json(m)))
         }
-        None => Err((StatusCode::INTERNAL_SERVER_ERROR, "Failed to create model".to_string())),
+        None => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create model".to_string(),
+        )),
     }
 }
 
@@ -950,7 +960,11 @@ async fn get_model(
     Path(id): Path<String>,
 ) -> Result<Json<himadri_admin::Model>, StatusCode> {
     let admin = state.admin.as_ref();
-    admin.get_model(&id).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+    admin
+        .get_model(&id)
+        .await
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn update_model(
@@ -964,7 +978,10 @@ async fn update_model(
             // Rebuild routing targets
             let providers = admin.list_providers().await;
             let models = admin.list_models().await;
-            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            state
+                .gateway
+                .rebuild_targets_from_db(&providers, &models)
+                .await;
             Ok(Json(m))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -980,7 +997,10 @@ async fn delete_model(
         // Rebuild routing targets
         let providers = admin.list_providers().await;
         let models = admin.list_models().await;
-        state.gateway.rebuild_targets_from_db(&providers, &models).await;
+        state
+            .gateway
+            .rebuild_targets_from_db(&providers, &models)
+            .await;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -993,13 +1013,19 @@ async fn toggle_model(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<himadri_admin::Model>, StatusCode> {
     let admin = state.admin.as_ref();
-    let enabled = body.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     match admin.toggle_model(&id, enabled).await {
         Some(m) => {
             // Rebuild routing targets
             let providers = admin.list_providers().await;
             let models = admin.list_models().await;
-            state.gateway.rebuild_targets_from_db(&providers, &models).await;
+            state
+                .gateway
+                .rebuild_targets_from_db(&providers, &models)
+                .await;
             Ok(Json(m))
         }
         None => Err(StatusCode::NOT_FOUND),

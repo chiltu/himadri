@@ -88,10 +88,7 @@ impl RbacConfig {
     /// Resolve the effective policy for the given roles, or `None` if no role
     /// matched and no `default_role` applies.
     fn effective_policy(&self, roles: &[String]) -> Option<EffectivePolicy> {
-        let matched: Vec<&RolePolicy> = roles
-            .iter()
-            .filter_map(|r| self.roles.get(r))
-            .collect();
+        let matched: Vec<&RolePolicy> = roles.iter().filter_map(|r| self.roles.get(r)).collect();
 
         let policies: Vec<&RolePolicy> = if matched.is_empty() {
             match &self.default_role {
@@ -145,7 +142,9 @@ impl RbacConfig {
         if !self.enabled || is_admin {
             return Ok(());
         }
-        let policy = self.effective_policy(roles).ok_or(RbacDenial::NoMatchingRole)?;
+        let policy = self
+            .effective_policy(roles)
+            .ok_or(RbacDenial::NoMatchingRole)?;
         match &policy.models {
             None => Ok(()),
             Some(allowed) if any_match(allowed, model) => Ok(()),
@@ -163,7 +162,9 @@ impl RbacConfig {
         if !self.enabled || is_admin {
             return Ok(());
         }
-        let policy = self.effective_policy(roles).ok_or(RbacDenial::NoMatchingRole)?;
+        let policy = self
+            .effective_policy(roles)
+            .ok_or(RbacDenial::NoMatchingRole)?;
         match &policy.providers {
             None => Ok(()),
             Some(allowed) if any_match(allowed, provider) => Ok(()),
@@ -242,7 +243,9 @@ mod tests {
         );
 
         let engineer = vec!["engineer".to_string()];
-        assert!(cfg.check_model(&engineer, false, "claude-3-5-sonnet").is_ok());
+        assert!(cfg
+            .check_model(&engineer, false, "claude-3-5-sonnet")
+            .is_ok());
         assert!(cfg.check_model(&engineer, false, "o1").is_ok());
         assert!(cfg.check_model(&engineer, false, "gpt-4o-mini").is_err());
     }

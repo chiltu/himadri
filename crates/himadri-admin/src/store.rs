@@ -671,15 +671,30 @@ impl SqliteStore {
         let id = Uuid::new_v4().to_string();
         let key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
         let scopes = serde_json::to_value(&request.scopes).unwrap_or_default();
-        let models = request.models.as_ref().map(|m| serde_json::to_value(m).unwrap_or_default());
-        let rate_limit = request.rate_limit_override.as_ref().map(|r| serde_json::to_value(r).unwrap_or_default());
-        let budget = request.token_budget.as_ref().map(|b| serde_json::to_value(b).unwrap_or_default());
+        let models = request
+            .models
+            .as_ref()
+            .map(|m| serde_json::to_value(m).unwrap_or_default());
+        let rate_limit = request
+            .rate_limit_override
+            .as_ref()
+            .map(|r| serde_json::to_value(r).unwrap_or_default());
+        let budget = request
+            .token_budget
+            .as_ref()
+            .map(|b| serde_json::to_value(b).unwrap_or_default());
+        // Bind an explicit RFC3339 timestamp rather than SQLite's `datetime('now')`,
+        // whose `YYYY-MM-DD HH:MM:SS` output isn't RFC3339 (no `T`, no offset) and
+        // fails `DateTime::parse_from_rfc3339` on read, silently defaulting to the
+        // Unix epoch.
+        let now = Utc::now().to_rfc3339();
 
         sqlx::query(
             r#"INSERT INTO api_keys (id, name, key, scopes, enabled, created_at, expires_at, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget)
-               VALUES (?, ?, ?, ?, 1, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&id).bind(&request.name).bind(&key).bind(&scopes)
+        .bind(&now)
         .bind(request.expires_at.map(|dt| dt.to_rfc3339())).bind(request.metadata.map(|m| m.to_string()))
         .bind(&request.org_id).bind(&request.team_id).bind(&request.user_id)
         .bind(models.map(|m| m.to_string())).bind(rate_limit.map(|r| r.to_string())).bind(budget.map(|b| b.to_string()))
@@ -703,7 +718,11 @@ impl SqliteStore {
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
-    pub async fn update(&self, id: &str, request: UpdateApiKeyRequest) -> Result<Option<ApiKey>, sqlx::Error> {
+    pub async fn update(
+        &self,
+        id: &str,
+        request: UpdateApiKeyRequest,
+    ) -> Result<Option<ApiKey>, sqlx::Error> {
         // Fetch current record, apply changes, save back
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
 
@@ -715,7 +734,9 @@ impl SqliteStore {
         let team_id = request.team_id.unwrap_or(current.team_id);
         let user_id = request.user_id.unwrap_or(current.user_id);
 
-        let scopes_json = serde_json::to_value(&scopes).unwrap_or_default().to_string();
+        let scopes_json = serde_json::to_value(&scopes)
+            .unwrap_or_default()
+            .to_string();
         let enabled_int = enabled as i32;
         let metadata_str = metadata.as_ref().map(|m| m.to_string());
 
@@ -739,11 +760,17 @@ impl SqliteStore {
     }
 
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+        // `expires_at` is stored as RFC3339 (see `create`); comparing it against
+        // SQLite's `datetime('now')` (a different, non-RFC3339 format) is a
+        // string comparison across two incompatible formats and can misjudge
+        // expiry around format-dependent byte positions (e.g. `T` vs ` `).
+        // Bind an RFC3339 `now` on both sides so the comparison is apples-to-apples.
+        let now = Utc::now().to_rfc3339();
         let row = sqlx::query_as::<_, SqliteApiKeyRow>(
-            r#"UPDATE api_keys SET last_used_at = datetime('now'), usage_count = usage_count + 1
-               WHERE key = ? AND enabled = 1 AND (expires_at IS NULL OR expires_at > datetime('now'))
+            r#"UPDATE api_keys SET last_used_at = ?, usage_count = usage_count + 1
+               WHERE key = ? AND enabled = 1 AND (expires_at IS NULL OR expires_at > ?)
                RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget"#,
-        ).bind(key).fetch_optional(&self.pool).await?;
+        ).bind(&now).bind(key).bind(&now).fetch_optional(&self.pool).await?;
         Ok(row.map(|r| r.into()))
     }
 
@@ -758,7 +785,8 @@ impl SqliteStore {
     pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
         let new_key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
         sqlx::query("UPDATE api_keys SET key = ? WHERE id = ?")
-            .bind(&new_key).bind(id)
+            .bind(&new_key)
+            .bind(id)
             .execute(&self.pool)
             .await?;
         self.get(id).await
@@ -795,18 +823,18 @@ impl From<SqliteApiKeyRow> for ApiKey {
             key: r.key,
             scopes: serde_json::from_str(&r.scopes).unwrap_or_default(),
             enabled: r.enabled != 0,
-            created_at: DateTime::parse_from_rfc3339(&r.created_at)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_default(),
-            last_used_at: r.last_used_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
-            expires_at: r.expires_at.and_then(|s| DateTime::parse_from_rfc3339(&s).ok()).map(|dt| dt.with_timezone(&Utc)),
+            created_at: crate::sqlite_time::parse_or_default(&r.created_at),
+            last_used_at: r.last_used_at.and_then(|s| crate::sqlite_time::parse(&s)),
+            expires_at: r.expires_at.and_then(|s| crate::sqlite_time::parse(&s)),
             usage_count: r.usage_count as u64,
             metadata: r.metadata.and_then(|s| serde_json::from_str(&s).ok()),
             org_id: r.org_id,
             team_id: r.team_id,
             user_id: r.user_id,
             models: r.models.and_then(|s| serde_json::from_str(&s).ok()),
-            rate_limit_override: r.rate_limit_override.and_then(|s| serde_json::from_str(&s).ok()),
+            rate_limit_override: r
+                .rate_limit_override
+                .and_then(|s| serde_json::from_str(&s).ok()),
             token_budget: r.token_budget.and_then(|s| serde_json::from_str(&s).ok()),
         }
     }

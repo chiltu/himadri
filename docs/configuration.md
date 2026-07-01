@@ -80,6 +80,7 @@ JSON file.
 | `GATEWAY_CONFIG` | _(unset)_ | Path to a `.json` config file. Unset → built-in default config. |
 | `MASTER_KEY` | _(unset)_ | Bearer token for `/admin/*` and a global super-key for `/v1/*`. **Unset disables all authentication** (see [Authentication](#authentication)). |
 | `DATABASE_URL` | _(unset)_ | `sqlite://...` or `postgres://...`. Unset → in-memory store. See [Database](./database.md). |
+| `PROVIDER_ENCRYPTION_KEY` | _(unset)_ | Base64-encoded 32-byte AES-256-GCM key (e.g. `openssl rand -base64 32`). Encrypts the `providers.api_key` column at rest. **Unset stores upstream provider API keys in plaintext** — set this in production. See [Encryption at rest](#encryption-at-rest). |
 
 ### Authentication (JWT/OIDC — e.g. Zitadel)
 
@@ -218,6 +219,28 @@ A target binds a provider to a credential and (optionally) a model allowlist:
 The OpenAI, Anthropic and Gemini providers are always registered; the rest
 register only when their key env var is present. Anthropic and Gemini use their
 native auth schemes internally (`x-api-key` / `?key=`), not Bearer.
+
+### Encryption at rest
+
+Providers created via `POST/PUT /admin/providers` (not the env-var-registered
+ones above) store their `api_key` in the `providers` table. Set
+`PROVIDER_ENCRYPTION_KEY` to encrypt that column with AES-256-GCM instead of
+storing it in plaintext:
+
+```bash
+export PROVIDER_ENCRYPTION_KEY=$(openssl rand -base64 32)
+```
+
+- Ciphertext is stored as `enc:v1:<base64>`; the API always returns the
+  decrypted plaintext to authenticated admin callers.
+- Rows written before the key was set remain readable (they're plaintext with
+  no `enc:v1:` prefix) and are transparently re-encrypted the next time
+  they're updated — no migration step needed.
+- Losing the key makes existing encrypted rows permanently undecryptable;
+  back it up the same way you'd back up `MASTER_KEY`.
+- This does **not** cover the `api_keys` table (client-facing gateway keys) —
+  those are opaque bearer tokens, not upstream credentials, and are looked up
+  by exact match rather than decrypted.
 
 ---
 

@@ -297,8 +297,7 @@ impl Gateway {
         }
         let targets = self.filter_targets_by_rbac(auth, targets).await?;
 
-        let mut last_err =
-            GatewayError::Internal("No provider produced embeddings".to_string());
+        let mut last_err = GatewayError::Internal("No provider produced embeddings".to_string());
 
         for target in &targets {
             let provider = match self.providers.get(&target.provider) {
@@ -911,25 +910,33 @@ impl Gateway {
         path: &str,
         headers: &axum::http::HeaderMap,
         body: axum::body::Bytes,
-    ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, axum::body::Bytes), GatewayError>
-    {
+    ) -> Result<
+        (
+            axum::http::StatusCode,
+            axum::http::HeaderMap,
+            axum::body::Bytes,
+        ),
+        GatewayError,
+    > {
         let targets = self.targets.read().await;
-        let target = targets.first().ok_or_else(|| {
-            GatewayError::Internal("No targets configured for proxy".to_string())
-        })?;
+        let target = targets
+            .first()
+            .ok_or_else(|| GatewayError::Internal("No targets configured for proxy".to_string()))?;
 
-        let provider = self.providers.get(&target.provider).ok_or_else(|| {
-            GatewayError::ProviderNotFound(target.provider.clone())
-        })?;
+        let provider = self
+            .providers
+            .get(&target.provider)
+            .ok_or_else(|| GatewayError::ProviderNotFound(target.provider.clone()))?;
 
-        let base_url = target.base_url.clone().unwrap_or_else(|| {
-            match provider.name() {
+        let base_url = target
+            .base_url
+            .clone()
+            .unwrap_or_else(|| match provider.name() {
                 "openai" => "https://api.openai.com/v1".to_string(),
                 "anthropic" => "https://api.anthropic.com".to_string(),
                 "gemini" => "https://generativelanguage.googleapis.com".to_string(),
                 _ => "https://api.openai.com/v1".to_string(),
-            }
-        });
+            });
 
         let api_key = self.get_api_key(target)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
@@ -1033,13 +1040,15 @@ impl Gateway {
         let mut last_denial: Option<himadri_core::RbacDenial> = None;
         let allowed: Vec<Target> = ordered
             .into_iter()
-            .filter(|t| match config.rbac.check_provider(roles, is_admin, &t.provider) {
-                Ok(()) => true,
-                Err(d) => {
-                    last_denial = Some(d);
-                    false
-                }
-            })
+            .filter(
+                |t| match config.rbac.check_provider(roles, is_admin, &t.provider) {
+                    Ok(()) => true,
+                    Err(d) => {
+                        last_denial = Some(d);
+                        false
+                    }
+                },
+            )
             .collect();
 
         if allowed.is_empty() {

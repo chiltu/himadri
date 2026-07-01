@@ -205,11 +205,9 @@ impl OpenAiCompatibleProvider {
                         message: ResponseMessage {
                             role: himadri_core::Role::Assistant,
                             content: c["message"]["content"].as_str().map(|s| s.to_string()),
-                            tool_calls: serde_json::from_value(
-                                c["message"]["tool_calls"].clone(),
-                            )
-                            .ok()
-                            .filter(|tc: &Vec<himadri_core::ToolCall>| !tc.is_empty()),
+                            tool_calls: serde_json::from_value(c["message"]["tool_calls"].clone())
+                                .ok()
+                                .filter(|tc: &Vec<himadri_core::ToolCall>| !tc.is_empty()),
                         },
                         finish_reason: c["finish_reason"].as_str().map(|s| s.to_string()),
                     })

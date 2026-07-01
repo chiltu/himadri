@@ -68,7 +68,11 @@ fn chat_request(model: &str, prompt: &str, stream: bool) -> ChatCompletionReques
 fn is_upstream_capacity_error(e: &ProviderError) -> bool {
     matches!(
         e,
-        ProviderError::RateLimited { .. } | ProviderError::Api { status: 429 | 502 | 503, .. }
+        ProviderError::RateLimited { .. }
+            | ProviderError::Api {
+                status: 429 | 502 | 503,
+                ..
+            }
     )
 }
 

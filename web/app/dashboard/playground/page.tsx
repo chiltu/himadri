@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState, useRef } from "react"
-import { api, type Provider, type Model, type ApiKey } from "@/lib/api"
+import { api, type Model, type ApiKey } from "@/lib/api"
 import { AuthGuard } from "@/components/auth-guard"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
@@ -30,7 +30,6 @@ interface Message {
 }
 
 export default function PlaygroundPage() {
-  const [providers, setProviders] = useState<Provider[]>([])
   const [models, setModels] = useState<Model[]>([])
   const [keys, setKeys] = useState<ApiKey[]>([])
   const [selectedModel, setSelectedModel] = useState("")
@@ -42,7 +41,6 @@ export default function PlaygroundPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    api.listProviders().then(setProviders).catch((e) => setError(e.message))
     api.listModels().then(setModels).catch((e) => setError(e.message))
     api.listKeys().then(setKeys).catch((e) => setError(e.message))
   }, [])

@@ -2,7 +2,7 @@
 
 import { AuthGuard } from "@/components/auth-guard"
 import { useEffect, useState, useCallback } from "react"
-import { api, type ApiKey, type CreateApiKeyRequest } from "@/lib/api"
+import { api, type ApiKey, type CreateApiKeyRequest, type UpdateApiKeyRequest } from "@/lib/api"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
   Breadcrumb,
@@ -38,6 +38,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -45,13 +46,176 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 
+interface KeyFormState {
+  name: string
+  scopes: string
+  orgId: string
+  teamId: string
+  userId: string
+  models: string
+  rpsLimit: string
+  burstSize: string
+  maxTokensPerRequest: string
+  maxTokensPerDay: string
+  maxTokensPerMonth: string
+  costLimitPerDay: string
+  costLimitPerMonth: string
+}
+
+const emptyForm: KeyFormState = {
+  name: "",
+  scopes: "api",
+  orgId: "",
+  teamId: "",
+  userId: "",
+  models: "",
+  rpsLimit: "",
+  burstSize: "",
+  maxTokensPerRequest: "",
+  maxTokensPerDay: "",
+  maxTokensPerMonth: "",
+  costLimitPerDay: "",
+  costLimitPerMonth: "",
+}
+
+function formFromKey(key: ApiKey): KeyFormState {
+  return {
+    name: key.name,
+    scopes: key.scopes.join(", "),
+    orgId: key.org_id ?? "",
+    teamId: key.team_id ?? "",
+    userId: key.user_id ?? "",
+    models: key.models?.join(", ") ?? "",
+    rpsLimit: key.rate_limit_override?.requests_per_second?.toString() ?? "",
+    burstSize: key.rate_limit_override?.burst_size?.toString() ?? "",
+    maxTokensPerRequest: key.token_budget?.max_tokens_per_request?.toString() ?? "",
+    maxTokensPerDay: key.token_budget?.max_tokens_per_day?.toString() ?? "",
+    maxTokensPerMonth: key.token_budget?.max_tokens_per_month?.toString() ?? "",
+    costLimitPerDay: key.token_budget?.cost_limit_per_day?.toString() ?? "",
+    costLimitPerMonth: key.token_budget?.cost_limit_per_month?.toString() ?? "",
+  }
+}
+
+function num(v: string): number | undefined {
+  if (v.trim() === "") return undefined
+  const n = Number(v)
+  return Number.isNaN(n) ? undefined : n
+}
+
+function list(v: string): string[] | undefined {
+  const items = v.split(",").map((s) => s.trim()).filter(Boolean)
+  return items.length ? items : undefined
+}
+
+function buildRateLimitOverride(form: KeyFormState) {
+  const rps = num(form.rpsLimit)
+  const burst = num(form.burstSize)
+  if (rps === undefined && burst === undefined) return undefined
+  return { requests_per_second: rps, burst_size: burst }
+}
+
+function buildTokenBudget(form: KeyFormState) {
+  const maxReq = num(form.maxTokensPerRequest)
+  const maxDay = num(form.maxTokensPerDay)
+  const maxMonth = num(form.maxTokensPerMonth)
+  const costDay = num(form.costLimitPerDay)
+  const costMonth = num(form.costLimitPerMonth)
+  if ([maxReq, maxDay, maxMonth, costDay, costMonth].every((v) => v === undefined)) return undefined
+  return {
+    max_tokens_per_request: maxReq,
+    max_tokens_per_day: maxDay,
+    max_tokens_per_month: maxMonth,
+    cost_limit_per_day: costDay,
+    cost_limit_per_month: costMonth,
+  }
+}
+
+function KeyFormFields({
+  form,
+  onChange,
+}: {
+  form: KeyFormState
+  onChange: (form: KeyFormState) => void
+}) {
+  const set = <K extends keyof KeyFormState>(key: K, value: KeyFormState[K]) =>
+    onChange({ ...form, [key]: value })
+
+  return (
+    <Tabs defaultValue="basic">
+      <TabsList>
+        <TabsTrigger value="basic">Basic</TabsTrigger>
+        <TabsTrigger value="budgets">Budgets &amp; Limits</TabsTrigger>
+      </TabsList>
+      <TabsContent value="basic" className="space-y-4 pt-2">
+        <div>
+          <Label>Name</Label>
+          <Input value={form.name} onChange={(e) => set("name", e.target.value)} placeholder="e.g. production-key" />
+        </div>
+        <div>
+          <Label>Scopes (comma-separated)</Label>
+          <Input value={form.scopes} onChange={(e) => set("scopes", e.target.value)} placeholder="api, admin" />
+        </div>
+        <div>
+          <Label>Org ID</Label>
+          <Input value={form.orgId} onChange={(e) => set("orgId", e.target.value)} placeholder="optional" />
+        </div>
+        <div>
+          <Label>Team ID</Label>
+          <Input value={form.teamId} onChange={(e) => set("teamId", e.target.value)} placeholder="optional" />
+        </div>
+        <div>
+          <Label>User ID</Label>
+          <Input value={form.userId} onChange={(e) => set("userId", e.target.value)} placeholder="optional" />
+        </div>
+        <div>
+          <Label>Allowed models (comma-separated)</Label>
+          <Input value={form.models} onChange={(e) => set("models", e.target.value)} placeholder="leave empty to allow all" />
+        </div>
+      </TabsContent>
+      <TabsContent value="budgets" className="space-y-4 pt-2">
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <Label>Requests/sec limit</Label>
+            <Input type="number" value={form.rpsLimit} onChange={(e) => set("rpsLimit", e.target.value)} placeholder="unlimited" />
+          </div>
+          <div>
+            <Label>Burst size</Label>
+            <Input type="number" value={form.burstSize} onChange={(e) => set("burstSize", e.target.value)} placeholder="unlimited" />
+          </div>
+          <div>
+            <Label>Max tokens / request</Label>
+            <Input type="number" value={form.maxTokensPerRequest} onChange={(e) => set("maxTokensPerRequest", e.target.value)} placeholder="unlimited" />
+          </div>
+          <div>
+            <Label>Max tokens / day</Label>
+            <Input type="number" value={form.maxTokensPerDay} onChange={(e) => set("maxTokensPerDay", e.target.value)} placeholder="unlimited" />
+          </div>
+          <div>
+            <Label>Max tokens / month</Label>
+            <Input type="number" value={form.maxTokensPerMonth} onChange={(e) => set("maxTokensPerMonth", e.target.value)} placeholder="unlimited" />
+          </div>
+          <div>
+            <Label>Cost limit / day ($)</Label>
+            <Input type="number" value={form.costLimitPerDay} onChange={(e) => set("costLimitPerDay", e.target.value)} placeholder="unlimited" />
+          </div>
+          <div>
+            <Label>Cost limit / month ($)</Label>
+            <Input type="number" value={form.costLimitPerMonth} onChange={(e) => set("costLimitPerMonth", e.target.value)} placeholder="unlimited" />
+          </div>
+        </div>
+      </TabsContent>
+    </Tabs>
+  )
+}
+
 export default function KeysPage() {
   const [keys, setKeys] = useState<ApiKey[]>([])
   const [error, setError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
-  const [newKeyName, setNewKeyName] = useState("")
-  const [newKeyScopes, setNewKeyScopes] = useState("api")
+  const [createForm, setCreateForm] = useState<KeyFormState>(emptyForm)
   const [createdKey, setCreatedKey] = useState<ApiKey | null>(null)
+  const [editKey, setEditKey] = useState<ApiKey | null>(null)
+  const [editForm, setEditForm] = useState<KeyFormState>(emptyForm)
 
   const loadKeys = useCallback(() => {
     api.listKeys().then(setKeys).catch((e) => setError(e.message))
@@ -64,17 +228,48 @@ export default function KeysPage() {
   const handleCreate = async () => {
     try {
       const req: CreateApiKeyRequest = {
-        name: newKeyName,
-        scopes: newKeyScopes.split(",").map((s) => s.trim()),
+        name: createForm.name,
+        scopes: list(createForm.scopes) ?? [],
+        org_id: createForm.orgId || undefined,
+        team_id: createForm.teamId || undefined,
+        user_id: createForm.userId || undefined,
+        models: list(createForm.models),
+        rate_limit_override: buildRateLimitOverride(createForm),
+        token_budget: buildTokenBudget(createForm),
       }
       const key = await api.createKey(req)
       setCreatedKey(key)
       setCreateOpen(false)
-      setNewKeyName("")
-      setNewKeyScopes("api")
+      setCreateForm(emptyForm)
       loadKeys()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Failed to create key")
+    }
+  }
+
+  const openEdit = (key: ApiKey) => {
+    setEditKey(key)
+    setEditForm(formFromKey(key))
+  }
+
+  const handleSaveEdit = async () => {
+    if (!editKey) return
+    try {
+      const req: UpdateApiKeyRequest = {
+        name: editForm.name,
+        scopes: list(editForm.scopes) ?? [],
+        org_id: editForm.orgId || null,
+        team_id: editForm.teamId || null,
+        user_id: editForm.userId || null,
+        models: list(editForm.models) ?? null,
+        rate_limit_override: buildRateLimitOverride(editForm) ?? null,
+        token_budget: buildTokenBudget(editForm) ?? null,
+      }
+      await api.updateKey(editKey.id, req)
+      setEditKey(null)
+      loadKeys()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to update key")
     }
   }
 
@@ -171,14 +366,7 @@ export default function KeysPage() {
                       <DialogTitle>Create API Key</DialogTitle>
                     </DialogHeader>
                     <div className="space-y-4">
-                      <div>
-                        <Label>Name</Label>
-                        <Input value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} placeholder="e.g. production-key" />
-                      </div>
-                      <div>
-                        <Label>Scopes (comma-separated)</Label>
-                        <Input value={newKeyScopes} onChange={(e) => setNewKeyScopes(e.target.value)} placeholder="api, admin" />
-                      </div>
+                      <KeyFormFields form={createForm} onChange={setCreateForm} />
                       <Button onClick={handleCreate} className="w-full">Create</Button>
                     </div>
                   </DialogContent>
@@ -221,6 +409,7 @@ export default function KeysPage() {
                             <Button variant="ghost" size="sm">...</Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={() => openEdit(k)}>Edit</DropdownMenuItem>
                             <DropdownMenuItem onClick={() => handleToggle(k)}>
                               {k.enabled ? "Disable" : "Enable"}
                             </DropdownMenuItem>
@@ -244,6 +433,18 @@ export default function KeysPage() {
         </div>
       </SidebarInset>
     </SidebarProvider>
+
+    <Dialog open={editKey !== null} onOpenChange={(open) => !open && setEditKey(null)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Edit API Key</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <KeyFormFields form={editForm} onChange={setEditForm} />
+          <Button onClick={handleSaveEdit} className="w-full">Save Changes</Button>
+        </div>
+      </DialogContent>
+    </Dialog>
     </AuthGuard>
   )
 }

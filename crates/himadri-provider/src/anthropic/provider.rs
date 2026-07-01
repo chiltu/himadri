@@ -465,7 +465,8 @@ mod tool_tests {
     #[test]
     fn tools_translated_to_anthropic_schema() {
         let provider = AnthropicProvider::new(None);
-        let body = provider.build_request_body(&request_with_tools(serde_json::json!("auto")), false);
+        let body =
+            provider.build_request_body(&request_with_tools(serde_json::json!("auto")), false);
         // Anthropic uses name/description/input_schema, not {type, function}.
         assert_eq!(body["tools"][0]["name"], "get_weather");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");

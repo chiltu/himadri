@@ -317,8 +317,12 @@ async fn cache_serves_identical_request_without_hitting_provider() {
     ));
     gw.register_provider(healthy);
 
-    gw.route(request("gpt-4", "same"), None, None).await.unwrap();
-    gw.route(request("gpt-4", "same"), None, None).await.unwrap();
+    gw.route(request("gpt-4", "same"), None, None)
+        .await
+        .unwrap();
+    gw.route(request("gpt-4", "same"), None, None)
+        .await
+        .unwrap();
 
     assert_eq!(
         handle.call_count(),
@@ -346,7 +350,11 @@ async fn cache_misses_for_different_prompt() {
         .await
         .unwrap();
 
-    assert_eq!(handle.call_count(), 2, "different prompts both hit provider");
+    assert_eq!(
+        handle.call_count(),
+        2,
+        "different prompts both hit provider"
+    );
 }
 
 // ─── Embeddings ──────────────────────────────────────────────────────────
@@ -364,7 +372,10 @@ async fn embed_skips_unsupported_provider_and_uses_supporting_one() {
 
     let resp = gw
         .embed(
-            embed_request("text-embedding-3-small", EmbeddingInput::Single("hi".to_string())),
+            embed_request(
+                "text-embedding-3-small",
+                EmbeddingInput::Single("hi".to_string()),
+            ),
             None,
         )
         .await
@@ -403,12 +414,18 @@ async fn embed_errors_when_no_provider_supports_embeddings() {
 
     let result = gw
         .embed(
-            embed_request("text-embedding-3-small", EmbeddingInput::Single("hi".to_string())),
+            embed_request(
+                "text-embedding-3-small",
+                EmbeddingInput::Single("hi".to_string()),
+            ),
             None,
         )
         .await;
 
-    assert!(result.is_err(), "no embedding-capable provider should error");
+    assert!(
+        result.is_err(),
+        "no embedding-capable provider should error"
+    );
 }
 
 // ─── RBAC (tiered access) ────────────────────────────────────────────
@@ -461,20 +478,34 @@ fn role(models: Option<&[&str]>, providers: Option<&[&str]>) -> RolePolicy {
 #[tokio::test]
 async fn rbac_denies_model_outside_role() {
     let gw = himadri::Gateway::new(
-        rbac_config(&["healthy"], vec![("analyst", role(Some(&["gpt-4o-mini"]), None))]),
+        rbac_config(
+            &["healthy"],
+            vec![("analyst", role(Some(&["gpt-4o-mini"]), None))],
+        ),
         metrics(),
     );
     gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
 
     // analyst may not use gpt-4o
     let denied = gw
-        .route(request("gpt-4o", "hello"), Some(&auth(&["analyst"], false)), None)
+        .route(
+            request("gpt-4o", "hello"),
+            Some(&auth(&["analyst"], false)),
+            None,
+        )
         .await;
-    assert!(matches!(denied, Err(himadri_core::GatewayError::Forbidden(_))));
+    assert!(matches!(
+        denied,
+        Err(himadri_core::GatewayError::Forbidden(_))
+    ));
 
     // analyst may use gpt-4o-mini
     let allowed = gw
-        .route(request("gpt-4o-mini", "hello"), Some(&auth(&["analyst"], false)), None)
+        .route(
+            request("gpt-4o-mini", "hello"),
+            Some(&auth(&["analyst"], false)),
+            None,
+        )
         .await;
     assert!(allowed.is_ok());
 }
@@ -482,7 +513,10 @@ async fn rbac_denies_model_outside_role() {
 #[tokio::test]
 async fn rbac_admin_scope_bypasses() {
     let gw = himadri::Gateway::new(
-        rbac_config(&["healthy"], vec![("analyst", role(Some(&["gpt-4o-mini"]), None))]),
+        rbac_config(
+            &["healthy"],
+            vec![("analyst", role(Some(&["gpt-4o-mini"]), None))],
+        ),
         metrics(),
     );
     gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
@@ -497,15 +531,25 @@ async fn rbac_admin_scope_bypasses() {
 #[tokio::test]
 async fn rbac_unknown_role_denied() {
     let gw = himadri::Gateway::new(
-        rbac_config(&["healthy"], vec![("analyst", role(Some(&["gpt-4o-mini"]), None))]),
+        rbac_config(
+            &["healthy"],
+            vec![("analyst", role(Some(&["gpt-4o-mini"]), None))],
+        ),
         metrics(),
     );
     gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
 
     let denied = gw
-        .route(request("gpt-4o-mini", "hello"), Some(&auth(&["stranger"], false)), None)
+        .route(
+            request("gpt-4o-mini", "hello"),
+            Some(&auth(&["stranger"], false)),
+            None,
+        )
         .await;
-    assert!(matches!(denied, Err(himadri_core::GatewayError::Forbidden(_))));
+    assert!(matches!(
+        denied,
+        Err(himadri_core::GatewayError::Forbidden(_))
+    ));
 }
 
 #[tokio::test]
@@ -513,13 +557,23 @@ async fn rbac_denies_provider_outside_role() {
     // Role allows any model but only the "openai" provider; the only target is
     // "healthy", so provider filtering leaves nothing → Forbidden.
     let gw = himadri::Gateway::new(
-        rbac_config(&["healthy"], vec![("engineer", role(None, Some(&["openai"])))]),
+        rbac_config(
+            &["healthy"],
+            vec![("engineer", role(None, Some(&["openai"])))],
+        ),
         metrics(),
     );
     gw.register_provider(Arc::new(MockProvider::new("healthy", "hi")));
 
     let denied = gw
-        .route(request("gpt-4o", "hello"), Some(&auth(&["engineer"], false)), None)
+        .route(
+            request("gpt-4o", "hello"),
+            Some(&auth(&["engineer"], false)),
+            None,
+        )
         .await;
-    assert!(matches!(denied, Err(himadri_core::GatewayError::Forbidden(_))));
+    assert!(matches!(
+        denied,
+        Err(himadri_core::GatewayError::Forbidden(_))
+    ));
 }

@@ -454,10 +454,7 @@ mod tool_tests {
             body["tools"][0]["functionDeclarations"][0]["name"],
             "get_weather"
         );
-        assert_eq!(
-            body["toolConfig"]["functionCallingConfig"]["mode"],
-            "ANY"
-        );
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
     }
 
     #[test]

@@ -735,7 +735,10 @@ async fn test_select_ordered_load_balance_includes_all_as_fallbacks() {
     assert_eq!(ordered.len(), 2);
     let mut providers: Vec<_> = ordered.iter().map(|t| t.provider.clone()).collect();
     providers.sort();
-    assert_eq!(providers, vec!["anthropic".to_string(), "openai".to_string()]);
+    assert_eq!(
+        providers,
+        vec!["anthropic".to_string(), "openai".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -759,7 +762,11 @@ async fn test_select_ordered_dedups_identical_endpoints() {
     ];
     let req = test_request("gpt-4");
     let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
-    assert_eq!(ordered.len(), 1, "identical endpoints should be de-duplicated");
+    assert_eq!(
+        ordered.len(),
+        1,
+        "identical endpoints should be de-duplicated"
+    );
 }
 
 #[tokio::test]

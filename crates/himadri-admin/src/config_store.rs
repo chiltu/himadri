@@ -10,6 +10,19 @@ pub struct ConfigHistoryEntry {
     pub rolled_back_from: Option<u32>,
 }
 
+/// Parses a timestamp that may be RFC3339 (the format `save` writes) or
+/// SQLite's native `datetime('now')` output (`YYYY-MM-DD HH:MM:SS`, no offset
+/// — assumed UTC), which rows written before `save` was fixed to bind an
+/// explicit RFC3339 value are still stored as.
+fn parse_timestamp(s: &str) -> chrono::DateTime<chrono::Utc> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.with_timezone(&chrono::Utc);
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| naive.and_utc())
+        .unwrap_or_default()
+}
+
 /// SQLite-backed config store with history tracking
 pub struct SqliteConfigStore {
     pool: SqlitePool,
@@ -34,13 +47,15 @@ impl SqliteConfigStore {
     /// Save a new config version to database
     pub async fn save(&self, version: u32, config: &Config) -> Result<(), sqlx::Error> {
         let json = serde_json::to_string(config).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-        sqlx::query(
-            "INSERT INTO config_history (version, config, updated_at) VALUES (?, ?, datetime('now'))",
-        )
-        .bind(version)
-        .bind(&json)
-        .execute(&self.pool)
-        .await?;
+        // Bind an explicit RFC3339 timestamp rather than SQLite's `datetime('now')`,
+        // whose `YYYY-MM-DD HH:MM:SS` output isn't RFC3339 and fails to parse in
+        // `get_history` below — which used to silently drop the whole row.
+        sqlx::query("INSERT INTO config_history (version, config, updated_at) VALUES (?, ?, ?)")
+            .bind(version)
+            .bind(&json)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -56,12 +71,9 @@ impl SqliteConfigStore {
             .into_iter()
             .filter_map(|(version, json, updated_at, rolled_back)| {
                 let config: Config = serde_json::from_str(&json).ok()?;
-                let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
-                    .ok()?
-                    .with_timezone(&chrono::Utc);
                 Some(ConfigHistoryEntry {
                     version,
-                    updated_at,
+                    updated_at: parse_timestamp(&updated_at),
                     config,
                     rolled_back_from: rolled_back,
                 })
@@ -71,12 +83,11 @@ impl SqliteConfigStore {
 
     /// Get a specific config version from database
     pub async fn get_version(&self, version: u32) -> Result<Option<Config>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (String,)>(
-            "SELECT config FROM config_history WHERE version = ?",
-        )
-        .bind(version)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, (String,)>("SELECT config FROM config_history WHERE version = ?")
+                .bind(version)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
     }

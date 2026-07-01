@@ -57,7 +57,7 @@ const data = {
       items: [
         {
           title: "Try out",
-          url: "#",
+          url: "/dashboard/playground",
         },
       ],
     },
@@ -73,8 +73,8 @@ const data = {
           url: "/dashboard/models",
         },
         {
-          title: "Usage",
-          url: "/dashboard/usage",
+          title: "Logs",
+          url: "/dashboard/logs",
         },
       ],
     },
@@ -104,7 +104,7 @@ const data = {
         },
         {
           title: "Keys",
-          url: "/dashboard/config",
+          url: "/dashboard/keys",
         },
       ],
     },

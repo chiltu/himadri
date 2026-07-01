@@ -1,4 +1,10 @@
-use sqlx::SqlitePool;
+//! Postgres-backed equivalent of [`crate::provider_store::ProviderStore`] /
+//! [`crate::provider_store::ModelStore`]. Kept as a mirror-image
+//! implementation (same method set, same encryption-at-rest behavior) so
+//! `ProviderStoreBackend`/`ModelStoreBackend` in [`crate::provider_backend`]
+//! can dispatch to whichever backend `DATABASE_URL` selects.
+
+use uuid::Uuid;
 
 use crate::crypto::CipherKey;
 use crate::models::{
@@ -6,16 +12,13 @@ use crate::models::{
     UpdateProviderRequest,
 };
 
-/// SQLite-backed provider store
-pub struct ProviderStore {
-    pool: SqlitePool,
+pub struct PgProviderStore {
+    pool: sqlx::PgPool,
     cipher: Option<CipherKey>,
 }
 
-impl ProviderStore {
-    /// `cipher` encrypts `api_key` at rest when set (see `PROVIDER_ENCRYPTION_KEY`,
-    /// [`crate::crypto`]). Pass `None` to store/read it as plaintext (legacy behavior).
-    pub fn new(pool: SqlitePool, cipher: Option<CipherKey>) -> Self {
+impl PgProviderStore {
+    pub fn new(pool: sqlx::PgPool, cipher: Option<CipherKey>) -> Self {
         Self { pool, cipher }
     }
 
@@ -46,30 +49,41 @@ impl ProviderStore {
     ) -> Result<Provider, sqlx::Error> {
         let plaintext_key = request.api_key.clone();
         request.api_key = self.encrypt_api_key(request.api_key);
-        let mut provider = Provider::new(request);
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
         sqlx::query(
             "INSERT INTO providers (id, name, enabled, api_key, base_url, weight, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
         )
-        .bind(&provider.id)
-        .bind(&provider.name)
-        .bind(provider.enabled)
-        .bind(&provider.api_key)
-        .bind(&provider.base_url)
-        .bind(provider.weight)
-        .bind(provider.created_at.to_rfc3339())
-        .bind(provider.updated_at.to_rfc3339())
+        .bind(id)
+        .bind(&request.name)
+        .bind(request.enabled)
+        .bind(&request.api_key)
+        .bind(&request.base_url)
+        .bind(request.weight)
+        .bind(now)
         .execute(&self.pool)
         .await?;
-        provider.api_key = plaintext_key;
-        Ok(provider)
+
+        Ok(Provider {
+            id: id.to_string(),
+            name: request.name,
+            enabled: request.enabled,
+            api_key: plaintext_key,
+            base_url: request.base_url,
+            weight: request.weight,
+            created_at: now,
+            updated_at: now,
+        })
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Provider>, sqlx::Error> {
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
         let row = sqlx::query_as::<_, ProviderRow>(
-            "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE id = ?",
+            "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE id = $1",
         )
-        .bind(id)
+        .bind(uuid)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| self.decrypt_provider(r.into())))
@@ -89,7 +103,7 @@ impl ProviderStore {
 
     pub async fn list_enabled(&self) -> Result<Vec<Provider>, sqlx::Error> {
         let rows = sqlx::query_as::<_, ProviderRow>(
-            "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE enabled = 1 ORDER BY name",
+            "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE enabled = true ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -105,6 +119,7 @@ impl ProviderStore {
         request: UpdateProviderRequest,
     ) -> Result<Option<Provider>, sqlx::Error> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
 
         let name = request.name.unwrap_or(current.name);
         let enabled = request.enabled.unwrap_or(current.enabled);
@@ -114,15 +129,14 @@ impl ProviderStore {
         let stored_api_key = self.encrypt_api_key(api_key);
 
         sqlx::query(
-            "UPDATE providers SET name = ?, enabled = ?, api_key = ?, base_url = ?, weight = ?, updated_at = ? WHERE id = ?",
+            "UPDATE providers SET name = $1, enabled = $2, api_key = $3, base_url = $4, weight = $5, updated_at = NOW() WHERE id = $6",
         )
         .bind(&name)
         .bind(enabled)
         .bind(&stored_api_key)
         .bind(&base_url)
         .bind(weight)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(id)
+        .bind(uuid)
         .execute(&self.pool)
         .await?;
 
@@ -130,17 +144,15 @@ impl ProviderStore {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, sqlx::Error> {
-        // Check if provider exists
-        let provider = self.get(id).await?;
-        let provider = match provider {
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
+        let provider = match self.get(id).await? {
             Some(p) => p,
             None => return Ok(false),
         };
 
-        // Check if provider has any models
         let model_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM models WHERE provider_id = ?")
-                .bind(id)
+            sqlx::query_as("SELECT COUNT(*) FROM models WHERE provider_id = $1")
+                .bind(uuid)
                 .fetch_one(&self.pool)
                 .await?;
 
@@ -151,21 +163,23 @@ impl ProviderStore {
             )));
         }
 
-        let r = sqlx::query("DELETE FROM providers WHERE id = ?")
-            .bind(id)
+        let r = sqlx::query("DELETE FROM providers WHERE id = $1")
+            .bind(uuid)
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected() > 0)
     }
 
     pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Provider>, sqlx::Error> {
-        // If disabling, check for enabled models
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
+
         if !enabled {
-            let enabled_models: (i64,) =
-                sqlx::query_as("SELECT COUNT(*) FROM models WHERE provider_id = ? AND enabled = 1")
-                    .bind(id)
-                    .fetch_one(&self.pool)
-                    .await?;
+            let enabled_models: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM models WHERE provider_id = $1 AND enabled = true",
+            )
+            .bind(uuid)
+            .fetch_one(&self.pool)
+            .await?;
 
             if enabled_models.0 > 0 {
                 let provider = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
@@ -176,32 +190,32 @@ impl ProviderStore {
             }
         }
 
-        sqlx::query("UPDATE providers SET enabled = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE providers SET enabled = $1, updated_at = NOW() WHERE id = $2")
             .bind(enabled)
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(id)
+            .bind(uuid)
             .execute(&self.pool)
             .await?;
         self.get(id).await
     }
 }
 
-/// SQLite-backed model store
-pub struct ModelStore {
-    pool: SqlitePool,
+pub struct PgModelStore {
+    pool: sqlx::PgPool,
 }
 
-impl ModelStore {
-    pub fn new(pool: SqlitePool) -> Self {
+impl PgModelStore {
+    pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
     }
 
     pub async fn create(&self, request: CreateModelRequest) -> Result<Model, sqlx::Error> {
-        // Validate provider exists
+        let provider_uuid =
+            Uuid::parse_str(&request.provider_id).map_err(|_| sqlx::Error::RowNotFound)?;
+
         let provider_row = sqlx::query_as::<_, ProviderRow>(
-            "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE id = ?",
+            "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE id = $1",
         )
-        .bind(&request.provider_id)
+        .bind(provider_uuid)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -215,36 +229,46 @@ impl ModelStore {
             }
         };
 
-        // Validate provider is enabled
-        if provider_row.enabled == 0 {
+        if !provider_row.enabled {
             return Err(sqlx::Error::Protocol(format!(
                 "Provider '{}' is disabled",
                 provider_row.name
             )));
         }
 
-        let model = Model::new(request);
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+
         sqlx::query(
             "INSERT INTO models (id, name, provider_id, display_name, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
         )
-        .bind(&model.id)
-        .bind(&model.name)
-        .bind(&model.provider_id)
-        .bind(&model.display_name)
-        .bind(model.enabled)
-        .bind(model.created_at.to_rfc3339())
-        .bind(model.updated_at.to_rfc3339())
+        .bind(id)
+        .bind(&request.name)
+        .bind(provider_uuid)
+        .bind(&request.display_name)
+        .bind(request.enabled)
+        .bind(now)
         .execute(&self.pool)
         .await?;
-        Ok(model)
+
+        Ok(Model {
+            id: id.to_string(),
+            name: request.name,
+            provider_id: request.provider_id,
+            display_name: request.display_name,
+            enabled: request.enabled,
+            created_at: now,
+            updated_at: now,
+        })
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Model>, sqlx::Error> {
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
         let row = sqlx::query_as::<_, ModelRow>(
-            "SELECT id, name, provider_id, display_name, enabled, created_at, updated_at FROM models WHERE id = ?",
+            "SELECT id, name, provider_id, display_name, enabled, created_at, updated_at FROM models WHERE id = $1",
         )
-        .bind(id)
+        .bind(uuid)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.into()))
@@ -260,10 +284,11 @@ impl ModelStore {
     }
 
     pub async fn list_by_provider(&self, provider_id: &str) -> Result<Vec<Model>, sqlx::Error> {
+        let provider_uuid = Uuid::parse_str(provider_id).map_err(|_| sqlx::Error::RowNotFound)?;
         let rows = sqlx::query_as::<_, ModelRow>(
-            "SELECT id, name, provider_id, display_name, enabled, created_at, updated_at FROM models WHERE provider_id = ? ORDER BY name",
+            "SELECT id, name, provider_id, display_name, enabled, created_at, updated_at FROM models WHERE provider_id = $1 ORDER BY name",
         )
-        .bind(provider_id)
+        .bind(provider_uuid)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.into()).collect())
@@ -271,7 +296,7 @@ impl ModelStore {
 
     pub async fn list_enabled(&self) -> Result<Vec<Model>, sqlx::Error> {
         let rows = sqlx::query_as::<_, ModelRow>(
-            "SELECT id, name, provider_id, display_name, enabled, created_at, updated_at FROM models WHERE enabled = 1 ORDER BY name",
+            "SELECT id, name, provider_id, display_name, enabled, created_at, updated_at FROM models WHERE enabled = true ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -284,23 +309,25 @@ impl ModelStore {
         request: UpdateModelRequest,
     ) -> Result<Option<Model>, sqlx::Error> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
 
         let name = request.name.unwrap_or(current.name);
         let provider_id = request.provider_id.unwrap_or(current.provider_id.clone());
         let display_name = request.display_name.unwrap_or(current.display_name);
         let enabled = request.enabled.unwrap_or(current.enabled);
 
-        // Validate provider exists and is enabled if changing provider
         if provider_id != current.provider_id {
+            let provider_uuid =
+                Uuid::parse_str(&provider_id).map_err(|_| sqlx::Error::RowNotFound)?;
             let provider_row = sqlx::query_as::<_, ProviderRow>(
-                "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE id = ?",
+                "SELECT id, name, enabled, api_key, base_url, weight, created_at, updated_at FROM providers WHERE id = $1",
             )
-            .bind(&provider_id)
+            .bind(provider_uuid)
             .fetch_optional(&self.pool)
             .await?;
 
             match provider_row {
-                Some(row) if row.enabled == 0 => {
+                Some(row) if !row.enabled => {
                     return Err(sqlx::Error::Protocol(format!(
                         "Provider '{}' is disabled",
                         row.name
@@ -316,15 +343,16 @@ impl ModelStore {
             }
         }
 
+        let provider_uuid = Uuid::parse_str(&provider_id).map_err(|_| sqlx::Error::RowNotFound)?;
+
         sqlx::query(
-            "UPDATE models SET name = ?, provider_id = ?, display_name = ?, enabled = ?, updated_at = ? WHERE id = ?",
+            "UPDATE models SET name = $1, provider_id = $2, display_name = $3, enabled = $4, updated_at = NOW() WHERE id = $5",
         )
         .bind(&name)
-        .bind(&provider_id)
+        .bind(provider_uuid)
         .bind(&display_name)
         .bind(enabled)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(id)
+        .bind(uuid)
         .execute(&self.pool)
         .await?;
 
@@ -332,9 +360,8 @@ impl ModelStore {
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, sqlx::Error> {
-        // Check if model exists and is enabled (active deployment)
-        let model = self.get(id).await?;
-        let model = match model {
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
+        let model = match self.get(id).await? {
             Some(m) => m,
             None => return Ok(false),
         };
@@ -346,60 +373,58 @@ impl ModelStore {
             )));
         }
 
-        let r = sqlx::query("DELETE FROM models WHERE id = ?")
-            .bind(id)
+        let r = sqlx::query("DELETE FROM models WHERE id = $1")
+            .bind(uuid)
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected() > 0)
     }
 
     pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, sqlx::Error> {
-        sqlx::query("UPDATE models SET enabled = ?, updated_at = ? WHERE id = ?")
+        let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
+        sqlx::query("UPDATE models SET enabled = $1, updated_at = NOW() WHERE id = $2")
             .bind(enabled)
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(id)
+            .bind(uuid)
             .execute(&self.pool)
             .await?;
         self.get(id).await
     }
 }
 
-// Row types for database mapping
-
 #[derive(Debug, sqlx::FromRow)]
 struct ProviderRow {
-    id: String,
+    id: Uuid,
     name: String,
-    enabled: i32,
+    enabled: bool,
     api_key: Option<String>,
     base_url: Option<String>,
     weight: f64,
-    created_at: String,
-    updated_at: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct ModelRow {
-    id: String,
+    id: Uuid,
     name: String,
-    provider_id: String,
+    provider_id: Uuid,
     display_name: Option<String>,
-    enabled: i32,
-    created_at: String,
-    updated_at: String,
+    enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<ProviderRow> for Provider {
     fn from(r: ProviderRow) -> Self {
         Provider {
-            id: r.id,
+            id: r.id.to_string(),
             name: r.name,
-            enabled: r.enabled != 0,
+            enabled: r.enabled,
             api_key: r.api_key,
             base_url: r.base_url,
             weight: r.weight,
-            created_at: crate::sqlite_time::parse_or_default(&r.created_at),
-            updated_at: crate::sqlite_time::parse_or_default(&r.updated_at),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         }
     }
 }
@@ -407,13 +432,13 @@ impl From<ProviderRow> for Provider {
 impl From<ModelRow> for Model {
     fn from(r: ModelRow) -> Self {
         Model {
-            id: r.id,
+            id: r.id.to_string(),
             name: r.name,
-            provider_id: r.provider_id,
+            provider_id: r.provider_id.to_string(),
             display_name: r.display_name,
-            enabled: r.enabled != 0,
-            created_at: crate::sqlite_time::parse_or_default(&r.created_at),
-            updated_at: crate::sqlite_time::parse_or_default(&r.updated_at),
+            enabled: r.enabled,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
         }
     }
 }

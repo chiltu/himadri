@@ -1,7 +1,15 @@
 "use client"
 
 import { useEffect, useState, useCallback } from "react"
-import { api, type Provider, type Model, type CreateProviderRequest, type CreateModelRequest } from "@/lib/api"
+import {
+  api,
+  type Provider,
+  type Model,
+  type CreateProviderRequest,
+  type CreateModelRequest,
+  type UpdateProviderRequest,
+  type UpdateModelRequest,
+} from "@/lib/api"
 import { AuthGuard } from "@/components/auth-guard"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
@@ -57,11 +65,25 @@ export default function ModelsPage() {
   const [newProviderName, setNewProviderName] = useState("")
   const [newProviderApiKey, setNewProviderApiKey] = useState("")
   const [newProviderBaseUrl, setNewProviderBaseUrl] = useState("")
+  const [newProviderWeight, setNewProviderWeight] = useState("")
 
   // Model form
   const [newModelName, setNewModelName] = useState("")
   const [newModelDisplayName, setNewModelDisplayName] = useState("")
   const [newModelProviderId, setNewModelProviderId] = useState("")
+
+  // Provider edit
+  const [editProvider, setEditProvider] = useState<Provider | null>(null)
+  const [editProviderName, setEditProviderName] = useState("")
+  const [editProviderApiKey, setEditProviderApiKey] = useState("")
+  const [editProviderBaseUrl, setEditProviderBaseUrl] = useState("")
+  const [editProviderWeight, setEditProviderWeight] = useState("")
+
+  // Model edit
+  const [editModel, setEditModel] = useState<Model | null>(null)
+  const [editModelName, setEditModelName] = useState("")
+  const [editModelDisplayName, setEditModelDisplayName] = useState("")
+  const [editModelProviderId, setEditModelProviderId] = useState("")
 
   const loadProviders = useCallback(() => {
     api.listProviders().then(setProviders).catch((e) => setError(e.message))
@@ -82,15 +104,42 @@ export default function ModelsPage() {
         name: newProviderName,
         api_key: newProviderApiKey || undefined,
         base_url: newProviderBaseUrl || undefined,
+        weight: newProviderWeight ? Number(newProviderWeight) : undefined,
       }
       await api.createProvider(req)
       setProviderDialogOpen(false)
       setNewProviderName("")
       setNewProviderApiKey("")
       setNewProviderBaseUrl("")
+      setNewProviderWeight("")
       loadProviders()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Failed to create provider")
+    }
+  }
+
+  const openEditProvider = (provider: Provider) => {
+    setEditProvider(provider)
+    setEditProviderName(provider.name)
+    setEditProviderApiKey("")
+    setEditProviderBaseUrl(provider.base_url || "")
+    setEditProviderWeight(provider.weight?.toString() ?? "")
+  }
+
+  const handleSaveProvider = async () => {
+    if (!editProvider) return
+    try {
+      const req: UpdateProviderRequest = {
+        name: editProviderName,
+        base_url: editProviderBaseUrl || undefined,
+        weight: editProviderWeight ? Number(editProviderWeight) : undefined,
+        ...(editProviderApiKey ? { api_key: editProviderApiKey } : {}),
+      }
+      await api.updateProvider(editProvider.id, req)
+      setEditProvider(null)
+      loadProviders()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to update provider")
     }
   }
 
@@ -129,6 +178,29 @@ export default function ModelsPage() {
       loadModels()
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Failed to create model")
+    }
+  }
+
+  const openEditModel = (model: Model) => {
+    setEditModel(model)
+    setEditModelName(model.name)
+    setEditModelDisplayName(model.display_name || "")
+    setEditModelProviderId(model.provider_id)
+  }
+
+  const handleSaveModel = async () => {
+    if (!editModel) return
+    try {
+      const req: UpdateModelRequest = {
+        name: editModelName,
+        provider_id: editModelProviderId,
+        display_name: editModelDisplayName || undefined,
+      }
+      await api.updateModel(editModel.id, req)
+      setEditModel(null)
+      loadModels()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Failed to update model")
     }
   }
 
@@ -217,6 +289,10 @@ export default function ModelsPage() {
                               <Label>Base URL (optional)</Label>
                               <Input value={newProviderBaseUrl} onChange={(e) => setNewProviderBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
                             </div>
+                            <div>
+                              <Label>Weight (optional)</Label>
+                              <Input type="number" value={newProviderWeight} onChange={(e) => setNewProviderWeight(e.target.value)} placeholder="1" />
+                            </div>
                             <Button onClick={handleCreateProvider} className="w-full">Create</Button>
                           </div>
                         </DialogContent>
@@ -253,6 +329,7 @@ export default function ModelsPage() {
                                   <Button variant="ghost" size="sm">...</Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end">
+                                  <DropdownMenuItem onClick={() => openEditProvider(p)}>Edit</DropdownMenuItem>
                                   <DropdownMenuItem onClick={() => handleToggleProvider(p)}>
                                     {p.enabled ? "Disable" : "Enable"}
                                   </DropdownMenuItem>
@@ -348,6 +425,7 @@ export default function ModelsPage() {
                                   <Button variant="ghost" size="sm">...</Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end">
+                                  <DropdownMenuItem onClick={() => openEditModel(m)}>Edit</DropdownMenuItem>
                                   <DropdownMenuItem onClick={() => handleToggleModel(m)}>
                                     {m.enabled ? "Disable" : "Enable"}
                                   </DropdownMenuItem>
@@ -375,6 +453,64 @@ export default function ModelsPage() {
           </div>
         </SidebarInset>
       </SidebarProvider>
+
+      <Dialog open={editProvider !== null} onOpenChange={(open) => !open && setEditProvider(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Provider</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label>Name</Label>
+              <Input value={editProviderName} onChange={(e) => setEditProviderName(e.target.value)} />
+            </div>
+            <div>
+              <Label>API Key (leave blank to keep unchanged)</Label>
+              <Input type="password" value={editProviderApiKey} onChange={(e) => setEditProviderApiKey(e.target.value)} placeholder="sk-..." />
+            </div>
+            <div>
+              <Label>Base URL</Label>
+              <Input value={editProviderBaseUrl} onChange={(e) => setEditProviderBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" />
+            </div>
+            <div>
+              <Label>Weight</Label>
+              <Input type="number" value={editProviderWeight} onChange={(e) => setEditProviderWeight(e.target.value)} />
+            </div>
+            <Button onClick={handleSaveProvider} className="w-full">Save Changes</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editModel !== null} onOpenChange={(open) => !open && setEditModel(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Model</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <Label>Model Name</Label>
+              <Input value={editModelName} onChange={(e) => setEditModelName(e.target.value)} />
+            </div>
+            <div>
+              <Label>Display Name</Label>
+              <Input value={editModelDisplayName} onChange={(e) => setEditModelDisplayName(e.target.value)} />
+            </div>
+            <div>
+              <Label>Provider</Label>
+              <select
+                value={editModelProviderId}
+                onChange={(e) => setEditModelProviderId(e.target.value)}
+                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors"
+              >
+                {providers.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+            <Button onClick={handleSaveModel} className="w-full">Save Changes</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </AuthGuard>
   )
 }

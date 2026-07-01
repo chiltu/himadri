@@ -98,6 +98,21 @@ export interface UpdateApiKeyRequest {
   name?: string;
   scopes?: string[];
   enabled?: boolean;
+  org_id?: string | null;
+  team_id?: string | null;
+  user_id?: string | null;
+  models?: string[] | null;
+  rate_limit_override?: {
+    requests_per_second?: number;
+    burst_size?: number;
+  } | null;
+  token_budget?: {
+    max_tokens_per_request?: number;
+    max_tokens_per_day?: number;
+    max_tokens_per_month?: number;
+    cost_limit_per_day?: number;
+    cost_limit_per_month?: number;
+  } | null;
 }
 
 export interface Provider {
@@ -199,27 +214,149 @@ export interface UsageStats {
   error_rate: number;
 }
 
+export type StrategyMode =
+  | "single"
+  | "fallback"
+  | "load_balance"
+  | "least_latency"
+  | "cost_optimized"
+  | "conditional"
+  | "content_based"
+  | "ab_test";
+
+export interface StrategyConfig {
+  mode: StrategyMode;
+  fallback_timeout_ms: number;
+  conditional_rules: ConditionalRuleConfig[];
+  content_rules: ContentRuleConfig[];
+  ab_variants: ABVariantConfig[];
+  strategy_fallback?: Target | null;
+}
+
+export interface ConditionalRuleConfig {
+  key: "model" | "model_prefix";
+  value: string;
+  target: Target;
+}
+
+export interface ContentRuleConfig {
+  condition_type: "prompt_contains" | "prompt_not_contains" | "prompt_regex";
+  value: string;
+  target: Target;
+}
+
+export interface ABVariantConfig {
+  target: Target;
+  weight: number;
+  label: string;
+}
+
+export interface RateLimitConfig {
+  enabled: boolean;
+  requests_per_second: number;
+  burst_size: number;
+}
+
+export interface RolePolicy {
+  models?: string[] | null;
+  providers?: string[] | null;
+}
+
+export interface RbacConfig {
+  enabled: boolean;
+  roles: Record<string, RolePolicy>;
+  default_role?: string | null;
+}
+
+export interface OrgTokenBudget {
+  max_tokens_per_request?: number;
+  max_tokens_per_day?: number;
+  max_tokens_per_month?: number;
+  cost_limit_per_day?: number;
+  cost_limit_per_month?: number;
+}
+
+export interface ContentFilterConfig {
+  enabled: boolean;
+  block_pii: boolean;
+  block_toxicity: boolean;
+  custom_patterns: string[];
+}
+
+export interface AuditConfig {
+  enabled: boolean;
+  log_requests: boolean;
+  log_responses: boolean;
+  redact_pii: boolean;
+  retention_days?: number;
+}
+
+export interface OrgGuardrailConfig {
+  enabled: boolean;
+  blocked_words: string[];
+  max_tokens_per_request?: number;
+  content_filter?: ContentFilterConfig | null;
+  audit: AuditConfig;
+}
+
+export interface TeamConfig {
+  name?: string | null;
+  enabled: boolean;
+  allowed_models?: string[] | null;
+  blocked_models?: string[] | null;
+  rate_limit?: RateLimitConfig | null;
+  token_budget?: OrgTokenBudget | null;
+  guardrails: OrgGuardrailConfig;
+}
+
+export interface OrgConfig {
+  name?: string | null;
+  enabled: boolean;
+  allowed_models?: string[] | null;
+  blocked_models?: string[] | null;
+  rate_limit?: RateLimitConfig | null;
+  token_budget?: OrgTokenBudget | null;
+  guardrails: OrgGuardrailConfig;
+  teams: Record<string, TeamConfig>;
+}
+
+export interface CorsConfig {
+  enabled: boolean;
+  allowed_origins: string[];
+  allowed_methods: string[];
+  allowed_headers: string[];
+}
+
+export interface AdminConfig {
+  enabled: boolean;
+  master_key?: string;
+}
+
+export interface TracingConfig {
+  enabled: boolean;
+  service_name: string;
+  endpoint?: string;
+  sample_ratio: number;
+}
+
+export interface MetricsConfig {
+  enabled: boolean;
+  path: string;
+}
+
 export interface GatewayConfig {
-  strategy: {
-    mode: string;
-  };
+  strategy: StrategyConfig;
   targets: Target[];
-  rate_limit: {
-    enabled: boolean;
-    requests_per_second: number;
-    burst_size: number;
-  };
   plugins: PluginConfig[];
   observability: {
-    tracing: {
-      enabled: boolean;
-      endpoint: string;
-      sample_ratio: number;
-    };
+    tracing: TracingConfig;
+    metrics: MetricsConfig;
   };
-  admin: {
-    master_key?: string;
-  };
+  rate_limit: RateLimitConfig;
+  admin: AdminConfig;
+  orgs: Record<string, OrgConfig>;
+  cors: CorsConfig;
+  rbac: RbacConfig;
 }
 
 export interface Target {
@@ -232,8 +369,6 @@ export interface Target {
 
 export interface PluginConfig {
   name: string;
-  type: string;
-  stage: string;
   enabled: boolean;
   config?: Record<string, unknown>;
 }
