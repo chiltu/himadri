@@ -74,7 +74,7 @@ himadri-core = { path = "../himadri-core" }
 himadri-provider = { path = "../himadri-provider" }
 himadri-plugin = { path = "../himadri-plugin" }
 himadri-plugins = { path = "../himadri-plugins" }
-himadri-admin = { path = "../himadri-admin" }
+himadri-admin = { path = "../himadri-admin", features = ["postgres"] }
 himadri-observability = { path = "../himadri-observability" }
 himadri-ratelimit = { path = "../himadri-ratelimit" }
 himadri-circuitbreaker = { path = "../himadri-circuitbreaker" }
@@ -85,3 +85,5 @@ tower-http = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
 futures = { workspace = true }
+base64 = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "postgres", "chrono", "uuid"] }
