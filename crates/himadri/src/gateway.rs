@@ -62,6 +62,19 @@ struct AuditContext<'a> {
     guardrail_actions: &'a [String],
 }
 
+/// Why a failover attempt produced no result. Infrastructure failures are
+/// kept distinct from provider errors so each caller can preserve its error
+/// surface: `route` flattens everything into `ProviderError` (for audit /
+/// usage records), while `route_stream` maps to the richer `GatewayError`
+/// variants (`CircuitOpen`, `ProviderNotFound`).
+enum AttemptError {
+    NoTargets,
+    CircuitOpen(String),
+    ProviderNotFound(String),
+    ApiKey(GatewayError),
+    Provider(himadri_provider::ProviderError),
+}
+
 pub struct Gateway {
     config: RwLock<Config>,
     providers: DashMap<String, Arc<dyn Provider>>,
@@ -69,6 +82,10 @@ pub struct Gateway {
     strategy: RwLock<Strategy>,
     circuit_breakers: DashMap<String, Arc<dyn CircuitBreakerTrait>>,
     targets: RwLock<Vec<Target>>,
+    /// Decrypted API keys for DB-registered providers, keyed by provider name.
+    /// Kept out of `Target` so keys never serialize into `/admin/config`
+    /// responses or config history.
+    provider_keys: DashMap<String, String>,
     rate_limiter: RateLimiter,
     audit_log: Arc<AuditLog>,
     metrics: Arc<Metrics>,
@@ -125,6 +142,7 @@ impl Gateway {
             strategy: RwLock::new(strategy),
             circuit_breakers: DashMap::new(),
             targets: RwLock::new(config.targets),
+            provider_keys: DashMap::new(),
             rate_limiter,
             audit_log,
             metrics,
@@ -169,23 +187,68 @@ impl Gateway {
         self.plugin_manager = Arc::new(manager);
     }
 
-    /// Execute a completion against an ordered list of targets, advancing to
-    /// the next target when a circuit breaker is open or the provider returns a
-    /// retryable error. Returns the target actually used, its result, and the
-    /// observed latency.
-    async fn execute_with_fallback(
+    /// Run the shared request prologue: rate-limit / budget / guardrail /
+    /// RBAC checks followed by the before-request plugins. Any new guard
+    /// added here applies to both `route` and `route_stream`.
+    async fn prepare_request(
         &self,
         request: &ChatCompletionRequest,
+        auth: Option<&AuthContext>,
+        remote_ip: Option<String>,
+    ) -> Result<himadri_plugin::PluginContext, GatewayError> {
+        let config = self.config.read().await;
+        self.check_rate_limits(auth, &config)?;
+        self.check_token_budgets(auth, &config, request)?;
+        self.check_org_guardrails(auth, &config, request)?;
+        self.check_rbac_model(auth, &config, &request.model)?;
+        drop(config);
+
+        let mut ctx = himadri_plugin::PluginContext::from_request(request, auth);
+        ctx.remote_ip = remote_ip;
+        self.plugin_manager
+            .run_before(&mut ctx)
+            .await
+            .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+        Ok(ctx)
+    }
+
+    /// Select targets via the active strategy (in priority order for
+    /// failover) and filter them by the caller's RBAC grants.
+    async fn select_targets(
+        &self,
+        request: &ChatCompletionRequest,
+        auth: Option<&AuthContext>,
+    ) -> Result<Vec<Target>, GatewayError> {
+        let strategy = self.strategy.read().await;
+        let targets = self.targets.read().await;
+        let ordered = strategy.select_ordered(request, &targets).await?;
+        drop(strategy);
+        drop(targets);
+        self.filter_targets_by_rbac(auth, ordered).await
+    }
+
+    /// Execute an operation against an ordered list of targets, advancing to
+    /// the next target when a circuit breaker is open or the operation
+    /// returns a retryable error. Returns the target actually used, its
+    /// result, and the latency of the final attempt.
+    ///
+    /// Infrastructure failures stay distinct from provider errors (see
+    /// [`AttemptError`]) so each caller can keep its own error surface.
+    /// `record_latency` feeds per-attempt latency into the least-latency
+    /// routing strategy; streaming passes `false` because time-to-open-stream
+    /// is not comparable with full completion latency.
+    async fn with_failover<T, F, Fut>(
+        &self,
         ordered: &[Target],
-    ) -> (
-        Target,
-        Result<ChatCompletionResponse, himadri_provider::ProviderError>,
-        std::time::Duration,
-    ) {
+        record_latency: bool,
+        mut op: F,
+    ) -> (Target, Result<T, AttemptError>, std::time::Duration)
+    where
+        F: FnMut(Arc<dyn Provider>, String) -> Fut,
+        Fut: std::future::Future<Output = Result<T, himadri_provider::ProviderError>>,
+    {
         let mut last_target = ordered[0].clone();
-        let mut last_result = Err(himadri_provider::ProviderError::Internal(
-            "No targets attempted".to_string(),
-        ));
+        let mut last_result = Err(AttemptError::NoTargets);
         let mut last_latency = std::time::Duration::ZERO;
 
         let last_idx = ordered.len() - 1;
@@ -202,10 +265,7 @@ impl Gateway {
                 .clone();
 
             if !cb.allow().await {
-                last_result = Err(himadri_provider::ProviderError::Internal(format!(
-                    "Circuit breaker open for provider {}",
-                    candidate.provider
-                )));
+                last_result = Err(AttemptError::CircuitOpen(candidate.provider.clone()));
                 if is_last {
                     break;
                 }
@@ -216,10 +276,7 @@ impl Gateway {
             let provider = match self.providers.get(&candidate.provider) {
                 Some(p) => p.clone(),
                 None => {
-                    last_result = Err(himadri_provider::ProviderError::Internal(format!(
-                        "Provider not found: {}",
-                        candidate.provider
-                    )));
+                    last_result = Err(AttemptError::ProviderNotFound(candidate.provider.clone()));
                     if is_last {
                         break;
                     }
@@ -231,7 +288,7 @@ impl Gateway {
             let api_key = match self.get_api_key(candidate) {
                 Ok(k) => k,
                 Err(e) => {
-                    last_result = Err(himadri_provider::ProviderError::Internal(e.to_string()));
+                    last_result = Err(AttemptError::ApiKey(e));
                     if is_last {
                         break;
                     }
@@ -241,7 +298,7 @@ impl Gateway {
 
             // Execute.
             let start = std::time::Instant::now();
-            let result = provider.complete(request, &api_key).await;
+            let result = op(provider, api_key).await;
             last_latency = start.elapsed();
 
             // Circuit breaker + latency bookkeeping for this attempt.
@@ -250,14 +307,16 @@ impl Gateway {
                 Err(e) if e.retryable() => cb.record_failure().await,
                 Err(_) => {}
             }
-            let attempt_ms = last_latency.as_millis() as u64;
-            if let Strategy::LeastLatency(state) = &*self.strategy.read().await {
-                state.store.record(&candidate.provider, attempt_ms).await;
+            if record_latency {
+                let attempt_ms = last_latency.as_millis() as u64;
+                if let Strategy::LeastLatency(state) = &*self.strategy.read().await {
+                    state.store.record(&candidate.provider, attempt_ms).await;
+                }
             }
 
             match result {
-                Ok(resp) => {
-                    last_result = Ok(resp);
+                Ok(v) => {
+                    last_result = Ok(v);
                     break;
                 }
                 Err(e) if e.retryable() && !is_last => {
@@ -265,11 +324,11 @@ impl Gateway {
                         "Provider {} failed with retryable error, falling back: {}",
                         candidate.provider, e
                     );
-                    last_result = Err(e);
+                    last_result = Err(AttemptError::Provider(e));
                     continue;
                 }
                 Err(e) => {
-                    last_result = Err(e);
+                    last_result = Err(AttemptError::Provider(e));
                     break;
                 }
             }
@@ -332,21 +391,8 @@ impl Gateway {
         auth: Option<&AuthContext>,
         remote_ip: Option<String>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
-        // Check rate limits and quotas
-        let config = self.config.read().await;
-        self.check_rate_limits(auth, &config)?;
-        self.check_token_budgets(auth, &config, &request)?;
-        self.check_org_guardrails(auth, &config, &request)?;
-        self.check_rbac_model(auth, &config, &request.model)?;
-        drop(config);
-
-        // Run before-request plugins
-        let mut ctx = himadri_plugin::PluginContext::from_request(&request, auth);
-        ctx.remote_ip = remote_ip.clone();
-        self.plugin_manager
-            .run_before(&mut ctx)
-            .await
-            .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
+        // Guards + before-request plugins (shared with route_stream).
+        self.prepare_request(&request, auth, remote_ip).await?;
 
         // Serve from response cache on an exact-match hit (non-streaming only).
         if !request.stream {
@@ -360,18 +406,34 @@ impl Gateway {
             }
         }
 
-        // Select provider(s) via strategy, in priority order for failover.
-        let strategy = self.strategy.read().await;
-        let targets = self.targets.read().await;
-        let ordered = strategy.select_ordered(&request, &targets).await?;
-        drop(strategy);
-        drop(targets);
-        let ordered = self.filter_targets_by_rbac(auth, ordered).await?;
+        let ordered = self.select_targets(&request, auth).await?;
 
         // Try targets in priority order, falling back on retryable failures or
         // open circuit breakers.
-        let (target, result, latency) = self.execute_with_fallback(&request, &ordered).await;
+        let request_ref = &request;
+        let (target, result, latency) = self
+            .with_failover(&ordered, true, |provider, api_key| async move {
+                provider.complete(request_ref, &api_key).await
+            })
+            .await;
         let latency_ms = latency.as_millis() as u64;
+
+        // Flatten infrastructure failures into ProviderError, preserving the
+        // messages the audit log and API responses have always carried.
+        let result = result.map_err(|e| match e {
+            AttemptError::Provider(e) => e,
+            AttemptError::CircuitOpen(p) => himadri_provider::ProviderError::Internal(format!(
+                "Circuit breaker open for provider {}",
+                p
+            )),
+            AttemptError::ProviderNotFound(p) => {
+                himadri_provider::ProviderError::Internal(format!("Provider not found: {}", p))
+            }
+            AttemptError::ApiKey(e) => himadri_provider::ProviderError::Internal(e.to_string()),
+            AttemptError::NoTargets => {
+                himadri_provider::ProviderError::Internal("No targets attempted".to_string())
+            }
+        });
 
         // Run after-request plugins
         let mut ctx = himadri_plugin::PluginContext::from_request(&request, auth);
@@ -556,109 +618,31 @@ impl Gateway {
         BoxStream<'static, Result<StreamChunk, himadri_provider::ProviderError>>,
         GatewayError,
     > {
-        // Check rate limits, quotas, and org guardrails
-        let config = self.config.read().await;
-        self.check_rate_limits(auth, &config)?;
-        self.check_token_budgets(auth, &config, &request)?;
-        self.check_org_guardrails(auth, &config, &request)?;
-        self.check_rbac_model(auth, &config, &request.model)?;
-        drop(config);
+        // Guards + before-request plugins (shared with route).
+        let ctx = self.prepare_request(&request, auth, remote_ip).await?;
 
-        // Run before-request plugins (input guardrails)
-        let mut ctx = himadri_plugin::PluginContext::from_request(&request, auth);
-        ctx.remote_ip = remote_ip;
-        self.plugin_manager
-            .run_before(&mut ctx)
-            .await
-            .map_err(|e| GatewayError::BadRequest(e.to_string()))?;
-
-        // Select provider(s) via strategy, in priority order for failover.
-        let strategy = self.strategy.read().await;
-        let targets = self.targets.read().await;
-        let ordered = strategy.select_ordered(&request, &targets).await?;
-        drop(strategy);
-        drop(targets);
-        let ordered = self.filter_targets_by_rbac(auth, ordered).await?;
+        let ordered = self.select_targets(&request, auth).await?;
 
         // Try targets in priority order until one opens a stream. Failover for
         // streaming only applies before the first chunk is produced — once a
-        // stream is established we cannot transparently switch providers.
-        let mut target = ordered[0].clone();
-        let mut stream = None;
-        let mut last_err: Option<GatewayError> = None;
-        let last_idx = ordered.len() - 1;
-        for (idx, candidate) in ordered.iter().enumerate() {
-            let is_last = idx == last_idx;
-            target = candidate.clone();
+        // stream is established we cannot transparently switch providers, and
+        // the circuit breaker records success when the stream opens.
+        let request_ref = &request;
+        let (target, result, _latency) = self
+            .with_failover(&ordered, false, |provider, api_key| async move {
+                provider.complete_stream(request_ref, &api_key).await
+            })
+            .await;
 
-            let cb = self
-                .circuit_breakers
-                .entry(candidate.provider.clone())
-                .or_insert_with(|| Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())))
-                .clone();
-
-            if !cb.allow().await {
-                last_err = Some(GatewayError::CircuitOpen(candidate.provider.clone()));
-                if is_last {
-                    break;
-                }
-                continue;
+        let stream = result.map_err(|e| match e {
+            AttemptError::Provider(e) => GatewayError::Provider(e.to_string()),
+            AttemptError::CircuitOpen(p) => GatewayError::CircuitOpen(p),
+            AttemptError::ProviderNotFound(p) => GatewayError::ProviderNotFound(p),
+            AttemptError::ApiKey(e) => e,
+            AttemptError::NoTargets => {
+                GatewayError::Internal("No targets produced a stream".to_string())
             }
-
-            let provider = match self.providers.get(&candidate.provider) {
-                Some(p) => p.clone(),
-                None => {
-                    last_err = Some(GatewayError::ProviderNotFound(candidate.provider.clone()));
-                    if is_last {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            let api_key = match self.get_api_key(candidate) {
-                Ok(k) => k,
-                Err(e) => {
-                    last_err = Some(e);
-                    if is_last {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            match provider.complete_stream(&request, &api_key).await {
-                Ok(s) => {
-                    cb.record_success().await;
-                    stream = Some(s);
-                    break;
-                }
-                Err(e) => {
-                    if e.retryable() {
-                        cb.record_failure().await;
-                    }
-                    if e.retryable() && !is_last {
-                        warn!(
-                            "Provider {} failed to open stream, falling back: {}",
-                            candidate.provider, e
-                        );
-                        last_err = Some(GatewayError::Provider(e.to_string()));
-                        continue;
-                    }
-                    last_err = Some(GatewayError::Provider(e.to_string()));
-                    break;
-                }
-            }
-        }
-
-        let stream = match stream {
-            Some(s) => s,
-            None => {
-                return Err(last_err.unwrap_or_else(|| {
-                    GatewayError::Internal("No targets produced a stream".to_string())
-                }))
-            }
-        };
+        })?;
 
         // Log audit event for stream start
         {
@@ -708,12 +692,31 @@ impl Gateway {
             self.audit_log.log(event);
         }
 
-        // Wrap stream with output guardrails
+        // Wrap stream with output guardrails and usage accounting. The
+        // recorder fires at stream end (or client disconnect, via Drop),
+        // covering the usage/metrics recording that `route` does inline.
+        let recorder = StreamUsageRecorder {
+            metrics: self.metrics.clone(),
+            usage_store: self.usage_store.clone(),
+            request_log: self.request_log.clone(),
+            provider: target.provider.clone(),
+            model: request.model.clone(),
+            api_key_id: auth.and_then(|a| a.key_id.clone()),
+            started: std::time::Instant::now(),
+            usage: None,
+            error: None,
+            recorded: false,
+        };
         let plugin_manager = self.plugin_manager.clone();
         let auth_clone = auth.cloned();
         let request_clone = request.clone();
-        let wrapped_stream =
-            wrap_stream_with_guardrails(stream, plugin_manager, request_clone, auth_clone);
+        let wrapped_stream = wrap_stream_with_guardrails(
+            stream,
+            plugin_manager,
+            request_clone,
+            auth_clone,
+            recorder,
+        );
 
         Ok(Box::pin(wrapped_stream))
     }
@@ -824,11 +827,19 @@ impl Gateway {
     ) {
         let mut targets = self.targets.write().await;
         targets.clear();
+        self.provider_keys.clear();
 
         // Build targets from enabled providers
         for provider in providers {
             if !provider.enabled {
                 continue;
+            }
+
+            // Stash the (already decrypted) key so get_api_key can use it;
+            // it must not travel on the serializable Target.
+            if let Some(key) = provider.api_key.as_deref().filter(|k| !k.is_empty()) {
+                self.provider_keys
+                    .insert(provider.name.clone(), key.to_string());
             }
 
             // Get enabled models for this provider
@@ -1220,6 +1231,8 @@ impl Gateway {
                     env_var
                 ))
             })
+        } else if let Some(key) = self.provider_keys.get(&target.provider) {
+            Ok(key.clone())
         } else {
             Ok(String::new())
         }
@@ -1364,6 +1377,114 @@ use futures::StreamExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Records usage, metrics and a request-log entry for a streamed request,
+/// mirroring what `route` records for non-streaming ones. Usage is taken
+/// from the last stream chunk that carries it (OpenAI-style final-chunk
+/// usage, Anthropic `message_delta`). Recording happens once, at stream end
+/// or — via `Drop` — when the client disconnects mid-stream.
+struct StreamUsageRecorder {
+    metrics: Arc<Metrics>,
+    usage_store: Arc<himadri_admin::UsageStore>,
+    request_log: Arc<dyn himadri_admin::RequestLogStore>,
+    provider: String,
+    model: String,
+    api_key_id: Option<String>,
+    started: std::time::Instant,
+    usage: Option<himadri_core::Usage>,
+    error: Option<String>,
+    recorded: bool,
+}
+
+impl StreamUsageRecorder {
+    fn observe_chunk(&mut self, chunk: &StreamChunk) {
+        if let Some(usage) = &chunk.usage {
+            self.usage = Some(usage.clone());
+        }
+    }
+
+    fn observe_error(&mut self, e: &himadri_provider::ProviderError) {
+        self.error = Some(e.to_string());
+    }
+
+    fn finish(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+
+        let latency_ms = self.started.elapsed().as_millis() as u64;
+        let (prompt_tokens, completion_tokens, total_tokens) = self
+            .usage
+            .as_ref()
+            .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens))
+            .unwrap_or((0, 0, 0));
+        let labels = [self.provider.as_str(), self.model.as_str()];
+
+        self.metrics.requests_total.with_label_values(&labels).inc();
+        self.metrics
+            .request_duration
+            .observe(latency_ms as f64 / 1000.0);
+        if self.error.is_none() {
+            self.metrics
+                .tokens_input_total
+                .with_label_values(&labels)
+                .inc_by(prompt_tokens as u64);
+            self.metrics
+                .tokens_output_total
+                .with_label_values(&labels)
+                .inc_by(completion_tokens as u64);
+        } else {
+            self.metrics
+                .provider_errors
+                .with_label_values(&labels)
+                .inc();
+        }
+
+        let cost = self
+            .usage_store
+            .calculate_cost(&self.model, prompt_tokens, completion_tokens);
+        if cost > 0.0 {
+            self.metrics
+                .cost_usd_total
+                .with_label_values(&labels)
+                .inc_by((cost * 1_000_000.0) as u64); // micro-USD, as in `route`
+        }
+
+        self.usage_store.record(himadri_admin::UsageRecord {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            api_key_id: self.api_key_id.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cost_usd: cost,
+            latency_ms,
+            created_at: chrono::Utc::now(),
+            success: self.error.is_none(),
+            error_message: self.error.clone(),
+        });
+
+        let _ = self.request_log.write(himadri_admin::RequestLogEntry {
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            stage: "completed".to_string(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            error_message: self.error.clone(),
+            created_at: chrono::Utc::now(),
+        });
+    }
+}
+
+impl Drop for StreamUsageRecorder {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 struct GuardrailStream<S> {
     inner: S,
     buffer: String,
@@ -1372,6 +1493,7 @@ struct GuardrailStream<S> {
     request: ChatCompletionRequest,
     auth: Option<AuthContext>,
     guardrails_ran: bool,
+    recorder: StreamUsageRecorder,
 }
 
 const DEFAULT_STREAM_BUFFER_LIMIT: usize = 1024 * 1024; // 1MB
@@ -1385,6 +1507,7 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
+                self.recorder.observe_chunk(&chunk);
                 // Accumulate response text from chunks, but cap at buffer limit
                 if self.buffer.len() < self.buffer_limit {
                     for choice in &chunk.choices {
@@ -1395,8 +1518,12 @@ where
                 }
                 Poll::Ready(Some(Ok(chunk)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Err(e))) => {
+                self.recorder.observe_error(&e);
+                Poll::Ready(Some(Err(e)))
+            }
             Poll::Ready(None) => {
+                self.recorder.finish();
                 // Stream ended — run guardrails on accumulated content
                 if !self.buffer.is_empty() && !self.guardrails_ran {
                     self.guardrails_ran = true;
@@ -1434,6 +1561,7 @@ fn wrap_stream_with_guardrails<S>(
     plugin_manager: Arc<PluginManager>,
     request: ChatCompletionRequest,
     auth: Option<AuthContext>,
+    recorder: StreamUsageRecorder,
 ) -> GuardrailStream<S>
 where
     S: Stream<Item = Result<StreamChunk, himadri_provider::ProviderError>> + Unpin + Send + 'static,
@@ -1446,6 +1574,123 @@ where
         request,
         auth,
         guardrails_ran: false,
+        recorder,
+    }
+}
+
+#[cfg(test)]
+mod stream_usage_tests {
+    use super::*;
+    use futures::stream;
+    use himadri_observability::Metrics;
+
+    fn chunk(content: &str, usage: Option<himadri_core::Usage>) -> StreamChunk {
+        StreamChunk {
+            id: "c1".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 0,
+            model: "gpt-4o".to_string(),
+            choices: vec![himadri_core::StreamChoice {
+                index: 0,
+                delta: himadri_core::Delta {
+                    role: None,
+                    content: Some(content.to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage,
+            system_fingerprint: None,
+        }
+    }
+
+    fn recorder(
+        usage_store: &Arc<himadri_admin::UsageStore>,
+        request_log: &Arc<himadri_admin::InMemoryRequestLogStore>,
+    ) -> StreamUsageRecorder {
+        StreamUsageRecorder {
+            metrics: Arc::new(Metrics::new()),
+            usage_store: usage_store.clone(),
+            request_log: request_log.clone() as Arc<dyn himadri_admin::RequestLogStore>,
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            api_key_id: Some("key-1".to_string()),
+            started: std::time::Instant::now(),
+            usage: None,
+            error: None,
+            recorded: false,
+        }
+    }
+
+    fn request() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn records_usage_from_final_chunk_at_stream_end() {
+        let usage_store = Arc::new(himadri_admin::UsageStore::new());
+        let request_log = Arc::new(himadri_admin::InMemoryRequestLogStore::new());
+
+        let chunks: Vec<Result<StreamChunk, himadri_provider::ProviderError>> = vec![
+            Ok(chunk("hel", None)),
+            Ok(chunk(
+                "lo",
+                Some(himadri_core::Usage {
+                    prompt_tokens: 7,
+                    completion_tokens: 5,
+                    total_tokens: 12,
+                }),
+            )),
+        ];
+        let wrapped = wrap_stream_with_guardrails(
+            stream::iter(chunks),
+            Arc::new(PluginManager::new()),
+            request(),
+            None,
+            recorder(&usage_store, &request_log),
+        );
+        let out: Vec<_> = wrapped.collect().await;
+        assert_eq!(out.len(), 2);
+
+        let dashboard = usage_store.get_dashboard(0);
+        assert_eq!(dashboard.total_requests, 1);
+        assert_eq!(dashboard.total_tokens, 12);
+        let stats = usage_store.get_key_stats("key-1");
+        assert_eq!(stats.total_tokens, 12);
+    }
+
+    #[tokio::test]
+    async fn records_error_when_client_disconnects_mid_stream() {
+        let usage_store = Arc::new(himadri_admin::UsageStore::new());
+        let request_log = Arc::new(himadri_admin::InMemoryRequestLogStore::new());
+
+        let chunks: Vec<Result<StreamChunk, himadri_provider::ProviderError>> = vec![
+            Ok(chunk("partial", None)),
+            Err(himadri_provider::ProviderError::Network(
+                "reset".to_string(),
+            )),
+        ];
+        let mut wrapped = Box::pin(wrap_stream_with_guardrails(
+            stream::iter(chunks),
+            Arc::new(PluginManager::new()),
+            request(),
+            None,
+            recorder(&usage_store, &request_log),
+        ));
+        // Consume both items, then drop without polling to completion —
+        // Drop must still record, marking the request as failed.
+        let _ = wrapped.next().await;
+        let _ = wrapped.next().await;
+        drop(wrapped);
+
+        let dashboard = usage_store.get_dashboard(0);
+        assert_eq!(dashboard.total_requests, 1);
+        assert!(dashboard.error_rate > 0.0);
     }
 }
 

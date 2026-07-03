@@ -218,7 +218,14 @@ pub async fn connect_provider_model_stores(
 
     #[cfg(feature = "sqlite")]
     if database_url.starts_with("sqlite") {
-        return match sqlx::SqlitePool::connect(&format!("{database_url}?mode=rwc")).await {
+        // Create the database file if missing; don't clobber an existing
+        // query string (e.g. `sqlite://file.db?mode=ro`).
+        let url = if database_url.contains('?') {
+            database_url.to_string()
+        } else {
+            format!("{database_url}?mode=rwc")
+        };
+        return match sqlx::SqlitePool::connect(&url).await {
             Ok(pool) => {
                 if let Err(e) = sqlx::migrate!("migrations/sqlite").run(&pool).await {
                     tracing::error!("Failed to run SQLite migrations: {e}");
@@ -240,4 +247,42 @@ pub async fn connect_provider_model_stores(
 
     #[allow(unreachable_code)]
     None
+}
+
+/// Migrates the database at `database_url` to the latest schema version using
+/// the migrations embedded in this binary. Unlike the connect paths above
+/// (which log and fall back on failure), this returns the error so callers
+/// can fail hard — intended for an explicit pre-startup migration step.
+pub async fn migrate_to_latest(database_url: &str) -> Result<(), String> {
+    #[cfg(feature = "postgres")]
+    if database_url.starts_with("postgres") {
+        let pool = sqlx::PgPool::connect(database_url)
+            .await
+            .map_err(|e| format!("failed to connect to Postgres: {e}"))?;
+        return sqlx::migrate!("migrations/postgres")
+            .run(&pool)
+            .await
+            .map_err(|e| format!("Postgres migration failed: {e}"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    if database_url.starts_with("sqlite") {
+        let url = if database_url.contains('?') {
+            database_url.to_string()
+        } else {
+            format!("{database_url}?mode=rwc")
+        };
+        let pool = sqlx::SqlitePool::connect(&url)
+            .await
+            .map_err(|e| format!("failed to connect to SQLite: {e}"))?;
+        return sqlx::migrate!("migrations/sqlite")
+            .run(&pool)
+            .await
+            .map_err(|e| format!("SQLite migration failed: {e}"));
+    }
+
+    #[allow(unreachable_code)]
+    Err(format!(
+        "unsupported DATABASE_URL scheme (expected sqlite:// or postgres://): {database_url}"
+    ))
 }

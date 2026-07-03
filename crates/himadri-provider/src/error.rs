@@ -57,6 +57,50 @@ impl ProviderError {
     }
 }
 
+impl ProviderError {
+    /// Map an unsuccessful HTTP response with an OpenAI-shaped error body
+    /// (`{"error": {"message": ...}}` or `{"message": ...}`) to a
+    /// `ProviderError`, treating 401 as an auth failure.
+    pub async fn from_openai_response(response: reqwest::Response) -> Self {
+        Self::from_response(response, &[401], |v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .map(str::to_string)
+        })
+        .await
+    }
+
+    /// Map an unsuccessful HTTP response to a `ProviderError`, using
+    /// `extract_message` to pull a human-readable message out of the JSON
+    /// body (falling back to the raw body) and `auth_statuses` for the
+    /// status codes that indicate an authentication failure.
+    pub async fn from_response(
+        response: reqwest::Response,
+        auth_statuses: &[u16],
+        extract_message: impl Fn(&serde_json::Value) -> Option<String>,
+    ) -> Self {
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| extract_message(&v))
+            .unwrap_or(body);
+
+        if auth_statuses.contains(&status) {
+            return ProviderError::Auth(message);
+        }
+        match status {
+            429 => ProviderError::RateLimited {
+                retry_after_secs: 60,
+            },
+            404 => ProviderError::ModelNotFound(message),
+            _ => ProviderError::Api { status, message },
+        }
+    }
+}
+
 impl From<reqwest::Error> for ProviderError {
     fn from(e: reqwest::Error) -> Self {
         ProviderError::Network(e.to_string())

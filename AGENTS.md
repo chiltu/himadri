@@ -6,9 +6,9 @@
 
 Cargo workspace (`crates/`):
 
-- `himadri` — the binary: axum server + `Gateway` orchestrator (`gateway.rs`, `strategy.rs`)
+- `himadri` — the binary: axum server (`main.rs` wiring + `handlers.rs` HTTP handlers) + `Gateway` orchestrator (`gateway.rs`, `strategy.rs`)
 - `himadri-core` — shared types, config, errors
-- `himadri-provider` — `Provider` trait + impls (openai, anthropic, gemini, azure, bedrock, openrouter, …)
+- `himadri-provider` — `Provider` trait; OpenAI-shaped vendors (openai, azure, openrouter, groq, …) are config presets of `compatible::OpenAiCompatibleProvider`; bespoke impls only for anthropic, gemini, bedrock; shared SSE decoding in `sse.rs`
 - `himadri-plugin` / `himadri-plugins` — plugin traits + impls (budget, cache, logger, max_token, rate_limit, word_filter)
 - `himadri-admin` — key/provider/model CRUD, usage & request-log stores (in-memory / Postgres / SQLite), auth middleware
 - `himadri-auth` — JWT/OIDC/OAuth2 (not currently wired into the binary)

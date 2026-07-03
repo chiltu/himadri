@@ -115,25 +115,41 @@ impl RequestLogStore for PostgresRequestLogStore {
                     format!("WHERE {}", conditions.join(" AND "))
                 };
 
-                // Count query
+                // Count query. Filter values are bound (never interpolated) in
+                // the same order the `$N` placeholders were added above.
                 let count_query = format!("SELECT COUNT(*) FROM request_logs {}", where_clause);
-                let count: i64 = sqlx::query_scalar(&count_query)
-                    .fetch_one(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let mut count_q = sqlx::query_scalar::<_, i64>(&count_query);
+                if let Some(model) = &query.model {
+                    count_q = count_q.bind(model.clone());
+                }
+                if let Some(provider) = &query.provider {
+                    count_q = count_q.bind(provider.clone());
+                }
+                if let Some(since) = query.since {
+                    count_q = count_q.bind(since);
+                }
+                let count: i64 = count_q.fetch_one(&pool).await.map_err(|e| e.to_string())?;
 
-                // Data query with pagination
+                // Data query with pagination. LIMIT/OFFSET are i64 (not
+                // user strings), so formatting them in is injection-safe.
                 let limit = query.limit.unwrap_or(100) as i64;
                 let offset = query.offset.unwrap_or(0) as i64;
                 let data_query = format!(
                     "SELECT trace_id, stage, model, provider, prompt_tokens, completion_tokens, total_tokens, error_message, created_at FROM request_logs {} ORDER BY created_at DESC LIMIT {} OFFSET {}",
                     where_clause, limit, offset
                 );
-
-                let rows: Vec<RequestLogRow> = sqlx::query_as(&data_query)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let mut data_q = sqlx::query_as::<_, RequestLogRow>(&data_query);
+                if let Some(model) = &query.model {
+                    data_q = data_q.bind(model.clone());
+                }
+                if let Some(provider) = &query.provider {
+                    data_q = data_q.bind(provider.clone());
+                }
+                if let Some(since) = query.since {
+                    data_q = data_q.bind(since);
+                }
+                let rows: Vec<RequestLogRow> =
+                    data_q.fetch_all(&pool).await.map_err(|e| e.to_string())?;
 
                 let data: Vec<RequestLogEntry> = rows.into_iter().map(|r| RequestLogEntry {
                     trace_id: r.trace_id,
@@ -162,15 +178,15 @@ impl RequestLogStore for PostgresRequestLogStore {
                 let mut conditions = Vec::new();
                 let mut param_count = 1u32;
 
-                if let Some(_model) = query.model {
+                if query.model.is_some() {
                     conditions.push(format!("model = ${}", param_count));
                     param_count += 1;
                 }
-                if let Some(_provider) = query.provider {
+                if query.provider.is_some() {
                     conditions.push(format!("provider = ${}", param_count));
                     param_count += 1;
                 }
-                if let Some(_before) = query.before {
+                if query.before.is_some() {
                     conditions.push(format!("created_at < ${}", param_count));
                     param_count += 1;
                 }
@@ -182,10 +198,21 @@ impl RequestLogStore for PostgresRequestLogStore {
                     format!("WHERE {}", conditions.join(" AND "))
                 };
 
-                let result = sqlx::query(&format!("DELETE FROM request_logs {}", where_clause))
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                // Filter values are bound in placeholder order. With no
+                // filters this is an unconditional `DELETE` (delete-all), the
+                // intended maintenance behavior.
+                let delete_sql = format!("DELETE FROM request_logs {}", where_clause);
+                let mut delete_q = sqlx::query(&delete_sql);
+                if let Some(model) = &query.model {
+                    delete_q = delete_q.bind(model.clone());
+                }
+                if let Some(provider) = &query.provider {
+                    delete_q = delete_q.bind(provider.clone());
+                }
+                if let Some(before) = query.before {
+                    delete_q = delete_q.bind(before);
+                }
+                let result = delete_q.execute(&pool).await.map_err(|e| e.to_string())?;
 
                 Ok(result.rows_affected() as usize)
             })

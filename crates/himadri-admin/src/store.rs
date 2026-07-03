@@ -471,91 +471,47 @@ impl PostgresStore {
         request: UpdateApiKeyRequest,
     ) -> Result<Option<ApiKey>, sqlx::Error> {
         let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
-        let mut sets = Vec::new();
-        let mut p = 1u32;
-        if request.name.is_some() {
-            sets.push(format!("name = ${}", p));
-            p += 1;
-        }
-        if request.scopes.is_some() {
-            sets.push(format!("scopes = ${}", p));
-            p += 1;
-        }
-        if request.enabled.is_some() {
-            sets.push(format!("enabled = ${}", p));
-            p += 1;
-        }
-        if request.expires_at.is_some() {
-            sets.push(format!("expires_at = ${}", p));
-            p += 1;
-        }
-        if request.metadata.is_some() {
-            sets.push(format!("metadata = ${}", p));
-            p += 1;
-        }
-        if request.org_id.is_some() {
-            sets.push(format!("org_id = ${}", p));
-            p += 1;
-        }
-        if request.team_id.is_some() {
-            sets.push(format!("team_id = ${}", p));
-            p += 1;
-        }
-        if request.user_id.is_some() {
-            sets.push(format!("user_id = ${}", p));
-            p += 1;
-        }
-        if request.models.is_some() {
-            sets.push(format!("models = ${}", p));
-            p += 1;
-        }
-        if request.rate_limit_override.is_some() {
-            sets.push(format!("rate_limit_override = ${}", p));
-            p += 1;
-        }
-        if request.token_budget.is_some() {
-            sets.push(format!("token_budget = ${}", p));
-        }
-        if sets.is_empty() {
-            return self.get(id).await;
-        }
+        // Fetch current record, apply changes, save back. Outer `None` keeps
+        // the current value; `Some(None)` clears a nullable field.
+        let current = match self.get(id).await? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
 
-        let q = format!("UPDATE api_keys SET {} WHERE id = ${} RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget", sets.join(", "), p);
-        let mut q = sqlx::query_as::<_, ApiKeyRow>(&q).bind(uuid);
-        if let Some(v) = &request.name {
-            q = q.bind(v);
-        }
-        if let Some(v) = &request.scopes {
-            q = q.bind(serde_json::to_value(v).unwrap_or_default());
-        }
-        if let Some(v) = request.enabled {
-            q = q.bind(v);
-        }
-        if let Some(v) = request.expires_at {
-            q = q.bind(v);
-        }
-        if let Some(v) = &request.metadata {
-            q = q.bind(v);
-        }
-        if let Some(v) = &request.org_id {
-            q = q.bind(v);
-        }
-        if let Some(v) = &request.team_id {
-            q = q.bind(v);
-        }
-        if let Some(v) = &request.user_id {
-            q = q.bind(v);
-        }
-        if let Some(v) = &request.models {
-            q = q.bind(serde_json::to_value(v).unwrap_or_default());
-        }
-        if let Some(v) = &request.rate_limit_override {
-            q = q.bind(serde_json::to_value(v).unwrap_or_default());
-        }
-        if let Some(v) = &request.token_budget {
-            q = q.bind(serde_json::to_value(v).unwrap_or_default());
-        }
-        Ok(q.fetch_optional(&self.pool).await?.map(|r| r.into()))
+        let name = request.name.unwrap_or(current.name);
+        let scopes = request.scopes.unwrap_or(current.scopes);
+        let enabled = request.enabled.unwrap_or(current.enabled);
+        let expires_at = request.expires_at.unwrap_or(current.expires_at);
+        let metadata = request.metadata.unwrap_or(current.metadata);
+        let org_id = request.org_id.unwrap_or(current.org_id);
+        let team_id = request.team_id.unwrap_or(current.team_id);
+        let user_id = request.user_id.unwrap_or(current.user_id);
+        let models = request.models.unwrap_or(current.models);
+        let rate_limit = request
+            .rate_limit_override
+            .unwrap_or(current.rate_limit_override);
+        let token_budget = request.token_budget.unwrap_or(current.token_budget);
+
+        let scopes = serde_json::to_value(&scopes).unwrap_or_default();
+        let models = models.map(|v| serde_json::to_value(v).unwrap_or_default());
+        let rate_limit = rate_limit.map(|v| serde_json::to_value(v).unwrap_or_default());
+        let token_budget = token_budget.map(|v| serde_json::to_value(v).unwrap_or_default());
+
+        let record = sqlx::query_as::<_, ApiKeyRow>(
+            r#"UPDATE api_keys
+               SET name = $2, scopes = $3, enabled = $4, expires_at = $5, metadata = $6,
+                   org_id = $7, team_id = $8, user_id = $9, models = $10,
+                   rate_limit_override = $11, token_budget = $12
+               WHERE id = $1
+               RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget"#,
+        )
+        .bind(uuid)
+        .bind(&name).bind(&scopes).bind(enabled).bind(expires_at).bind(&metadata)
+        .bind(&org_id).bind(&team_id).bind(&user_id)
+        .bind(models).bind(rate_limit).bind(token_budget)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record.map(|r| r.into()))
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, sqlx::Error> {
@@ -723,28 +679,47 @@ impl SqliteStore {
         id: &str,
         request: UpdateApiKeyRequest,
     ) -> Result<Option<ApiKey>, sqlx::Error> {
-        // Fetch current record, apply changes, save back
+        // Fetch current record, apply changes, save back. Outer `None` keeps
+        // the current value; `Some(None)` clears a nullable field.
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
 
         let name = request.name.unwrap_or(current.name);
         let scopes = request.scopes.unwrap_or(current.scopes);
         let enabled = request.enabled.unwrap_or(current.enabled);
+        let expires_at = request.expires_at.unwrap_or(current.expires_at);
         let metadata = request.metadata.unwrap_or(current.metadata);
         let org_id = request.org_id.unwrap_or(current.org_id);
         let team_id = request.team_id.unwrap_or(current.team_id);
         let user_id = request.user_id.unwrap_or(current.user_id);
+        let models = request.models.unwrap_or(current.models);
+        let rate_limit = request
+            .rate_limit_override
+            .unwrap_or(current.rate_limit_override);
+        let token_budget = request.token_budget.unwrap_or(current.token_budget);
 
         let scopes_json = serde_json::to_value(&scopes)
             .unwrap_or_default()
             .to_string();
         let enabled_int = enabled as i32;
         let metadata_str = metadata.as_ref().map(|m| m.to_string());
+        let models_str = models
+            .as_ref()
+            .map(|v| serde_json::to_value(v).unwrap_or_default().to_string());
+        let rate_limit_str = rate_limit
+            .as_ref()
+            .map(|v| serde_json::to_value(v).unwrap_or_default().to_string());
+        let token_budget_str = token_budget
+            .as_ref()
+            .map(|v| serde_json::to_value(v).unwrap_or_default().to_string());
 
         sqlx::query(
-            "UPDATE api_keys SET name = ?, scopes = ?, enabled = ?, metadata = ?, org_id = ?, team_id = ?, user_id = ? WHERE id = ?",
+            "UPDATE api_keys SET name = ?, scopes = ?, enabled = ?, expires_at = ?, metadata = ?, org_id = ?, team_id = ?, user_id = ?, models = ?, rate_limit_override = ?, token_budget = ? WHERE id = ?",
         )
-        .bind(&name).bind(&scopes_json).bind(enabled_int).bind(&metadata_str)
-        .bind(&org_id).bind(&team_id).bind(&user_id).bind(id)
+        .bind(&name).bind(&scopes_json).bind(enabled_int)
+        .bind(expires_at.map(|dt| dt.to_rfc3339())).bind(&metadata_str)
+        .bind(&org_id).bind(&team_id).bind(&user_id)
+        .bind(&models_str).bind(&rate_limit_str).bind(&token_budget_str)
+        .bind(id)
         .execute(&self.pool)
         .await?;
 

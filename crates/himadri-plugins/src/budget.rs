@@ -9,8 +9,8 @@ use himadri_plugin::traits::{Plugin, PluginError, PluginType, Stage};
 // ─── Global Spend Store ──────────────────────────────────────────────
 
 /// Process-level registry of spend stores keyed by store_id.
-static GLOBAL_STORES: once_cell::sync::Lazy<parking_lot::RwLock<HashMap<String, Arc<SpendStore>>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(HashMap::new()));
+static GLOBAL_STORES: once_cell::sync::Lazy<himadri_plugin::StoreRegistry<SpendStore>> =
+    once_cell::sync::Lazy::new(Default::default);
 
 /// Accumulates per-key USD spend with optional key count cap.
 struct SpendStore {
@@ -66,47 +66,30 @@ impl SpendStore {
 }
 
 fn get_or_create_store(store_id: &str, max_keys: usize) -> Arc<SpendStore> {
-    let stores = GLOBAL_STORES.read();
-    if let Some(store) = stores.get(store_id) {
-        return store.clone();
-    }
-    drop(stores);
-
-    let mut stores = GLOBAL_STORES.write();
-    stores
-        .entry(store_id.to_string())
-        .or_insert_with(|| Arc::new(SpendStore::new(max_keys)))
-        .clone()
+    GLOBAL_STORES.get_or_create(store_id, || SpendStore::new(max_keys))
 }
 
 /// Remove accumulated spend for a specific API key from the named store.
 pub fn reset_store_key(store_id: &str, api_key: &str) {
-    let stores = GLOBAL_STORES.read();
-    if let Some(store) = stores.get(store_id) {
-        store.reset(api_key);
-    }
+    GLOBAL_STORES.with(store_id, |s| s.reset(api_key));
 }
 
 /// Clear all accumulated spend for every key in the named store.
 pub fn reset_store(store_id: &str) {
-    let stores = GLOBAL_STORES.read();
-    if let Some(store) = stores.get(store_id) {
-        store.reset_all();
-    }
+    GLOBAL_STORES.with(store_id, |s| s.reset_all());
 }
 
 /// Get current spend for a key (for admin APIs / dashboard).
 pub fn get_spend(store_id: &str, api_key: &str) -> f64 {
-    let stores = GLOBAL_STORES.read();
-    stores.get(store_id).map(|s| s.get(api_key)).unwrap_or(0.0)
+    GLOBAL_STORES
+        .with(store_id, |s| s.get(api_key))
+        .unwrap_or(0.0)
 }
 
 /// Get all spend records for a store (for admin APIs / dashboard).
 pub fn get_all_spend(store_id: &str) -> HashMap<String, f64> {
-    let stores = GLOBAL_STORES.read();
-    stores
-        .get(store_id)
-        .map(|s| s.inner.read().spend.clone())
+    GLOBAL_STORES
+        .with(store_id, |s| s.inner.read().spend.clone())
         .unwrap_or_default()
 }
 

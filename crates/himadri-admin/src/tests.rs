@@ -553,4 +553,110 @@ mod tests {
         let auth = AuthMiddleware::new(StoreBackend::new().await, None);
         assert!(auth.is_bypass());
     }
+
+    /// The SSRF guard must be enforced at the admin boundary: a provider
+    /// pointing at an internal address is rejected, a public one accepted.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn create_provider_enforces_ssrf_guard() {
+        use crate::models::CreateProviderRequest;
+        use crate::store::StoreBackend;
+
+        let path = std::env::temp_dir().join(format!("himadri-ssrf-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}", path.display());
+        let (provider_store, model_store) =
+            crate::provider_backend::connect_provider_model_stores(&url, None)
+                .await
+                .expect("sqlite provider/model store");
+        let admin = AdminHandlers::new(StoreBackend::new().await, Some("mk".to_string()))
+            .with_provider_model_stores(provider_store, model_store);
+
+        let req = |name: &str, base_url: &str| CreateProviderRequest {
+            name: name.to_string(),
+            enabled: true,
+            api_key: Some("sk-x".to_string()),
+            base_url: Some(base_url.to_string()),
+            weight: 1.0,
+        };
+
+        // Cloud metadata endpoint → rejected before the store is touched.
+        assert!(admin
+            .create_provider(req("evil", "http://169.254.169.254/latest/meta-data/"))
+            .await
+            .is_none());
+        // Public endpoint → accepted.
+        assert!(admin
+            .create_provider(req("good", "https://api.openai.com/v1"))
+            .await
+            .is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SQLite update must persist every updatable field — models, budget and
+    /// expires_at were previously dropped silently (Postgres kept them).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_update_persists_models_and_budget() {
+        use crate::store::{SqliteStore, TokenBudget};
+
+        let store = SqliteStore::new("sqlite://:memory:").await.unwrap();
+        let created = store
+            .create(CreateApiKeyRequest {
+                name: "k".to_string(),
+                scopes: vec![],
+                expires_at: None,
+                metadata: None,
+                org_id: Some("org-1".to_string()),
+                team_id: None,
+                user_id: None,
+                models: None,
+                rate_limit_override: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap();
+
+        let updated = store
+            .update(
+                &created.id,
+                UpdateApiKeyRequest {
+                    models: Some(Some(vec!["gpt-4o".to_string()])),
+                    token_budget: Some(Some(TokenBudget {
+                        max_tokens_per_request: Some(1000),
+                        max_tokens_per_day: None,
+                        max_tokens_per_month: None,
+                        cost_limit_per_day: None,
+                        cost_limit_per_month: None,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.models, Some(vec!["gpt-4o".to_string()]));
+        assert_eq!(
+            updated
+                .token_budget
+                .as_ref()
+                .and_then(|b| b.max_tokens_per_request),
+            Some(1000)
+        );
+        // Unspecified fields keep their values; Some(None) clears them.
+        assert_eq!(updated.org_id.as_deref(), Some("org-1"));
+        let cleared = store
+            .update(
+                &created.id,
+                UpdateApiKeyRequest {
+                    org_id: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.org_id, None);
+        assert_eq!(cleared.models, Some(vec!["gpt-4o".to_string()]));
+    }
 }

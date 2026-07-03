@@ -95,17 +95,11 @@ Behavior:
 
 - Connects via a connection pool and **runs embedded migrations** on startup
   (version-tracked, only pending migrations applied).
-- Enables the **API-key store** and **persistent request-log store** — request
-  logs survive restarts.
+- Enables the **API-key store**, the **provider and model stores** (admin
+  CRUD and DB-backed `GET /v1/models`, same as SQLite), and the **persistent
+  request-log store** — request logs survive restarts.
 - The database/role must already exist and be reachable; unlike SQLite, Postgres
   does **not** create the database for you.
-
-> **Current limitation — dynamic providers/models on Postgres:** the admin
-> *provider* and *model* stores (which back the dynamic `GET /v1/models`) are
-> initialized only under the `sqlite` code path. On a Postgres deployment those
-> stores are not wired, so `/v1/models` falls back to each provider's built-in
-> `supported_models()` list. API keys and request logs persist normally. If you
-> need DB-backed dynamic models today, use SQLite. (Tracked as a gap.)
 
 Recommended pool/SSL tuning is done via the `DATABASE_URL` query string per
 `sqlx` conventions, e.g.:
@@ -122,7 +116,7 @@ DATABASE_URL="postgres://user:pass@db.internal:5432/himadri?sslmode=require"
 |---|---|---|---|
 | API keys | ✅ (volatile) | ✅ | ✅ |
 | Usage counters | ✅ (volatile) | ✅ | ✅ |
-| Providers / models (dynamic) | ❌ | ✅ | ⚠️ not wired (see above) |
+| Providers / models (dynamic) | ❌ | ✅ | ✅ |
 | Request logs | in-memory | in-memory | ✅ persistent |
 
 ---
@@ -132,6 +126,16 @@ DATABASE_URL="postgres://user:pass@db.internal:5432/himadri?sslmode=require"
 Migrations are **embedded in the binary** and run automatically at startup — you
 do not run a separate migration step. They are version-tracked, so restarting
 re-applies nothing.
+
+For an explicit, fail-hard migration step, start the binary with `--migrate`:
+it brings the database at `DATABASE_URL` to the latest schema version before
+the server starts and exits non-zero on any failure. This differs from the
+automatic connect-time migrations, which log errors and fall back to in-memory
+stores rather than aborting startup:
+
+```bash
+DATABASE_URL=sqlite://himadri.db ./himadri --migrate
+```
 
 Source locations (for reference / review):
 

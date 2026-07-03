@@ -1363,6 +1363,170 @@ async fn postgres_provider_crud_parity() {
     assert!(admin.delete_provider(&created.id).await);
 }
 
+/// Use case: API-key update semantics must match SQLite — partial updates
+/// keep unspecified fields, `Some(None)` clears nullable fields, and
+/// budget/model restrictions round-trip.
+#[tokio::test]
+async fn postgres_api_key_update_parity() {
+    let Some(url) = postgres_test_url() else {
+        eprintln!("skipping postgres_api_key_update_parity: TEST_POSTGRES_URL not set");
+        return;
+    };
+    let store = himadri_admin::PostgresStore::new(&url)
+        .await
+        .expect("postgres api-key store should connect");
+
+    let created = store
+        .create(himadri_admin::CreateApiKeyRequest {
+            name: "pg-parity-key".to_string(),
+            scopes: vec!["chat".to_string()],
+            expires_at: None,
+            metadata: None,
+            org_id: Some("org-1".to_string()),
+            team_id: None,
+            user_id: None,
+            models: None,
+            rate_limit_override: None,
+            token_budget: None,
+        })
+        .await
+        .expect("create should succeed");
+
+    // Partial update: set models + budget, leave the rest untouched.
+    let updated = store
+        .update(
+            &created.id,
+            himadri_admin::UpdateApiKeyRequest {
+                models: Some(Some(vec!["gpt-4o".to_string()])),
+                token_budget: Some(Some(himadri_admin::TokenBudget {
+                    max_tokens_per_request: Some(1000),
+                    max_tokens_per_day: None,
+                    max_tokens_per_month: None,
+                    cost_limit_per_day: None,
+                    cost_limit_per_month: None,
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update should succeed")
+        .expect("key should exist");
+    assert_eq!(updated.name, "pg-parity-key");
+    assert_eq!(updated.org_id.as_deref(), Some("org-1"));
+    assert_eq!(updated.models, Some(vec!["gpt-4o".to_string()]));
+    assert_eq!(
+        updated
+            .token_budget
+            .as_ref()
+            .and_then(|b| b.max_tokens_per_request),
+        Some(1000)
+    );
+
+    // `Some(None)` clears a nullable field; others remain.
+    let cleared = store
+        .update(
+            &created.id,
+            himadri_admin::UpdateApiKeyRequest {
+                org_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update should succeed")
+        .expect("key should exist");
+    assert_eq!(cleared.org_id, None);
+    assert_eq!(cleared.models, Some(vec!["gpt-4o".to_string()]));
+
+    // Missing id → Ok(None), matching the previous dynamic-update behavior.
+    let missing = store
+        .update(
+            &uuid::Uuid::new_v4().to_string(),
+            himadri_admin::UpdateApiKeyRequest::default(),
+        )
+        .await
+        .expect("update of missing id should not error");
+    assert!(missing.is_none());
+
+    assert!(store.delete(&created.id).await.expect("delete"));
+}
+
+/// Use case: filtered request-log queries must actually apply their filters on
+/// Postgres. The `list`/`delete` builders previously emitted `$N` placeholders
+/// but never bound the values, so any filtered query errored at runtime.
+///
+/// Uses a multi-thread runtime because `RequestLogStore` methods are sync and
+/// `block_in_place` internally — as they do under the real server runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_request_log_filters_are_bound() {
+    use himadri_admin::{
+        MaintenanceQuery, PostgresRequestLogStore, RequestLogEntry, RequestLogQuery,
+        RequestLogStore,
+    };
+
+    let Some(url) = postgres_test_url() else {
+        eprintln!("skipping postgres_request_log_filters_are_bound: TEST_POSTGRES_URL not set");
+        return;
+    };
+    let store = PostgresRequestLogStore::new(&url)
+        .await
+        .expect("postgres request-log store should connect");
+
+    let tag = uuid::Uuid::new_v4().to_string();
+    let entry = |provider: &str| RequestLogEntry {
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        stage: "completed".to_string(),
+        model: tag.clone(), // unique per test run, so filters isolate our rows
+        provider: provider.to_string(),
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2,
+        error_message: None,
+        created_at: chrono::Utc::now(),
+    };
+    store.write(entry("openai")).unwrap();
+    store.write(entry("openai")).unwrap();
+    store.write(entry("anthropic")).unwrap();
+
+    // Filtered list: model + provider must both apply (previously errored).
+    let listed = store
+        .list(RequestLogQuery {
+            model: Some(tag.clone()),
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        })
+        .expect("filtered list should succeed");
+    assert_eq!(listed.total, 2);
+    assert!(listed.data.iter().all(|e| e.provider == "openai"));
+
+    // Filtered delete removes only the matching subset.
+    let deleted = store
+        .delete(MaintenanceQuery {
+            model: Some(tag.clone()),
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        })
+        .expect("filtered delete should succeed");
+    assert_eq!(deleted, 2);
+
+    // The anthropic row for this tag survives.
+    let remaining = store
+        .list(RequestLogQuery {
+            model: Some(tag.clone()),
+            ..Default::default()
+        })
+        .expect("list should succeed");
+    assert_eq!(remaining.total, 1);
+    assert_eq!(remaining.data[0].provider, "anthropic");
+
+    // Clean up.
+    store
+        .delete(MaintenanceQuery {
+            model: Some(tag),
+            ..Default::default()
+        })
+        .unwrap();
+}
+
 /// Use case: encryption at rest for provider secrets must behave identically
 /// on Postgres as on SQLite.
 #[tokio::test]

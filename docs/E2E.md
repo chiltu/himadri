@@ -22,6 +22,9 @@ cargo build -p himadri -p load-test-sink   # -> target/debug/himadri, target/deb
 
 Notes:
 - Binary names use underscores: `himadri`, `load_test_sink`.
+- The gateway binary accepts `--port <PORT>` (overrides the `PORT` env var used
+  in the examples below), `--migrate` (migrate `DATABASE_URL` to the latest
+  schema before starting), and `--help`.
 - The default gateway config has a single `openai` target with
   `api_key_env: OPENAI_API_KEY`, so **`OPENAI_API_KEY` must be set** (any value;
   the sink ignores it) or requests fail with `ServiceUnavailable`.

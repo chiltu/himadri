@@ -184,9 +184,8 @@ impl RateLimiterStore {
 
 // ─── Global Rate Limiter Stores ──────────────────────────────────────
 
-static GLOBAL_STORES: once_cell::sync::Lazy<
-    parking_lot::RwLock<HashMap<String, Arc<RateLimiterStore>>>,
-> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(HashMap::new()));
+static GLOBAL_STORES: once_cell::sync::Lazy<himadri_plugin::StoreRegistry<RateLimiterStore>> =
+    once_cell::sync::Lazy::new(Default::default);
 
 fn get_or_create_store(
     store_id: &str,
@@ -194,39 +193,26 @@ fn get_or_create_store(
     window: Duration,
     max_keys: usize,
 ) -> Arc<RateLimiterStore> {
-    let stores = GLOBAL_STORES.read();
-    if let Some(store) = stores.get(store_id) {
-        return store.clone();
-    }
-    drop(stores);
-
-    let mut stores = GLOBAL_STORES.write();
-    stores
-        .entry(store_id.to_string())
-        .or_insert_with(|| Arc::new(RateLimiterStore::new(rate, window, max_keys, 64)))
-        .clone()
+    GLOBAL_STORES.get_or_create(store_id, || {
+        RateLimiterStore::new(rate, window, max_keys, 64)
+    })
 }
 
 /// Reset rate limit for a specific key.
 pub fn reset_store_key(store_id: &str, key: &str) {
-    let stores = GLOBAL_STORES.read();
-    if let Some(store) = stores.get(store_id) {
-        store.reset(key);
-    }
+    GLOBAL_STORES.with(store_id, |s| s.reset(key));
 }
 
 /// Reset all rate limits in a store.
 pub fn reset_store(store_id: &str) {
-    let stores = GLOBAL_STORES.read();
-    if let Some(store) = stores.get(store_id) {
-        store.reset_all();
-    }
+    GLOBAL_STORES.with(store_id, |s| s.reset_all());
 }
 
 /// Get current request count for a key in the current window.
 pub fn get_request_count(store_id: &str, key: &str) -> u64 {
-    let stores = GLOBAL_STORES.read();
-    stores.get(store_id).map(|s| s.get_count(key)).unwrap_or(0)
+    GLOBAL_STORES
+        .with(store_id, |s| s.get_count(key))
+        .unwrap_or(0)
 }
 
 // ─── Rate Limit Plugin ───────────────────────────────────────────────

@@ -88,6 +88,15 @@ impl AdminHandlers {
     }
 
     pub async fn create_provider(&self, request: CreateProviderRequest) -> Option<Provider> {
+        if let Some(url) = &request.base_url {
+            if let Err(reason) = himadri_core::provider_url_is_allowed(
+                url,
+                himadri_core::allow_private_provider_urls(),
+            ) {
+                tracing::warn!("Rejected provider base_url on create: {reason}");
+                return None;
+            }
+        }
         match &self.provider_store {
             Some(s) => s.create(request).await.ok(),
             None => None,
@@ -106,6 +115,16 @@ impl AdminHandlers {
         id: &str,
         request: UpdateProviderRequest,
     ) -> Option<Provider> {
+        // Outer Some(Some(url)) means "set base_url to url"; validate it.
+        if let Some(Some(url)) = &request.base_url {
+            if let Err(reason) = himadri_core::provider_url_is_allowed(
+                url,
+                himadri_core::allow_private_provider_urls(),
+            ) {
+                tracing::warn!("Rejected provider base_url on update: {reason}");
+                return None;
+            }
+        }
         match &self.provider_store {
             Some(s) => s.update(id, request).await.ok().flatten(),
             None => None,

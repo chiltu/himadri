@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json;
 use tracing::{debug, instrument};
 
@@ -157,6 +158,12 @@ impl OpenAiCompatibleProvider {
             "stream": stream,
         });
 
+        if stream {
+            // Ask for usage in the final chunk (OpenAI streaming sends none
+            // otherwise), so the gateway can meter streamed requests.
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
+
         if let Some(temp) = request.temperature {
             body["temperature"] = serde_json::json!(temp);
         }
@@ -285,27 +292,7 @@ impl OpenAiCompatibleProvider {
     }
 
     async fn handle_error(&self, response: reqwest::Response) -> ProviderError {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v["error"]["message"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| v["message"].as_str().map(|s| s.to_string()))
-            })
-            .unwrap_or(body);
-
-        match status {
-            401 => ProviderError::Auth(message),
-            429 => ProviderError::RateLimited {
-                retry_after_secs: 60,
-            },
-            404 => ProviderError::ModelNotFound(message),
-            _ => ProviderError::Api { status, message },
-        }
+        ProviderError::from_openai_response(response).await
     }
 
     fn build_auth_header(&self, api_key: &str) -> (String, String) {
@@ -402,53 +389,14 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(self.handle_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
         let provider = self.clone();
-
-        let stream = async_stream::stream! {
-            use futures::StreamExt;
-
-            let mut buffer = String::new();
-            let mut lines = byte_stream.map(|r| r.map(|b| String::from_utf8_lossy(&b).to_string()));
-
-            while let Some(line_result) = lines.next().await {
-                match line_result {
-                    Ok(line) => {
-                        buffer.push_str(&line);
-
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].trim().to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            if line == "data: [DONE]" {
-                                return;
-                            }
-
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                match serde_json::from_str::<serde_json::Value>(data) {
-                                    Ok(chunk) => {
-                                        match provider.parse_stream_chunk(chunk) {
-                                            Ok(parsed) => yield Ok(parsed),
-                                            Err(e) => yield Err(e),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        yield Err(ProviderError::Parse(e.to_string()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(ProviderError::Network(e.to_string()));
-                    }
-                }
-            }
-        };
+        let stream = crate::sse::sse_events(response.bytes_stream()).map(move |event| {
+            event.and_then(|event| {
+                let chunk: serde_json::Value = serde_json::from_str(&event.data)
+                    .map_err(|e| ProviderError::Parse(e.to_string()))?;
+                provider.parse_stream_chunk(chunk)
+            })
+        });
 
         Ok(Box::pin(stream))
     }

@@ -11,6 +11,11 @@ plugins/guardrails, circuit breaking, and observability.
 | [Configuration guide](./configuration.md) | Complete env-var reference, JSON config schema, providers, routing strategies, rate limiting, caching, orgs/teams/guardrails, CORS. |
 | [Database configuration](./database.md) | In-memory (default), SQLite (default build), and Postgres backends; what each persists; migrations. |
 | [Zitadel configuration & FAQ](./zitadel.md) | OIDC/JWT setup with Zitadel, role-claim mapping, user onboarding script, troubleshooting FAQ. |
+| [Refactoring backlog](./REFACTORING.md) | Architectural review findings, what was fixed (with rationale), and the remaining optional items. |
+
+See also, at the repository root: [ARCHITECTURE.md](../ARCHITECTURE.md)
+(system overview, request lifecycle, crate map) and
+[DEVELOPMENT.md](../DEVELOPMENT.md) (getting a dev environment running).
 
 ## At a glance
 
@@ -34,6 +39,8 @@ cargo run -p himadri --release
 - **No `DATABASE_URL` → in-memory store**, lost on restart.
 - **SQLite is the default build**; **Postgres requires `--features postgres`**.
 - **Config file is JSON only** (set via `GATEWAY_CONFIG`).
+- **CLI flags:** `--migrate` (migrate the DB to the latest schema before
+  starting, fail-hard), `--port <PORT>` (overrides `PORT`), `--help`.
 
 See the [project AGENTS.md](../AGENTS.md) for repository layout and build/test
 commands.

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json;
 use tracing::{debug, instrument};
 
@@ -269,30 +270,7 @@ impl AnthropicProvider {
     }
 
     async fn handle_error(&self, response: reqwest::Response) -> ProviderError {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v["error"]["message"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| v["message"].as_str().map(|s| s.to_string()))
-            })
-            .unwrap_or(body);
-
-        match status {
-            401 => ProviderError::Auth(message),
-            429 => {
-                let retry_after = 60;
-                ProviderError::RateLimited {
-                    retry_after_secs: retry_after,
-                }
-            }
-            404 => ProviderError::ModelNotFound(message),
-            _ => ProviderError::Api { status, message },
-        }
+        ProviderError::from_openai_response(response).await
     }
 }
 
@@ -369,50 +347,21 @@ impl Provider for AnthropicProvider {
             return Err(self.handle_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
         let provider = self.clone();
-
-        let stream = async_stream::stream! {
-            use futures::StreamExt;
-
-            let mut buffer = String::new();
-            let mut current_event_type = String::new();
-            let mut lines = byte_stream.map(|r| r.map(|b| String::from_utf8_lossy(&b).to_string()));
-
-            while let Some(line_result) = lines.next().await {
-                match line_result {
-                    Ok(line) => {
-                        buffer.push_str(&line);
-
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].trim().to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-
-                            if line.is_empty() {
-                                current_event_type.clear();
-                                continue;
-                            }
-
-                            if let Some(event_type) = line.strip_prefix("event: ") {
-                                current_event_type = event_type.to_string();
-                                continue;
-                            }
-
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if let Ok(data) = serde_json::from_str::<serde_json::Value>(data) {
-                                    if let Some(result) = provider.parse_stream_event(&current_event_type, &data) {
-                                        yield result;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(ProviderError::Network(e.to_string()));
-                    }
+        let stream = crate::sse::sse_events(response.bytes_stream()).filter_map(move |event| {
+            let result = match event {
+                Ok(event) => {
+                    let event_type = event.event.unwrap_or_default();
+                    // Malformed data lines are skipped, matching the
+                    // pre-existing lenient behavior for Anthropic events.
+                    serde_json::from_str::<serde_json::Value>(&event.data)
+                        .ok()
+                        .and_then(|data| provider.parse_stream_event(&event_type, &data))
                 }
-            }
-        };
+                Err(e) => Some(Err(e)),
+            };
+            async move { result }
+        });
 
         Ok(Box::pin(stream))
     }

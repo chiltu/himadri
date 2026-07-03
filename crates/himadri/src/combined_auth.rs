@@ -41,9 +41,17 @@ fn enforce_required_roles(ctx: &AuthContext) -> Result<(), StatusCode> {
     if REQUIRED_ROLES.is_empty() || ctx.has_any_role(&REQUIRED_ROLES) {
         Ok(())
     } else {
+        // Identify the principal by key_id / user_id, never `ctx.api_key` —
+        // for an API-key principal that field is the raw bearer secret and
+        // must not be written to logs (CWE-532).
+        let principal = ctx
+            .key_id
+            .as_deref()
+            .or(ctx.user_id.as_deref())
+            .unwrap_or("unknown");
         warn!(
             "Principal '{}' lacks any required role {:?}; denying",
-            ctx.api_key, *REQUIRED_ROLES
+            principal, *REQUIRED_ROLES
         );
         Err(StatusCode::FORBIDDEN)
     }

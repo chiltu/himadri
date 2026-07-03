@@ -1,12 +1,10 @@
 pub mod anthropic;
-pub mod azure;
 pub mod bedrock;
 pub mod compatible;
 pub mod error;
 pub mod gemini;
 pub mod http_client;
-pub mod openai;
-pub mod openrouter;
+pub mod sse;
 pub mod traits;
 pub mod types;
 

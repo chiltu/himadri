@@ -28,7 +28,7 @@ pub use models::{
     UpdateProviderRequest,
 };
 pub use provider_backend::{
-    connect_provider_model_stores, ModelStoreBackend, ProviderStoreBackend,
+    connect_provider_model_stores, migrate_to_latest, ModelStoreBackend, ProviderStoreBackend,
 };
 #[cfg(feature = "sqlite")]
 pub use provider_store::{ModelStore, ProviderStore};

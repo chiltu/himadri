@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json;
 use tracing::{debug, instrument};
 
@@ -206,12 +207,22 @@ impl BedrockProvider {
         })
     }
 
-    #[allow(dead_code)]
-    fn parse_stream_chunk(
-        &self,
-        chunk: serde_json::Value,
-        model: &str,
-    ) -> Result<StreamChunk, ProviderError> {
+    async fn handle_error(&self, response: reqwest::Response) -> ProviderError {
+        ProviderError::from_response(response, &[403], |v| {
+            v["message"]
+                .as_str()
+                .or_else(|| v["__type"].as_str())
+                .map(str::to_string)
+        })
+        .await
+    }
+
+    fn parse_stream_chunk(&self, chunk: &serde_json::Value, model: &str) -> StreamChunk {
+        let id = chunk["contentBlockDelta"]["outputIndex"]
+            .as_u64()
+            .map(|i| format!("bedrock-{}", i))
+            .unwrap_or_else(|| "bedrock-0".to_string());
+
         let content = chunk["contentBlockDelta"]["delta"]["text"]
             .as_str()
             .map(|s| s.to_string());
@@ -219,19 +230,11 @@ impl BedrockProvider {
         let stop_reason = chunk["metadata"]["stopReason"].as_str().map(|r| match r {
             "end_turn" => "stop".to_string(),
             "max_tokens" => "length".to_string(),
-            "stop_sequence" => "stop".to_string(),
             _ => r.to_string(),
         });
 
-        let usage = chunk["usage"].as_object().map(|u| Usage {
-            prompt_tokens: u["inputTokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["outputTokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["inputTokens"].as_u64().unwrap_or(0) as u32
-                + u["outputTokens"].as_u64().unwrap_or(0) as u32,
-        });
-
-        Ok(StreamChunk {
-            id: format!("bedrock-{}", uuid::Uuid::new_v4()),
+        StreamChunk {
+            id,
             object: "chat.completion.chunk".to_string(),
             created: chrono::Utc::now().timestamp() as u64,
             model: model.to_string(),
@@ -244,32 +247,8 @@ impl BedrockProvider {
                 },
                 finish_reason: stop_reason,
             }],
-            usage,
+            usage: None,
             system_fingerprint: None,
-        })
-    }
-
-    async fn handle_error(&self, response: reqwest::Response) -> ProviderError {
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
-
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| {
-                v["message"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| v["__type"].as_str().map(|s| s.to_string()))
-            })
-            .unwrap_or(body);
-
-        match status {
-            403 => ProviderError::Auth(message),
-            429 => ProviderError::RateLimited {
-                retry_after_secs: 60,
-            },
-            404 => ProviderError::ModelNotFound(message),
-            _ => ProviderError::Api { status, message },
         }
     }
 }
@@ -359,80 +338,16 @@ impl Provider for BedrockProvider {
             return Err(self.handle_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
         let model = request.model.clone();
+        let provider = self.clone();
 
-        let stream = async_stream::stream! {
-            use futures::StreamExt;
-
-            let mut buffer = String::new();
-            let mut lines = byte_stream.map(|r| r.map(|b| String::from_utf8_lossy(&b).to_string()));
-
-            while let Some(line_result) = lines.next().await {
-                match line_result {
-                    Ok(line) => {
-                        buffer.push_str(&line);
-
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].trim().to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            // Bedrock uses event: headers and data: bodies
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                match serde_json::from_str::<serde_json::Value>(data) {
-                                    Ok(chunk) => {
-                                        let id = chunk["contentBlockDelta"]["outputIndex"]
-                                            .as_u64()
-                                            .map(|i| format!("bedrock-{}", i))
-                                            .unwrap_or_else(|| "bedrock-0".to_string());
-
-                                        let content = chunk["contentBlockDelta"]["delta"]["text"]
-                                            .as_str()
-                                            .map(|s| s.to_string());
-
-                                        let stop_reason = chunk["metadata"]["stopReason"]
-                                            .as_str()
-                                            .map(|r| match r {
-                                                "end_turn" => "stop".to_string(),
-                                                "max_tokens" => "length".to_string(),
-                                                _ => r.to_string(),
-                                            });
-
-                                        yield Ok(StreamChunk {
-                                            id,
-                                            object: "chat.completion.chunk".to_string(),
-                                            created: chrono::Utc::now().timestamp() as u64,
-                                            model: model.clone(),
-                                            choices: vec![StreamChoice {
-                                                index: 0,
-                                                delta: Delta {
-                                                    role: None,
-                                                    content,
-                                                    tool_calls: None,
-                                                },
-                                                finish_reason: stop_reason,
-                                            }],
-                                            usage: None,
-                                            system_fingerprint: None,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        yield Err(ProviderError::Parse(e.to_string()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(ProviderError::Network(e.to_string()));
-                    }
-                }
-            }
-        };
+        let stream = crate::sse::sse_events(response.bytes_stream()).map(move |event| {
+            event.and_then(|event| {
+                let chunk: serde_json::Value = serde_json::from_str(&event.data)
+                    .map_err(|e| ProviderError::Parse(e.to_string()))?;
+                Ok(provider.parse_stream_chunk(&chunk, &model))
+            })
+        });
 
         Ok(Box::pin(stream))
     }

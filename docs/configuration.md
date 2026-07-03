@@ -7,6 +7,7 @@ default, so the gateway boots with zero configuration — but that default runs
 with **authentication disabled** and **in-memory storage** (see warnings below).
 
 - [Quick start](#quick-start)
+- [Command-line options](#command-line-options)
 - [Configuration sources](#configuration-sources)
 - [Environment variable reference](#environment-variable-reference)
 - [The JSON config file](#the-json-config-file)
@@ -48,6 +49,31 @@ The server listens on `0.0.0.0:$PORT` (default `8080`) and exposes:
 | `POST /v1/embeddings` | bearer | Embeddings |
 | `* /v1/*` (fallback) | bearer | Transparent proxy to first target |
 | `/admin/*` | master key | Key/provider/model/config CRUD |
+
+---
+
+## Command-line options
+
+Everything is configurable through environment variables; the binary
+additionally accepts a few flags:
+
+```
+himadri [OPTIONS]
+
+OPTIONS:
+    --migrate        Migrate the database (DATABASE_URL) to the latest
+                     schema version before starting
+    --port <PORT>    Listen port (overrides the PORT env var; default 8080)
+    -h, --help       Print help
+```
+
+- `--migrate` runs the embedded migrations (SQLite or Postgres, selected by
+  `DATABASE_URL`'s scheme) to the latest version **before** the server starts,
+  and exits non-zero if `DATABASE_URL` is unset or the migration fails. Use it
+  in deployments where you want schema failures to stop the rollout instead of
+  the default connect-time behavior (which logs the error and falls back to
+  in-memory stores). See [Database configuration](./database.md#migrations).
+- `--port` takes precedence over the `PORT` environment variable.
 
 ---
 
