@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState, useRef } from "react"
-import { api, type Model, type ApiKey } from "@/lib/api"
+import { api, type Model } from "@/lib/api"
 import { AuthGuard } from "@/components/auth-guard"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
@@ -31,9 +31,7 @@ interface Message {
 
 export default function PlaygroundPage() {
   const [models, setModels] = useState<Model[]>([])
-  const [keys, setKeys] = useState<ApiKey[]>([])
   const [selectedModel, setSelectedModel] = useState("")
-  const [selectedKey, setSelectedKey] = useState("")
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
@@ -42,7 +40,6 @@ export default function PlaygroundPage() {
 
   useEffect(() => {
     api.listModels().then(setModels).catch((e) => setError(e.message))
-    api.listKeys().then(setKeys).catch((e) => setError(e.message))
   }, [])
 
   useEffect(() => {
@@ -52,7 +49,7 @@ export default function PlaygroundPage() {
   const enabledModels = models.filter((m) => m.enabled)
 
   const sendMessage = async () => {
-    if (!input.trim() || !selectedModel || !selectedKey || loading) return
+    if (!input.trim() || !selectedModel || loading) return
 
     const userMessage: Message = { role: "user", content: input.trim() }
     setMessages((prev) => [...prev, userMessage])
@@ -67,7 +64,9 @@ export default function PlaygroundPage() {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${selectedKey}`,
+            // API keys are hashed at rest and never returned after creation,
+            // so the playground authenticates with the admin session key.
+            Authorization: `Bearer ${localStorage.getItem("himadri_master_key") ?? ""}`,
           },
           body: JSON.stringify({
             model: selectedModel,
@@ -160,17 +159,10 @@ export default function PlaygroundPage() {
                     </select>
                   </div>
                   <div>
-                    <Label>API Key</Label>
-                    <select
-                      value={selectedKey}
-                      onChange={(e) => setSelectedKey(e.target.value)}
-                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
-                    >
-                      <option value="">Select key</option>
-                      {keys.filter((k) => k.enabled).map((k) => (
-                        <option key={k.id} value={k.key}>{k.name}</option>
-                      ))}
-                    </select>
+                    <Label>Authentication</Label>
+                    <p className="flex h-9 items-center text-sm text-muted-foreground">
+                      Requests use your admin session key
+                    </p>
                   </div>
                 </div>
               </CardContent>
@@ -190,7 +182,7 @@ export default function PlaygroundPage() {
                 <div className="flex-1 overflow-auto space-y-4 min-h-[300px] max-h-[500px]">
                   {messages.length === 0 && (
                     <div className="flex items-center justify-center h-full text-muted-foreground">
-                      Select a model and API key, then start chatting
+                      Select a model, then start chatting
                     </div>
                   )}
                   {messages.map((msg, i) => (
@@ -224,12 +216,12 @@ export default function PlaygroundPage() {
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder={selectedModel && selectedKey ? "Type a message..." : "Select model and key first"}
-                    disabled={!selectedModel || !selectedKey || loading}
+                    placeholder={selectedModel ? "Type a message..." : "Select a model first"}
+                    disabled={!selectedModel || loading}
                   />
                   <Button
                     onClick={sendMessage}
-                    disabled={!input.trim() || !selectedModel || !selectedKey || loading}
+                    disabled={!input.trim() || !selectedModel || loading}
                   >
                     Send
                   </Button>

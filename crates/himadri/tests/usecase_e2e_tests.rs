@@ -78,7 +78,9 @@ fn request(model: &str) -> ChatCompletionRequest {
 fn auth_ctx(api_key: &str, roles: Vec<String>, scope: AuthScope) -> AuthContext {
     AuthContext {
         api_key: api_key.to_string(),
-        key_id: None,
+        // Real auth flows (API-key store, JWT) always set a stable key_id;
+        // budget/rate-limit tracking is keyed by it, never by the raw secret.
+        key_id: Some(api_key.to_string()),
         scope,
         org_id: None,
         team_id: None,

@@ -13,6 +13,7 @@ use himadri_core::{
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+#[derive(Clone)]
 pub struct GeminiProvider {
     base_url: String,
 }
@@ -360,14 +361,6 @@ impl Provider for GeminiProvider {
         });
 
         Ok(Box::pin(stream))
-    }
-}
-
-impl Clone for GeminiProvider {
-    fn clone(&self) -> Self {
-        Self {
-            base_url: self.base_url.clone(),
-        }
     }
 }
 

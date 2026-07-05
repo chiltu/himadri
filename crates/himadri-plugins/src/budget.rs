@@ -12,14 +12,31 @@ use himadri_plugin::traits::{Plugin, PluginError, PluginType, Stage};
 static GLOBAL_STORES: once_cell::sync::Lazy<himadri_plugin::StoreRegistry<SpendStore>> =
     once_cell::sync::Lazy::new(Default::default);
 
-/// Accumulates per-key USD spend with optional key count cap.
+/// Accumulated spend for one principal. Money is held as integer micro-USD
+/// so repeated small additions don't accumulate float rounding error;
+/// `last_update` drives LRU eviction.
+#[derive(Clone, Copy)]
+struct SpendEntry {
+    micro_usd: u64,
+    last_update: std::time::Instant,
+}
+
+/// Accumulates per-key spend with an optional key-count cap.
 struct SpendStore {
     inner: parking_lot::RwLock<SpendStoreInner>,
 }
 
 struct SpendStoreInner {
-    spend: HashMap<String, f64>,
+    spend: HashMap<String, SpendEntry>,
     max_keys: usize,
+}
+
+fn usd_to_micro(usd: f64) -> u64 {
+    (usd * 1_000_000.0).round().max(0.0) as u64
+}
+
+fn micro_to_usd(micro: u64) -> f64 {
+    micro as f64 / 1_000_000.0
 }
 
 impl SpendStore {
@@ -36,22 +53,35 @@ impl SpendStore {
         let mut inner = self.inner.write();
         let exists = inner.spend.contains_key(key);
         if !exists && inner.max_keys > 0 && inner.spend.len() >= inner.max_keys {
-            // Evict the key with the lowest accumulated spend
-            if let Some((min_key, _min_val)) = inner
+            // Evict the least-recently-updated entry. (Evicting the
+            // lowest-spend entry would let an attacker rotating fresh keys
+            // flush an active principal's — or their own — spend record;
+            // LRU only sheds entries that have gone quiet.)
+            if let Some((lru_key, _)) = inner
                 .spend
                 .iter()
-                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .min_by_key(|(_, entry)| entry.last_update)
             {
-                let min_key = min_key.clone();
-                inner.spend.remove(&min_key);
+                let lru_key = lru_key.clone();
+                inner.spend.remove(&lru_key);
             }
         }
-        *inner.spend.entry(key.to_string()).or_insert(0.0) += usd;
+        let now = std::time::Instant::now();
+        let entry = inner.spend.entry(key.to_string()).or_insert(SpendEntry {
+            micro_usd: 0,
+            last_update: now,
+        });
+        entry.micro_usd = entry.micro_usd.saturating_add(usd_to_micro(usd));
+        entry.last_update = now;
     }
 
     fn get(&self, key: &str) -> f64 {
         let inner = self.inner.read();
-        inner.spend.get(key).copied().unwrap_or(0.0)
+        inner
+            .spend
+            .get(key)
+            .map(|e| micro_to_usd(e.micro_usd))
+            .unwrap_or(0.0)
     }
 
     fn reset(&self, key: &str) {
@@ -89,7 +119,14 @@ pub fn get_spend(store_id: &str, api_key: &str) -> f64 {
 /// Get all spend records for a store (for admin APIs / dashboard).
 pub fn get_all_spend(store_id: &str) -> HashMap<String, f64> {
     GLOBAL_STORES
-        .with(store_id, |s| s.inner.read().spend.clone())
+        .with(store_id, |s| {
+            s.inner
+                .read()
+                .spend
+                .iter()
+                .map(|(k, e)| (k.clone(), micro_to_usd(e.micro_usd)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -150,17 +187,20 @@ impl BudgetPlugin {
             + (usage.completion_tokens as f64 / 1_000_000.0) * self.output_per_m_tokens
     }
 
-    fn get_api_key(ctx: &PluginContext) -> Option<String> {
-        // Try metadata first (for backward compat)
-        if let Some(key) = ctx.get_metadata("api_key") {
-            if let Some(s) = key.as_str() {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
+    /// Resolve the identity spend is tracked under. Prefers the stable
+    /// `key_id` / `user_id` from the auth context; never uses the raw bearer
+    /// secret (`AuthContext::api_key`), which must not be spread into
+    /// long-lived stores or admin/dashboard spend listings (CWE-522).
+    fn spend_key(ctx: &PluginContext) -> Option<String> {
+        if let Some(auth) = &ctx.auth {
+            if let Some(id) = auth.key_id.as_deref().or(auth.user_id.as_deref()) {
+                return Some(id.to_string());
             }
         }
-        // Fall back to auth context
-        ctx.auth.as_ref().map(|a| a.api_key.clone())
+        // Metadata fallback (tests / callers that inject an explicit id).
+        ctx.get_metadata("api_key")
+            .and_then(|k| k.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -193,9 +233,9 @@ impl Plugin for BudgetPlugin {
     }
 
     async fn execute(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
-        let key = match Self::get_api_key(ctx) {
+        let key = match Self::spend_key(ctx) {
             Some(k) => k,
-            None => return Ok(()), // No API key — skip per-key budget tracking
+            None => return Ok(()), // No stable identity — skip per-key budget tracking
         };
 
         if ctx.response.is_some() {
@@ -237,6 +277,7 @@ impl BudgetPlugin {
                     "budget exceeded: spent ${:.4} of ${:.2} limit",
                     current, limit
                 ),
+                kind: himadri_plugin::RejectKind::BudgetExceeded,
             });
         }
 
@@ -413,7 +454,7 @@ mod tests {
 
         // After the request, cost is recorded via the after-request stage.
         let mut after = make_response_ctx(api_key, 100, 50);
-        manager.run_after(&mut after).await.unwrap();
+        manager.run_after(&mut after).await;
 
         // The next request is now over budget.
         let mut before2 = make_request_ctx(Some(api_key));

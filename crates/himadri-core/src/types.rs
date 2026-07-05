@@ -78,6 +78,13 @@ pub enum Role {
     Tool,
 }
 
+/// Responses default to the assistant role when a provider omits it.
+impl Default for Role {
+    fn default() -> Self {
+        Role::Assistant
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -94,6 +101,25 @@ impl MessageContent {
         match self {
             MessageContent::Text(s) => Some(s),
             _ => None,
+        }
+    }
+
+    /// Flatten the content to plain text: the text itself for `Text`, and
+    /// the concatenated text parts (non-text parts skipped) for `Parts`.
+    /// Borrows in the `Text` case, so the common path allocates nothing.
+    pub fn flat_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            MessageContent::Text(s) => std::borrow::Cow::Borrowed(s),
+            MessageContent::Parts(parts) => std::borrow::Cow::Owned(
+                parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
         }
     }
 }
@@ -132,10 +158,15 @@ pub struct FunctionCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<Choice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -145,6 +176,7 @@ pub struct ChatCompletionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Choice {
+    #[serde(default)]
     pub index: u32,
     pub message: ResponseMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +185,7 @@ pub struct Choice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseMessage {
+    #[serde(default)]
     pub role: Role,
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,10 +203,15 @@ pub struct Usage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
@@ -183,6 +221,7 @@ pub struct StreamChunk {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChoice {
+    #[serde(default)]
     pub index: u32,
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -302,6 +341,10 @@ fn default_weight() -> f64 {
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
+    /// Non-secret principal descriptor (e.g. `key:<id>`, `jwt:<sub>`,
+    /// `master`). Never the raw bearer secret: `AuthContext` derives
+    /// `Debug`/`Serialize` and travels through plugins and stores, so a
+    /// secret here would be one stray log line away from leaking (CWE-532).
     pub api_key: String,
     pub key_id: Option<String>,
     pub scope: AuthScope,

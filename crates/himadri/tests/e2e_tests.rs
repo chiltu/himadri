@@ -250,10 +250,22 @@ async fn revoke_key(
     }
 }
 
+// Mirrors the production `handlers::error_to_response`: 5xx detail is
+// sanitized at the edge so upstream bodies never reach clients.
 fn error_to_response(e: GatewayError) -> Response {
     let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let message = if status.is_server_error() {
+        match &e {
+            GatewayError::CircuitOpen(_) | GatewayError::ServiceUnavailable(_) => {
+                "upstream provider unavailable".to_string()
+            }
+            _ => "internal server error".to_string(),
+        }
+    } else {
+        e.to_string()
+    };
     let body =
-        Json(serde_json::json!({ "error": { "message": e.to_string(), "type": "gateway_error" } }));
+        Json(serde_json::json!({ "error": { "message": message, "type": "gateway_error" } }));
     (status, body).into_response()
 }
 
@@ -339,12 +351,16 @@ async fn test_provider_error_no_auth() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 500);
+    // Upstream 5xx surfaces as 503 (upstream unavailable), not a generic
+    // 500 — and the upstream error body must NOT leak through the edge.
+    assert_eq!(resp.status(), 503);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Mock provider error"));
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("Mock provider error"),
+        "upstream detail leaked: {message}"
+    );
+    assert!(message.contains("unavailable"));
     h.abort();
 }
 
@@ -619,14 +635,15 @@ async fn test_streaming_error_mid_stream() {
     let (url, h) = setup_test_app(vec![mock], false).await;
     let client = reqwest::Client::new();
 
-    // Request with error model should fail before streaming starts
+    // Request with error model should fail before streaming starts.
+    // Upstream 5xx maps to 503 (upstream unavailable), not 500.
     let resp = client
         .post(format!("{}/v1/chat/completions", url))
         .json(&test_stream_request("error-model"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 500);
+    assert_eq!(resp.status(), 503);
     h.abort();
 }
 

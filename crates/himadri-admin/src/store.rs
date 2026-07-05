@@ -4,12 +4,52 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+// ─── Key hashing ─────────────────────────────────────────────────────
+
+/// Prefix marking a hashed (vs legacy plaintext) stored key value.
+const KEY_HASH_PREFIX: &str = "sha256:";
+
+/// Hash a bearer secret for at-rest storage (CWE-522). SHA-256 without a
+/// KDF is appropriate here: gateway keys are high-entropy random UUIDs, not
+/// passwords, so brute-forcing the hash is infeasible and per-request KDF
+/// latency would be wasted.
+pub(crate) fn hash_api_key(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{}{}",
+        KEY_HASH_PREFIX,
+        hex::encode(Sha256::digest(key.as_bytes()))
+    )
+}
+
+/// Display form for list/get responses. The stored value is a one-way hash,
+/// so the original secret cannot be shown again after creation; expose a
+/// short stable identifier derived from the stored value instead.
+pub(crate) fn masked_key_display(stored: &str) -> String {
+    let tail: String = stored
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("sk-****{}", tail)
+}
+
+fn generate_api_key() -> String {
+    format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""))
+}
+
 // ─── Shared Types ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: String,
     pub name: String,
+    /// The bearer secret is returned in plaintext **only** from `create` and
+    /// `rotate`. Everywhere else (get/list/update/validate) this field holds
+    /// a masked display form — only a SHA-256 hash is stored at rest.
     pub key: String,
     pub scopes: Vec<String>,
     #[serde(default)]
@@ -266,12 +306,13 @@ impl ApiKeyStore {
 
     pub fn create(&self, request: CreateApiKeyRequest) -> ApiKey {
         let id = Uuid::new_v4().to_string();
-        let key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let key = generate_api_key();
+        let key_hash = hash_api_key(&key);
 
         let api_key = ApiKey {
             id: id.clone(),
             name: request.name,
-            key: key.clone(),
+            key: key_hash.clone(),
             scopes: request.scopes,
             enabled: true,
             created_at: Utc::now(),
@@ -288,16 +329,20 @@ impl ApiKeyStore {
         };
 
         self.keys.insert(id.clone(), api_key.clone());
-        self.keys_by_key.insert(key, id);
-        api_key
+        self.keys_by_key.insert(key_hash, id);
+        // The plaintext secret leaves the store exactly once, here.
+        ApiKey { key, ..api_key }
     }
 
     pub fn get(&self, id: &str) -> Option<ApiKey> {
-        self.keys.get(id).map(|k| k.clone())
+        self.keys.get(id).map(|k| mask_stored(k.clone()))
     }
 
     pub fn list(&self) -> Vec<ApiKey> {
-        self.keys.iter().map(|k| k.value().clone()).collect()
+        self.keys
+            .iter()
+            .map(|k| mask_stored(k.value().clone()))
+            .collect()
     }
 
     pub fn update(&self, id: &str, request: UpdateApiKeyRequest) -> Option<ApiKey> {
@@ -335,7 +380,7 @@ impl ApiKeyStore {
             if let Some(token_budget) = request.token_budget {
                 key.token_budget = token_budget;
             }
-            key.clone()
+            mask_stored(key.clone())
         })
     }
 
@@ -349,20 +394,20 @@ impl ApiKeyStore {
     }
 
     pub fn validate(&self, key: &str) -> Option<ApiKey> {
-        let id = self.keys_by_key.get(key)?;
-        let mut api_key = self.keys.get(id.value())?.clone();
-        if !api_key.enabled {
+        let key_hash = hash_api_key(key);
+        let id = self.keys_by_key.get(&key_hash)?.value().clone();
+        let mut entry = self.keys.get_mut(&id)?;
+        if !entry.enabled {
             return None;
         }
-        if let Some(expires_at) = api_key.expires_at {
+        if let Some(expires_at) = entry.expires_at {
             if Utc::now() > expires_at {
                 return None;
             }
         }
-        api_key.last_used_at = Some(Utc::now());
-        api_key.usage_count += 1;
-        self.keys.insert(api_key.id.clone(), api_key.clone());
-        Some(api_key)
+        entry.last_used_at = Some(Utc::now());
+        entry.usage_count += 1;
+        Some(mask_stored(entry.clone()))
     }
 
     pub fn revoke(&self, id: &str) -> bool {
@@ -376,16 +421,28 @@ impl ApiKeyStore {
 
     pub fn rotate(&self, id: &str) -> Option<ApiKey> {
         let old_key = self.keys.get(id)?.clone();
-        let new_key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let new_key = generate_api_key();
+        let new_hash = hash_api_key(&new_key);
         self.keys_by_key.remove(&old_key.key);
-        let updated = ApiKey {
-            key: new_key.clone(),
+        let stored = ApiKey {
+            key: new_hash.clone(),
             ..old_key
         };
-        self.keys.insert(id.to_string(), updated.clone());
-        self.keys_by_key.insert(new_key, id.to_string());
-        Some(updated)
+        self.keys.insert(id.to_string(), stored.clone());
+        self.keys_by_key.insert(new_hash, id.to_string());
+        // Plaintext returned once, as in `create`.
+        Some(ApiKey {
+            key: new_key,
+            ..stored
+        })
     }
+}
+
+/// Replace the stored hash with its masked display form before an `ApiKey`
+/// leaves the store on any non-creation path.
+fn mask_stored(mut key: ApiKey) -> ApiKey {
+    key.key = masked_key_display(&key.key);
+    key
 }
 
 impl Default for ApiKeyStore {
@@ -415,7 +472,8 @@ impl PostgresStore {
 
     pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, sqlx::Error> {
         let id = Uuid::new_v4();
-        let key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let key = generate_api_key();
+        let key_hash = hash_api_key(&key);
         let scopes = serde_json::to_value(&request.scopes).unwrap_or_default();
         let models = request
             .models
@@ -435,12 +493,16 @@ impl PostgresStore {
                VALUES ($1, $2, $3, $4, true, NOW(), $5, $6, $7, $8, $9, $10, $11, $12)
                RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget"#,
         )
-        .bind(id).bind(&request.name).bind(&key).bind(&scopes)
+        .bind(id).bind(&request.name).bind(&key_hash).bind(&scopes)
         .bind(request.expires_at).bind(request.metadata)
         .bind(&request.org_id).bind(&request.team_id).bind(&request.user_id)
         .bind(models).bind(rate_limit).bind(budget)
         .fetch_one(&self.pool).await?;
-        Ok(record.into())
+        // The plaintext secret leaves the store exactly once, here.
+        Ok(ApiKey {
+            key,
+            ..record.into()
+        })
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
@@ -524,11 +586,19 @@ impl PostgresStore {
     }
 
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+        let key_hash = hash_api_key(key);
+        // Match the hash, or — for rows written before hashing was
+        // introduced — the legacy plaintext, upgrading such rows in place
+        // (same adoption pattern as `crypto.rs`). The plaintext branch is
+        // restricted to non-hashed rows so a leaked stored hash can never
+        // itself be presented as a bearer credential.
         let record = sqlx::query_as::<_, ApiKeyRow>(
-            r#"UPDATE api_keys SET last_used_at = NOW(), usage_count = usage_count + 1
-               WHERE key = $1 AND enabled = true AND (expires_at IS NULL OR expires_at > NOW())
+            r#"UPDATE api_keys
+               SET last_used_at = NOW(), usage_count = usage_count + 1, key = $2
+               WHERE (key = $2 OR (key = $1 AND key NOT LIKE 'sha256:%'))
+                 AND enabled = true AND (expires_at IS NULL OR expires_at > NOW())
                RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget"#,
-        ).bind(key).fetch_optional(&self.pool).await?;
+        ).bind(key).bind(&key_hash).fetch_optional(&self.pool).await?;
         Ok(record.map(|r| r.into()))
     }
 
@@ -543,11 +613,16 @@ impl PostgresStore {
 
     pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
         let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
-        let new_key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let new_key = generate_api_key();
+        let new_hash = hash_api_key(&new_key);
         let record = sqlx::query_as::<_, ApiKeyRow>(
             "UPDATE api_keys SET key = $1 WHERE id = $2 RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget",
-        ).bind(&new_key).bind(uuid).fetch_optional(&self.pool).await?;
-        Ok(record.map(|r| r.into()))
+        ).bind(&new_hash).bind(uuid).fetch_optional(&self.pool).await?;
+        // Plaintext returned once, as in `create`.
+        Ok(record.map(|r| ApiKey {
+            key: new_key.clone(),
+            ..r.into()
+        }))
     }
 }
 
@@ -578,7 +653,8 @@ impl From<ApiKeyRow> for ApiKey {
         ApiKey {
             id: r.id.to_string(),
             name: r.name,
-            key: r.key,
+            // Stored value is a hash; never expose it raw.
+            key: masked_key_display(&r.key),
             scopes: serde_json::from_value(r.scopes).unwrap_or_default(),
             enabled: r.enabled,
             created_at: r.created_at,
@@ -625,7 +701,8 @@ impl SqliteStore {
 
     pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, sqlx::Error> {
         let id = Uuid::new_v4().to_string();
-        let key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let key = generate_api_key();
+        let key_hash = hash_api_key(&key);
         let scopes = serde_json::to_value(&request.scopes).unwrap_or_default();
         let models = request
             .models
@@ -649,7 +726,7 @@ impl SqliteStore {
             r#"INSERT INTO api_keys (id, name, key, scopes, enabled, created_at, expires_at, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget)
                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
-        .bind(&id).bind(&request.name).bind(&key).bind(&scopes)
+        .bind(&id).bind(&request.name).bind(&key_hash).bind(&scopes)
         .bind(&now)
         .bind(request.expires_at.map(|dt| dt.to_rfc3339())).bind(request.metadata.map(|m| m.to_string()))
         .bind(&request.org_id).bind(&request.team_id).bind(&request.user_id)
@@ -657,7 +734,9 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
 
-        self.get(&id).await?.ok_or(sqlx::Error::RowNotFound)
+        // The plaintext secret leaves the store exactly once, here.
+        let stored = self.get(&id).await?.ok_or(sqlx::Error::RowNotFound)?;
+        Ok(ApiKey { key, ..stored })
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
@@ -741,11 +820,24 @@ impl SqliteStore {
         // expiry around format-dependent byte positions (e.g. `T` vs ` `).
         // Bind an RFC3339 `now` on both sides so the comparison is apples-to-apples.
         let now = Utc::now().to_rfc3339();
+        let key_hash = hash_api_key(key);
+        // Match the hash, or the legacy plaintext for pre-hashing rows
+        // (upgraded in place). The plaintext branch is restricted to
+        // non-hashed rows so a leaked stored hash can never itself be
+        // presented as a bearer credential.
         let row = sqlx::query_as::<_, SqliteApiKeyRow>(
-            r#"UPDATE api_keys SET last_used_at = ?, usage_count = usage_count + 1
-               WHERE key = ? AND enabled = 1 AND (expires_at IS NULL OR expires_at > ?)
+            r#"UPDATE api_keys SET last_used_at = ?, usage_count = usage_count + 1, key = ?
+               WHERE (key = ? OR (key = ? AND key NOT LIKE 'sha256:%'))
+                 AND enabled = 1 AND (expires_at IS NULL OR expires_at > ?)
                RETURNING id, name, key, scopes, enabled, created_at, last_used_at, expires_at, usage_count, metadata, org_id, team_id, user_id, models, rate_limit_override, token_budget"#,
-        ).bind(&now).bind(key).bind(&now).fetch_optional(&self.pool).await?;
+        )
+        .bind(&now)
+        .bind(&key_hash)
+        .bind(&key_hash)
+        .bind(key)
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|r| r.into()))
     }
 
@@ -758,13 +850,18 @@ impl SqliteStore {
     }
 
     pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, sqlx::Error> {
-        let new_key = format!("sk-{}", Uuid::new_v4().to_string().replace('-', ""));
+        let new_key = generate_api_key();
+        let new_hash = hash_api_key(&new_key);
         sqlx::query("UPDATE api_keys SET key = ? WHERE id = ?")
-            .bind(&new_key)
+            .bind(&new_hash)
             .bind(id)
             .execute(&self.pool)
             .await?;
-        self.get(id).await
+        // Plaintext returned once, as in `create`.
+        Ok(self.get(id).await?.map(|stored| ApiKey {
+            key: new_key.clone(),
+            ..stored
+        }))
     }
 }
 
@@ -795,7 +892,8 @@ impl From<SqliteApiKeyRow> for ApiKey {
         ApiKey {
             id: r.id,
             name: r.name,
-            key: r.key,
+            // Stored value is a hash; never expose it raw.
+            key: masked_key_display(&r.key),
             scopes: serde_json::from_str(&r.scopes).unwrap_or_default(),
             enabled: r.enabled != 0,
             created_at: crate::sqlite_time::parse_or_default(&r.created_at),

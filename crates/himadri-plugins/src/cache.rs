@@ -54,32 +54,33 @@ impl ResponseCachePlugin {
             .await;
     }
 
+    /// Hash a canonical JSON form of every request field that affects the
+    /// completion. Serializing one JSON document (instead of concatenating
+    /// raw field bytes) makes the key unambiguous — `model "gpt-4o"` +
+    /// prompt `"hello"` can no longer collide with `model "gpt-4"` +
+    /// prompt `"ohello"` — and includes message *roles*, so a system prompt
+    /// and a user message with identical text hash differently.
     pub fn cache_key(request: &himadri_core::ChatCompletionRequest) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(&request.model);
-
-        for message in &request.messages {
-            if let Some(content) = &message.content {
-                let text = match content {
-                    himadri_core::MessageContent::Text(text) => text.clone(),
-                    himadri_core::MessageContent::Parts(parts) => parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            himadri_core::ContentPart::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(""),
-                };
-                hasher.update(text.as_bytes());
-            }
-        }
-
-        if let Some(temp) = request.temperature {
-            hasher.update(temp.to_le_bytes());
-        }
-
-        hex::encode(hasher.finalize())
+        let canonical = serde_json::json!({
+            "model": request.model,
+            "messages": request.messages,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "max_tokens": request.max_tokens,
+            "stop": request.stop,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "tools": request.tools,
+            "tool_choice": request.tool_choice,
+            "user": request.user,
+            // Pass-through params (n, seed, response_format, logit_bias, …)
+            // land in the flattened `extra` map and materially change the
+            // completion; serde_json's default (BTree-backed) map keeps the
+            // serialization deterministic.
+            "extra": request.extra,
+        });
+        let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+        hex::encode(Sha256::digest(bytes))
     }
 }
 
@@ -180,6 +181,61 @@ mod tests {
 
         let hit = cache.get(&req).await.expect("warm cache should hit");
         assert_eq!(hit.choices[0].message.content.as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn key_is_unambiguous_across_field_boundaries() {
+        // Regression: raw byte concatenation let model+prompt pairs collide.
+        let a = request("gpt-4o", "hello");
+        let b = request("gpt-4", "ohello");
+        assert_ne!(
+            ResponseCachePlugin::cache_key(&a),
+            ResponseCachePlugin::cache_key(&b)
+        );
+    }
+
+    #[test]
+    fn key_includes_roles_and_sampling_params() {
+        // Same text as a system prompt vs a user message must differ.
+        let user = request("gpt-4", "be terse");
+        let mut system = request("gpt-4", "be terse");
+        system.messages[0].role = Role::System;
+        assert_ne!(
+            ResponseCachePlugin::cache_key(&user),
+            ResponseCachePlugin::cache_key(&system)
+        );
+
+        // max_tokens / top_p materially change the completion.
+        let mut capped = request("gpt-4", "be terse");
+        capped.max_tokens = Some(5);
+        assert_ne!(
+            ResponseCachePlugin::cache_key(&user),
+            ResponseCachePlugin::cache_key(&capped)
+        );
+    }
+
+    #[test]
+    fn key_includes_passthrough_extra_params() {
+        // Regression: `response_format`, `seed`, `n`, … ride in the
+        // flattened `extra` map and materially change the completion — two
+        // requests differing only there must not share a cache entry.
+        let plain = request("gpt-4", "give me json");
+        let mut json_mode = request("gpt-4", "give me json");
+        json_mode.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        assert_ne!(
+            ResponseCachePlugin::cache_key(&plain),
+            ResponseCachePlugin::cache_key(&json_mode)
+        );
+
+        let mut with_user = request("gpt-4", "give me json");
+        with_user.user = Some("tenant-a".to_string());
+        assert_ne!(
+            ResponseCachePlugin::cache_key(&plain),
+            ResponseCachePlugin::cache_key(&with_user)
+        );
     }
 
     #[tokio::test]

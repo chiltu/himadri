@@ -193,8 +193,10 @@ impl JwtClaims {
         // Parse rate limit override from claims
         let rate_limit_override = self.rate_limit_rpm.map(|rpm| {
             himadri_core::RateLimitOverride {
-                requests_per_second: Some(rpm / 60), // Convert RPM to RPS
-                burst_size: Some(rpm),               // Burst = 1 minute worth
+                // Round up so an RPM under 60 doesn't truncate to 0 rps
+                // (a zero-rate bucket never refills — burst-only).
+                requests_per_second: Some(rpm.div_ceil(60)),
+                burst_size: Some(rpm), // Burst = 1 minute worth
             }
         });
 

@@ -31,12 +31,19 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    /// Whether failing over to another target may succeed.
+    ///
+    /// Transport failures (`Network`) are retryable: a dead or unreachable
+    /// provider must both trip its circuit breaker and let the request fall
+    /// back to the next configured target — otherwise a hard-down primary
+    /// takes its models offline despite healthy fallbacks.
     pub fn retryable(&self) -> bool {
         matches!(
             self,
             ProviderError::RateLimited { .. }
+                | ProviderError::Network(_)
                 | ProviderError::Api {
-                    status: 502 | 503 | 529,
+                    status: 500 | 502 | 503 | 504 | 529,
                     ..
                 }
         )
@@ -81,6 +88,12 @@ impl ProviderError {
         extract_message: impl Fn(&serde_json::Value) -> Option<String>,
     ) -> Self {
         let status = response.status().as_u16();
+        // Honor the upstream Retry-After (seconds form) instead of guessing.
+        let retry_after_secs = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
         let body = response.text().await.unwrap_or_default();
 
         let message = serde_json::from_str::<serde_json::Value>(&body)
@@ -93,7 +106,7 @@ impl ProviderError {
         }
         match status {
             429 => ProviderError::RateLimited {
-                retry_after_secs: 60,
+                retry_after_secs: retry_after_secs.unwrap_or(60),
             },
             404 => ProviderError::ModelNotFound(message),
             _ => ProviderError::Api { status, message },
@@ -104,5 +117,49 @@ impl ProviderError {
 impl From<reqwest::Error> for ProviderError {
     fn from(e: reqwest::Error) -> Self {
         ProviderError::Network(e.to_string())
+    }
+}
+
+/// Structured mapping into the gateway's error surface so upstream failures
+/// keep their semantics instead of flattening to 500: an upstream 429 stays
+/// a 429 (clients back off), an upstream 4xx stays a client error, and an
+/// upstream auth failure — which means the *gateway's* provider key is bad,
+/// not the caller's — surfaces as 503, not a misleading 401.
+impl From<ProviderError> for himadri_core::GatewayError {
+    fn from(e: ProviderError) -> Self {
+        use himadri_core::GatewayError as G;
+        match e {
+            ProviderError::Auth(_) => {
+                G::ServiceUnavailable("upstream provider authentication failed".to_string())
+            }
+            ProviderError::RateLimited { retry_after_secs } => G::RateLimited { retry_after_secs },
+            ProviderError::ModelNotFound(model) => G::NotFound(format!("model: {}", model)),
+            ProviderError::ContextLengthExceeded { max, actual } => G::BadRequest(format!(
+                "context length exceeded: max {}, got {}",
+                max, actual
+            )),
+            ProviderError::Api {
+                status,
+                ref message,
+            } => {
+                if status == 401 || status == 403 {
+                    G::ServiceUnavailable("upstream provider authentication failed".to_string())
+                } else if status == 429 {
+                    G::RateLimited {
+                        retry_after_secs: 60,
+                    }
+                } else if (400..500).contains(&status) {
+                    G::BadRequest(message.clone())
+                } else {
+                    G::ServiceUnavailable(message.clone())
+                }
+            }
+            ProviderError::Network(msg) => G::ServiceUnavailable(msg),
+            ProviderError::Parse(msg) => G::Provider(format!("parse error: {}", msg)),
+            ProviderError::Internal(msg) => G::Internal(msg),
+            ProviderError::Unsupported(msg) => {
+                G::BadRequest(format!("operation not supported: {}", msg))
+            }
+        }
     }
 }

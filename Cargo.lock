@@ -1121,11 +1121,13 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
+ "hex",
  "himadri-core",
  "parking_lot",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -1160,6 +1162,8 @@ name = "himadri-circuitbreaker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "once_cell",
+ "parking_lot",
  "redis",
  "tokio",
  "tracing",
@@ -1245,6 +1249,7 @@ dependencies = [
  "dashmap",
  "futures",
  "himadri-core",
+ "http",
  "once_cell",
  "reqwest",
  "serde",
@@ -1261,6 +1266,7 @@ name = "himadri-ratelimit"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "once_cell",
  "parking_lot",
  "redis",
  "tokio",

@@ -37,10 +37,20 @@ impl PostgresConfigStore {
     }
 }
 
-/// Postgres-backed request log store
+/// Postgres-backed request log store.
+///
+/// `write` is called on the request hot path (including from the streaming
+/// recorder's `Drop`), so inserts go through a bounded channel to a
+/// background writer task instead of blocking the calling worker on a DB
+/// round-trip. When the queue is full, entries are dropped (and counted)
+/// rather than applying backpressure to requests.
 pub struct PostgresRequestLogStore {
     pool: PgPool,
+    sender: tokio::sync::mpsc::Sender<RequestLogEntry>,
+    dropped: std::sync::atomic::AtomicU64,
 }
+
+const REQUEST_LOG_QUEUE_CAPACITY: usize = 8_192;
 
 impl PostgresRequestLogStore {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
@@ -49,22 +59,13 @@ impl PostgresRequestLogStore {
             .run(&pool)
             .await
             .map_err(|e| sqlx::Error::Migrate(Box::new(e)))?;
-        Ok(Self { pool })
-    }
 
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-}
-
-impl RequestLogStore for PostgresRequestLogStore {
-    fn write(&self, entry: RequestLogEntry) -> Result<(), String> {
-        // Note: In production, this should use tokio::spawn for async execution
-        // For now, we block on the async call
-        let pool = self.pool.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                sqlx::query(
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<RequestLogEntry>(REQUEST_LOG_QUEUE_CAPACITY);
+        let writer_pool = pool.clone();
+        tokio::spawn(async move {
+            while let Some(entry) = receiver.recv().await {
+                let result = sqlx::query(
                     r#"
                     INSERT INTO request_logs (trace_id, stage, model, provider, prompt_tokens, completion_tokens, total_tokens, error_message, created_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -79,12 +80,40 @@ impl RequestLogStore for PostgresRequestLogStore {
                 .bind(entry.total_tokens as i32)
                 .bind(&entry.error_message)
                 .bind(entry.created_at)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-                Ok(())
-            })
+                .execute(&writer_pool)
+                .await;
+                if let Err(e) = result {
+                    tracing::warn!("Failed to persist request log entry: {}", e);
+                }
+            }
+        });
+
+        Ok(Self {
+            pool,
+            sender,
+            dropped: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+impl RequestLogStore for PostgresRequestLogStore {
+    fn write(&self, entry: RequestLogEntry) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.sender.try_send(entry).is_err() {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    "Request-log queue full; {} entr(ies) dropped so far",
+                    dropped
+                );
+            }
+            return Err("request log queue full".to_string());
+        }
+        Ok(())
     }
 
     fn list(&self, query: RequestLogQuery) -> Result<RequestLogListResult, String> {

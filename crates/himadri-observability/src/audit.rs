@@ -1,10 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::redact::Redactor;
+
+/// Bound on queued audit events. Events carry full prompt/response copies
+/// when content capture is enabled, so an unbounded queue behind a slow
+/// sink is a memory-exhaustion hazard; past this depth events are dropped
+/// (and counted) rather than buffered without limit.
+const AUDIT_CHANNEL_CAPACITY: usize = 8_192;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEvent {
@@ -48,13 +55,25 @@ pub enum AuditStatus {
 }
 
 pub struct AuditLog {
-    sender: mpsc::UnboundedSender<AuditEvent>,
+    sender: mpsc::Sender<AuditEvent>,
     redactor: Option<Redactor>,
+    /// When false (the default), prompt messages and response text are
+    /// stripped before an event leaves the process — request metadata is
+    /// still recorded, but user content never reaches logs or telemetry
+    /// (CWE-532). Enable explicitly (e.g. `AUDIT_CAPTURE_CONTENT=true`)
+    /// for deployments that require full-content audit trails.
+    capture_content: bool,
+    dropped: AtomicU64,
 }
 
 impl AuditLog {
+    /// Content capture defaults to **off**; see [`AuditLog::with_options`].
     pub fn new(log_dir: Option<PathBuf>, redact_pii: bool) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        Self::with_options(log_dir, redact_pii, false)
+    }
+
+    pub fn with_options(log_dir: Option<PathBuf>, redact_pii: bool, capture_content: bool) -> Self {
+        let (sender, receiver) = mpsc::channel(AUDIT_CHANNEL_CAPACITY);
 
         let redactor = if redact_pii {
             Some(Redactor::new())
@@ -68,11 +87,24 @@ impl AuditLog {
             tokio::spawn(Self::tracing_loop(receiver));
         }
 
-        Self { sender, redactor }
+        Self {
+            sender,
+            redactor,
+            capture_content,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Events dropped because the audit queue was full.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn log(&self, mut event: AuditEvent) {
-        if let Some(ref redactor) = self.redactor {
+        if !self.capture_content {
+            event.messages.clear();
+            event.response = None;
+        } else if let Some(ref redactor) = self.redactor {
             for msg in &mut event.messages {
                 msg.content = redactor.redact(&msg.content);
             }
@@ -80,7 +112,14 @@ impl AuditLog {
                 *response = redactor.redact(response);
             }
         }
-        let _ = self.sender.send(event);
+        // Never block the request path on the audit sink: drop (and count)
+        // when the bounded queue is full.
+        if self.sender.try_send(event).is_err() {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                warn!("Audit queue full; {} event(s) dropped so far", dropped);
+            }
+        }
     }
 
     /// Record an authentication/authorization failure (401/403). Only minimal
@@ -124,13 +163,8 @@ impl AuditLog {
         });
     }
 
-    async fn write_loop(dir: PathBuf, mut receiver: mpsc::UnboundedReceiver<AuditEvent>) {
+    async fn write_loop(dir: PathBuf, mut receiver: mpsc::Receiver<AuditEvent>) {
         while let Some(event) = receiver.recv().await {
-            let _filename = format!(
-                "{}-{}.jsonl",
-                event.timestamp.format("%Y-%m-%d"),
-                dir.display()
-            );
             let line = match serde_json::to_string(&event) {
                 Ok(l) => l,
                 Err(_) => continue,
@@ -163,7 +197,7 @@ impl AuditLog {
         }
     }
 
-    async fn tracing_loop(mut receiver: mpsc::UnboundedReceiver<AuditEvent>) {
+    async fn tracing_loop(mut receiver: mpsc::Receiver<AuditEvent>) {
         while let Some(event) = receiver.recv().await {
             match serde_json::to_string(&event) {
                 Ok(json) => {
@@ -174,5 +208,62 @@ impl AuditLog {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event_with_content() -> AuditEvent {
+        AuditEvent {
+            request_id: "r1".into(),
+            timestamp: Utc::now(),
+            org_id: None,
+            team_id: None,
+            user_id: None,
+            key_id: None,
+            model: "gpt-4o".into(),
+            provider: Some("openai".into()),
+            messages: vec![AuditMessage {
+                role: "user".into(),
+                content: "top secret prompt".into(),
+            }],
+            response: Some("secret answer".into()),
+            latency_ms: 5,
+            tokens_prompt: Some(1),
+            tokens_completion: Some(2),
+            tokens_total: Some(3),
+            status: AuditStatus::Success,
+            error: None,
+            guardrail_actions: Vec::new(),
+            stream: false,
+        }
+    }
+
+    /// The default configuration must never let prompt/response content
+    /// leave the process (finding: prompts logged to telemetry unredacted).
+    #[tokio::test]
+    async fn content_is_stripped_by_default() {
+        let log = AuditLog::new(None, true);
+        let mut event = event_with_content();
+        // Emulate what `log` does before enqueueing.
+        if !log.capture_content {
+            event.messages.clear();
+            event.response = None;
+        }
+        assert!(event.messages.is_empty());
+        assert!(event.response.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_content_keeps_and_redacts() {
+        let log = AuditLog::with_options(None, true, true);
+        assert!(log.capture_content);
+        let redactor = log.redactor.as_ref().unwrap();
+        let redacted =
+            redactor.redact("email me at user@example.com with sk-abcdef1234567890abcdef");
+        assert!(!redacted.contains("user@example.com"));
+        assert!(!redacted.contains("sk-abcdef1234567890abcdef"));
     }
 }

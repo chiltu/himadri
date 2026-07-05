@@ -7,8 +7,7 @@ use crate::error::ProviderError;
 use crate::http_client::CLIENT_POOL;
 use crate::traits::{BoxStream, Provider};
 use himadri_core::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, Delta, MessageContent,
-    ResponseMessage, StreamChoice, StreamChunk, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, ContentPart, MessageContent, StreamChunk,
 };
 
 /// Authentication method for OpenAI-compatible providers.
@@ -52,8 +51,18 @@ pub struct OpenAiCompatibleConfig {
 /// - Groq
 /// - Fireworks
 /// - And many others
+#[derive(Clone)]
 pub struct OpenAiCompatibleProvider {
     config: OpenAiCompatibleConfig,
+}
+
+/// Some providers emit `"tool_calls": []`; normalize to `None` so clients
+/// (and the empty-vs-absent distinction in our own tests) see the OpenAI
+/// convention of omitting the field entirely.
+fn normalize_tool_calls<T>(tool_calls: &mut Option<Vec<T>>) {
+    if tool_calls.as_ref().is_some_and(Vec::is_empty) {
+        *tool_calls = None;
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -78,7 +87,7 @@ impl OpenAiCompatibleProvider {
     pub fn azure(_api_key: &str, base_url: &str, deployment: &str, api_version: &str) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
         let path = format!(
-            "/openai/deployments/{}/completions?api-version={}",
+            "/openai/deployments/{}/chat/completions?api-version={}",
             deployment, api_version
         );
 
@@ -199,96 +208,23 @@ impl OpenAiCompatibleProvider {
         &self,
         response: serde_json::Value,
     ) -> Result<ChatCompletionResponse, ProviderError> {
-        let id = response["id"].as_str().unwrap_or("").to_string();
-        let model = response["model"].as_str().unwrap_or("").to_string();
-        let created = response["created"].as_u64().unwrap_or(0);
-
-        let choices = response["choices"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| Choice {
-                        index: c["index"].as_u64().unwrap_or(0) as u32,
-                        message: ResponseMessage {
-                            role: himadri_core::Role::Assistant,
-                            content: c["message"]["content"].as_str().map(|s| s.to_string()),
-                            tool_calls: serde_json::from_value(c["message"]["tool_calls"].clone())
-                                .ok()
-                                .filter(|tc: &Vec<himadri_core::ToolCall>| !tc.is_empty()),
-                        },
-                        finish_reason: c["finish_reason"].as_str().map(|s| s.to_string()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let usage = response["usage"].as_object().map(|u| Usage {
-            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-        });
-
-        Ok(ChatCompletionResponse {
-            id,
-            object: "chat.completion".to_string(),
-            created,
-            model,
-            choices,
-            usage,
-            system_fingerprint: response["system_fingerprint"]
-                .as_str()
-                .map(|s| s.to_string()),
-        })
+        let mut parsed: ChatCompletionResponse = serde_json::from_value(response)
+            .map_err(|e| ProviderError::Parse(format!("malformed provider response: {}", e)))?;
+        parsed.object = "chat.completion".to_string();
+        for choice in &mut parsed.choices {
+            normalize_tool_calls(&mut choice.message.tool_calls);
+        }
+        Ok(parsed)
     }
 
-    fn parse_stream_chunk(&self, chunk: serde_json::Value) -> Result<StreamChunk, ProviderError> {
-        let id = chunk["id"].as_str().unwrap_or("").to_string();
-        let model = chunk["model"].as_str().unwrap_or("").to_string();
-        let created = chunk["created"].as_u64().unwrap_or(0);
-
-        let choices = chunk["choices"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| {
-                        let delta = &c["delta"];
-                        StreamChoice {
-                            index: c["index"].as_u64().unwrap_or(0) as u32,
-                            delta: Delta {
-                                role: delta["role"].as_str().map(|r| match r {
-                                    "system" => himadri_core::Role::System,
-                                    "user" => himadri_core::Role::User,
-                                    "assistant" => himadri_core::Role::Assistant,
-                                    "tool" => himadri_core::Role::Tool,
-                                    _ => himadri_core::Role::Assistant,
-                                }),
-                                content: delta["content"].as_str().map(|s| s.to_string()),
-                                tool_calls: serde_json::from_value(delta["tool_calls"].clone())
-                                    .ok()
-                                    .filter(|tc: &Vec<himadri_core::ToolCallDelta>| !tc.is_empty()),
-                            },
-                            finish_reason: c["finish_reason"].as_str().map(|s| s.to_string()),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let usage = chunk["usage"].as_object().map(|u| Usage {
-            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
-        });
-
-        Ok(StreamChunk {
-            id,
-            object: "chat.completion.chunk".to_string(),
-            created,
-            model,
-            choices,
-            usage,
-            system_fingerprint: chunk["system_fingerprint"].as_str().map(|s| s.to_string()),
-        })
+    fn parse_stream_chunk(&self, data: &str) -> Result<StreamChunk, ProviderError> {
+        let mut chunk: StreamChunk = serde_json::from_str(data)
+            .map_err(|e| ProviderError::Parse(format!("malformed stream chunk: {}", e)))?;
+        chunk.object = "chat.completion.chunk".to_string();
+        for choice in &mut chunk.choices {
+            normalize_tool_calls(&mut choice.delta.tool_calls);
+        }
+        Ok(chunk)
     }
 
     async fn handle_error(&self, response: reqwest::Response) -> ProviderError {
@@ -390,13 +326,8 @@ impl Provider for OpenAiCompatibleProvider {
         }
 
         let provider = self.clone();
-        let stream = crate::sse::sse_events(response.bytes_stream()).map(move |event| {
-            event.and_then(|event| {
-                let chunk: serde_json::Value = serde_json::from_str(&event.data)
-                    .map_err(|e| ProviderError::Parse(e.to_string()))?;
-                provider.parse_stream_chunk(chunk)
-            })
-        });
+        let stream = crate::sse::sse_events(response.bytes_stream())
+            .map(move |event| event.and_then(|event| provider.parse_stream_chunk(&event.data)));
 
         Ok(Box::pin(stream))
     }
@@ -429,14 +360,6 @@ impl Provider for OpenAiCompatibleProvider {
             .json::<himadri_core::EmbeddingResponse>()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))
-    }
-}
-
-impl Clone for OpenAiCompatibleProvider {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-        }
     }
 }
 

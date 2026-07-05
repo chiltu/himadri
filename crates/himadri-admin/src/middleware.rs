@@ -2,7 +2,8 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use std::sync::Arc;
 
@@ -46,7 +47,7 @@ impl AuthMiddleware {
         if let Some(master_key) = &self.master_key {
             if constant_time_eq(api_key.as_bytes(), master_key.as_bytes()) {
                 return Ok(Some(AuthContext {
-                    api_key: api_key.to_string(),
+                    api_key: "master".to_string(),
                     key_id: None,
                     scope: AuthScope::Admin,
                     org_id: None,
@@ -66,7 +67,10 @@ impl AuthMiddleware {
                     burst_size: r.burst_size,
                 });
                 Ok(Some(AuthContext {
-                    api_key: api_key.to_string(),
+                    // Non-secret principal descriptor; the raw bearer secret
+                    // must never ride along in AuthContext (it derives Debug
+                    // and Serialize, and flows into plugins/stores).
+                    api_key: format!("key:{}", key.id),
                     key_id: Some(key.id),
                     scope: if key.scopes.contains(&"admin".to_string()) {
                         AuthScope::Admin
@@ -96,7 +100,7 @@ impl AuthMiddleware {
         headers: HeaderMap,
         mut request: axum::extract::Request,
         next: Next,
-    ) -> Result<Response, StatusCode> {
+    ) -> Result<Response, Response> {
         // If no master_key configured, bypass auth (testing mode)
         if auth.is_bypass() {
             let ctx = AuthContext::anonymous();
@@ -113,7 +117,10 @@ impl AuthMiddleware {
             Some(key) => key.to_string(),
             None => {
                 request.extensions_mut().insert(None::<AuthContext>);
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err(auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or missing bearer token",
+                ));
             }
         };
 
@@ -124,12 +131,30 @@ impl AuthMiddleware {
             }
             Ok(None) => {
                 request.extensions_mut().insert(None::<AuthContext>);
-                Err(StatusCode::UNAUTHORIZED)
+                Err(auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or missing bearer token",
+                ))
             }
             Err(()) => {
                 request.extensions_mut().insert(None::<AuthContext>);
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
+                Err(auth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error",
+                ))
             }
         }
     }
+}
+
+/// Auth failures use the same JSON error envelope as every other endpoint
+/// instead of an empty body.
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": "gateway_error" }
+        })),
+    )
+        .into_response()
 }

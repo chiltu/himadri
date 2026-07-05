@@ -14,10 +14,18 @@ use himadri_core::{
 const DEFAULT_REGION: &str = "us-east-1";
 const BEDROCK_RUNTIME_ENDPOINT: &str = "bedrock-runtime";
 
+#[derive(Clone)]
 pub struct BedrockProvider {
     region: String,
+    /// AWS credentials are stored but not yet used: requests are currently
+    /// sent with a Bearer token (see `complete`), which real AWS Bedrock
+    /// does not accept — SigV4 signing is unimplemented. Kept so the
+    /// constructor signature is stable for when signing lands.
+    #[allow(dead_code)]
     access_key_id: String,
+    #[allow(dead_code)]
     secret_access_key: String,
+    #[allow(dead_code)]
     session_token: Option<String>,
 }
 
@@ -350,16 +358,5 @@ impl Provider for BedrockProvider {
         });
 
         Ok(Box::pin(stream))
-    }
-}
-
-impl Clone for BedrockProvider {
-    fn clone(&self) -> Self {
-        Self {
-            region: self.region.clone(),
-            access_key_id: self.access_key_id.clone(),
-            secret_access_key: self.secret_access_key.clone(),
-            session_token: self.session_token.clone(),
-        }
     }
 }

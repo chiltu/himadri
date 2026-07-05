@@ -68,7 +68,7 @@ pub struct RedisLatencyStore {
 impl RedisLatencyStore {
     pub async fn new(redis_url: &str, window_secs: u64) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
-        let mut conn = client.get_async_connection().await?;
+        let mut conn = client.get_multiplexed_async_connection().await?;
         redis::cmd("PING").query_async::<_, ()>(&mut conn).await?;
         Ok(Self {
             client,
@@ -82,7 +82,7 @@ impl RedisLatencyStore {
 #[async_trait]
 impl LatencyStore for RedisLatencyStore {
     async fn record(&self, provider: &str, latency_ms: u64) {
-        let mut conn = match self.client.get_async_connection().await {
+        let mut conn = match self.client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -123,7 +123,7 @@ impl LatencyStore for RedisLatencyStore {
     }
 
     async fn get_avg_latency(&self, provider: &str) -> u64 {
-        let mut conn = match self.client.get_async_connection().await {
+        let mut conn = match self.client.get_multiplexed_async_connection().await {
             Ok(c) => c,
             Err(_) => return u64::MAX,
         };

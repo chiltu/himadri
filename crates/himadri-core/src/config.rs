@@ -449,7 +449,11 @@ pub struct AdminConfig {
     #[serde(default = "default_admin_enabled")]
     pub enabled: bool,
 
-    #[serde(default)]
+    /// Master admin key. Never serialized: `Config` is returned verbatim by
+    /// `GET /admin/config` and `/admin/config/history`, and the master key
+    /// must not be readable by admin-scoped principals (e.g. JWT-role
+    /// admins) or flow into config exports (CWE-522).
+    #[serde(default, skip_serializing)]
     pub master_key: Option<String>,
 }
 

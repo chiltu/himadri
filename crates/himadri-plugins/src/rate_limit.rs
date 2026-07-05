@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,28 +9,39 @@ use himadri_plugin::traits::{Plugin, PluginError, PluginType, Stage};
 
 // ─── Sliding Window Counter ──────────────────────────────────────────
 
-/// A single sliding window counter that tracks requests within a time window.
-/// Uses atomic operations for lock-free reads and minimal contention on writes.
-struct SlidingWindowCounter {
-    /// Current window count
-    count: AtomicU64,
-    /// Window start time in microseconds since epoch
-    window_start: AtomicI64,
-    /// Window duration in microseconds
+/// A fixed-window counter that tracks requests within a time window.
+/// (Counts reset at window boundaries rather than sliding continuously.)
+///
+/// Consumption is a bound-checked CAS so concurrent callers can never
+/// exceed `max_requests` within one window view, and only the thread that
+/// wins the window-rollover CAS resets the count — an unconditional reset
+/// used to let racing callers zero each other's counts.
+struct FixedWindowCounter {
+    /// Packed `(window_index << 32) | count`. Keeping the window id and the
+    /// count in one atomic makes rollover + consume a single CAS domain: a
+    /// rollover can never wipe consumption another thread just recorded in
+    /// the new window (the flaw in the separate-atomics design).
+    packed: AtomicU64,
+    /// Window duration in microseconds (>= 1).
     window_us: u64,
-    /// Maximum requests allowed in the window
+    /// Maximum requests allowed in the window (clamped to u32::MAX).
     max_requests: u64,
 }
 
-impl SlidingWindowCounter {
+const COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+impl FixedWindowCounter {
     fn new(max_requests: u64, window: Duration) -> Self {
-        let now = now_micros();
+        let window_us = (window.as_micros() as u64).max(1);
         Self {
-            count: AtomicU64::new(0),
-            window_start: AtomicI64::new(now),
-            window_us: window.as_micros() as u64,
-            max_requests,
+            packed: AtomicU64::new(0),
+            window_us,
+            max_requests: max_requests.min(COUNT_MASK),
         }
+    }
+
+    fn window_index(&self, now_us: u64) -> u64 {
+        (now_us / self.window_us) & COUNT_MASK
     }
 
     /// Try to consume one request. Returns true if allowed.
@@ -40,55 +51,44 @@ impl SlidingWindowCounter {
 
     /// Try to consume N requests. Returns true if allowed.
     fn allow_n(&self, n: u64) -> bool {
-        let now = now_micros();
-        let window_start = self.window_start.load(Ordering::Acquire);
-
-        // Check if we need to start a new window
-        if (now - window_start) as u64 >= self.window_us {
-            // Try to reset the window
-            let _ = self.window_start.compare_exchange_weak(
-                window_start,
-                now,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            self.count.store(0, Ordering::Relaxed);
-        }
-
-        // Try to consume tokens
-        let current = self.count.load(Ordering::Acquire);
-        if current + n <= self.max_requests {
-            self.count.fetch_add(n, Ordering::AcqRel);
-            true
-        } else {
-            false
-        }
+        let w = self.window_index(now_micros() as u64);
+        self.packed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
+                let count = if packed >> 32 == w {
+                    packed & COUNT_MASK
+                } else {
+                    0 // fresh window
+                };
+                let next = count.saturating_add(n);
+                (next <= self.max_requests).then_some((w << 32) | next)
+            })
+            .is_ok()
     }
 
     /// Get current count in the window.
     fn count(&self) -> u64 {
-        let now = now_micros();
-        let window_start = self.window_start.load(Ordering::Acquire);
-
-        if (now - window_start) as u64 >= self.window_us {
-            0
+        let w = self.window_index(now_micros() as u64);
+        let packed = self.packed.load(Ordering::Acquire);
+        if packed >> 32 == w {
+            packed & COUNT_MASK
         } else {
-            self.count.load(Ordering::Relaxed)
+            0
         }
     }
 
     /// Reset the counter.
     fn reset(&self) {
-        self.count.store(0, Ordering::Relaxed);
-        self.window_start.store(now_micros(), Ordering::Relaxed);
+        let w = self.window_index(now_micros() as u64);
+        self.packed.store(w << 32, Ordering::Release);
     }
 }
 
+/// Monotonic microseconds: window rollover must not jump when the wall
+/// clock steps (NTP).
 fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64
+    static EPOCH: once_cell::sync::Lazy<std::time::Instant> =
+        once_cell::sync::Lazy::new(std::time::Instant::now);
+    EPOCH.elapsed().as_micros() as i64
 }
 
 // ─── Sharded Rate Limiter Store ──────────────────────────────────────
@@ -96,7 +96,7 @@ fn now_micros() -> i64 {
 /// Per-key rate limiter store with LRU eviction.
 /// Uses sharding to reduce lock contention across keys.
 struct RateLimiterStore {
-    shards: Vec<parking_lot::RwLock<HashMap<String, Arc<SlidingWindowCounter>>>>,
+    shards: Vec<parking_lot::RwLock<HashMap<String, Arc<FixedWindowCounter>>>>,
     num_shards: usize,
     rate: u64,
     window: Duration,
@@ -147,7 +147,7 @@ impl RateLimiterStore {
             }
         }
 
-        let counter = Arc::new(SlidingWindowCounter::new(self.rate, self.window));
+        let counter = Arc::new(FixedWindowCounter::new(self.rate, self.window));
         let allowed = counter.allow();
         map.insert(key.to_string(), counter);
         allowed
@@ -221,7 +221,7 @@ const DEFAULT_MAX_KEYS: usize = 100_000;
 
 pub struct RateLimitPlugin {
     /// Global rate limiter (requests per window)
-    global_limiter: Arc<SlidingWindowCounter>,
+    global_limiter: Arc<FixedWindowCounter>,
     /// Per-API-key rate limiter store
     key_store: Option<Arc<RateLimiterStore>>,
     /// Per-user rate limiter store
@@ -237,7 +237,7 @@ impl RateLimitPlugin {
         let max_keys = config.max_keys.unwrap_or(DEFAULT_MAX_KEYS);
 
         // Create global limiter
-        let global_limiter = Arc::new(SlidingWindowCounter::new(rps, window));
+        let global_limiter = Arc::new(FixedWindowCounter::new(rps, window));
 
         // Create per-key store if configured
         let key_store = config.key_rpm.map(|rpm| {
@@ -308,6 +308,9 @@ impl Plugin for RateLimitPlugin {
             return Err(PluginError::Rejected {
                 name: self.name().to_string(),
                 reason: "rate limit exceeded".to_string(),
+                kind: himadri_plugin::RejectKind::RateLimited {
+                    retry_after_secs: 60,
+                },
             });
         }
 
@@ -318,6 +321,9 @@ impl Plugin for RateLimitPlugin {
                     return Err(PluginError::Rejected {
                         name: self.name().to_string(),
                         reason: "per-key rate limit exceeded".to_string(),
+                        kind: himadri_plugin::RejectKind::RateLimited {
+                            retry_after_secs: 60,
+                        },
                     });
                 }
             }
@@ -330,6 +336,9 @@ impl Plugin for RateLimitPlugin {
                     return Err(PluginError::Rejected {
                         name: self.name().to_string(),
                         reason: "per-user rate limit exceeded".to_string(),
+                        kind: himadri_plugin::RejectKind::RateLimited {
+                            retry_after_secs: 60,
+                        },
                     });
                 }
             }
@@ -343,6 +352,9 @@ impl Plugin for RateLimitPlugin {
                     return Err(PluginError::Rejected {
                         name: self.name().to_string(),
                         reason: "per-IP rate limit exceeded".to_string(),
+                        kind: himadri_plugin::RejectKind::RateLimited {
+                            retry_after_secs: 60,
+                        },
                     });
                 }
             }
@@ -353,6 +365,10 @@ impl Plugin for RateLimitPlugin {
 }
 
 impl RateLimitPlugin {
+    /// Resolve the identity per-key limits are tracked under. Prefers the
+    /// stable `key_id`/`user_id` from the auth context; never the raw
+    /// bearer secret (`AuthContext::api_key`), which must not be spread
+    /// into long-lived limiter stores (CWE-522).
     fn get_api_key(ctx: &PluginContext) -> Option<String> {
         if let Some(key) = ctx.get_metadata("api_key") {
             if let Some(s) = key.as_str() {
@@ -361,7 +377,9 @@ impl RateLimitPlugin {
                 }
             }
         }
-        ctx.auth.as_ref().map(|a| a.api_key.clone())
+        ctx.auth
+            .as_ref()
+            .and_then(|a| a.key_id.clone().or_else(|| a.user_id.clone()))
     }
 
     fn get_user_id(ctx: &PluginContext) -> Option<String> {
@@ -414,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_allows_within_limit() {
-        let counter = SlidingWindowCounter::new(10, Duration::from_secs(1));
+        let counter = FixedWindowCounter::new(10, Duration::from_secs(1));
         for _ in 0..10 {
             assert!(counter.allow());
         }
@@ -423,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_sliding_window_resets_after_window() {
-        let counter = SlidingWindowCounter::new(5, Duration::from_millis(100));
+        let counter = FixedWindowCounter::new(5, Duration::from_millis(100));
         for _ in 0..5 {
             assert!(counter.allow());
         }

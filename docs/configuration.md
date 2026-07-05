@@ -42,7 +42,7 @@ The server listens on `0.0.0.0:$PORT` (default `8080`) and exposes:
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `GET /health` | none | Liveness |
-| `GET /metrics` | none | Prometheus metrics |
+| `GET /metrics` | bearer (`METRICS_TOKEN` or `MASTER_KEY`, when configured) | Prometheus metrics |
 | `GET /v1/models` | none | Model list (DB-backed, else provider defaults) |
 | `POST /v1/chat/completions` | bearer | OpenAI-compatible chat |
 | `POST /v1/completions` | bearer | Legacy completions |
@@ -113,7 +113,7 @@ JSON file.
 | Variable | Default | Description |
 |---|---|---|
 | `JWT_ISSUER` | _(unset)_ | OIDC issuer URL. **Setting this enables JWT auth.** |
-| `JWT_AUDIENCE` | `""` | Expected `aud` claim. |
+| `JWT_AUDIENCE` | _(required with `JWT_ISSUER`)_ | Expected `aud` claim. The gateway refuses to start if `JWT_ISSUER` is set and this is empty (an empty audience would reject every token). |
 | `JWT_JWKS_URI` | _(discovered)_ | Explicit JWKS endpoint; otherwise discovered from the issuer. |
 | `JWT_JWKS_REFRESH_SECS` | `3600` | Background JWKS refresh interval (key rotation). |
 | `JWT_REQUIRED_ROLES` | _(unset)_ | Comma-separated. If set, an authenticated principal must hold **at least one** of these roles or gets `403`. Applies to both JWT and API-key principals. |
@@ -129,6 +129,16 @@ See [Zitadel configuration](./zitadel.md) for the full OIDC setup.
 | `CACHE_TTL_SECS` | _(unset)_ | Enables response caching with this TTL. |
 | `CACHE_MAX_ENTRIES` | `10000` | Max cached responses (only with `CACHE_TTL_SECS`). |
 
+### Guardrails & observability
+
+| Variable | Default | Description |
+|---|---|---|
+| `WORD_FILTER_BLOCKLIST` | _(unset)_ | Comma-separated words; requests containing any of them are rejected with `400`. Unset disables the word filter. |
+| `MAX_TOKENS_LIMIT` | _(unset)_ | Reject requests whose `max_tokens` exceeds this cap. Unset disables the cap. |
+| `AUDIT_LOG_DIR` | _(unset)_ | Directory for JSONL audit logs (one file per day). Unset → audit events go to tracing output. |
+| `AUDIT_CAPTURE_CONTENT` | `false` | Include prompt/response content in audit events (always redacted). Off by default so user content never reaches logs/telemetry. |
+| `METRICS_TOKEN` | _(unset)_ | Dedicated bearer token for `GET /metrics`. Falls back to `MASTER_KEY`; if neither is set (dev mode), metrics are unauthenticated. |
+
 ### Budget
 
 | Variable | Default | Description |
@@ -138,6 +148,12 @@ See [Zitadel configuration](./zitadel.md) for the full OIDC setup.
 | `BUDGET_OUTPUT_PER_M_TOKENS` | _(unset)_ | Price per 1M output (completion) tokens. |
 
 See [Budget limits](#budget-limits) for how global and per-principal caps interact.
+
+> **Bedrock note:** the Bedrock provider currently authenticates with a
+> `Bearer` token, which suits Bearer-compatible Bedrock frontends (e.g. AWS's
+> `bedrock-access-gateway`). Native AWS SigV4 signing is **not implemented**,
+> so it cannot talk to the AWS Bedrock runtime API directly; the
+> `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` variables only gate registration.
 
 ### Providers (presence of the key registers the provider)
 

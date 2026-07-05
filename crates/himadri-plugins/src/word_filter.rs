@@ -36,24 +36,13 @@ impl Plugin for WordFilterPlugin {
     async fn execute(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
         for message in &ctx.request.messages {
             if let Some(content) = &message.content {
-                let text = match content {
-                    himadri_core::MessageContent::Text(text) => text.clone(),
-                    himadri_core::MessageContent::Parts(parts) => parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            himadri_core::ContentPart::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(""),
-                };
-
-                let lower_text = text.to_lowercase();
+                let lower_text = content.flat_text().to_lowercase();
                 for word in &self.blocked_words {
                     if lower_text.contains(word) {
                         return Err(PluginError::Rejected {
                             name: self.name().to_string(),
                             reason: format!("Blocked word detected: {}", word),
+                            kind: himadri_plugin::traits::RejectKind::BadRequest,
                         });
                     }
                 }

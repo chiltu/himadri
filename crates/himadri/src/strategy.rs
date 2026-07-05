@@ -1,6 +1,5 @@
 use rand::Rng;
 use regex::Regex;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use crate::latency_store::{InMemoryLatencyStore, LatencyStore};
@@ -9,67 +8,27 @@ use himadri_core::{ChatCompletionRequest, GatewayError, Role, Target};
 // Re-export StrategyMode from core
 pub use himadri_core::config::StrategyMode;
 
-#[allow(dead_code, private_interfaces)]
+#[allow(private_interfaces)]
 #[derive(Default)]
 pub enum Strategy {
     #[default]
     Single,
-    Fallback(FallbackConfig),
-    LoadBalance(LoadBalanceState),
+    /// Try targets strictly in configured order. Retry/backoff behavior is
+    /// owned by the gateway's failover loop (`Gateway::with_failover`), not
+    /// per-strategy configuration.
+    Fallback,
+    LoadBalance,
     LeastLatency(LeastLatencyState),
-    CostOptimized(CostOptimizedConfig),
+    CostOptimized,
     Conditional(ConditionalConfig),
     ContentBased(ContentBasedConfig),
     ABTest(ABTestConfig),
-}
-
-#[allow(dead_code)]
-pub(crate) struct LoadBalanceState {
-    counter: AtomicU64,
 }
 
 pub struct LeastLatencyState {
     pub store: Arc<dyn LatencyStore>,
 }
 
-#[allow(dead_code)]
-pub struct FallbackConfig {
-    pub max_retries: u32,
-    pub retry_delay_ms: u64,
-    pub retryable_status_codes: Vec<u16>,
-}
-
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            retry_delay_ms: 100,
-            retryable_status_codes: vec![502, 503, 529, 429],
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub struct CostOptimizedConfig {
-    pub unpriced_strategy: UnpricedStrategy,
-}
-
-#[allow(dead_code)]
-pub enum UnpricedStrategy {
-    Fallback, // Use if nothing priced
-    Skip,     // Error if no priced option
-    Allow,    // Treat as free
-}
-
-impl Default for CostOptimizedConfig {
-    fn default() -> Self {
-        Self {
-            unpriced_strategy: UnpricedStrategy::Fallback,
-        }
-    }
-}
-
-#[allow(dead_code)]
 pub struct ConditionalConfig {
     pub rules: Vec<ConditionRule>,
     pub fallback: Option<Target>,
@@ -81,13 +40,11 @@ pub struct ConditionRule {
     pub target: Target,
 }
 
-#[allow(dead_code)]
 pub enum ConditionKey {
     Model,
     ModelPrefix,
 }
 
-#[allow(dead_code)]
 pub struct ContentBasedConfig {
     pub rules: Vec<ContentRule>,
     pub fallback: Option<Target>,
@@ -100,42 +57,32 @@ pub struct ContentRule {
     pub compiled_regex: Option<Regex>,
 }
 
-#[allow(dead_code, clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)]
 pub enum ContentConditionType {
     PromptContains,
     PromptNotContains,
     PromptRegex,
 }
 
-#[allow(dead_code)]
 pub struct ABTestConfig {
     pub variants: Vec<ABTestVariant>,
 }
 
-#[allow(dead_code)]
 pub struct ABTestVariant {
     pub target: Target,
     pub weight: f64,
-    pub label: String,
 }
 
 impl Strategy {
-    #[allow(dead_code)]
-    pub fn from_config_mode(mode: &StrategyMode) -> Self {
-        Self::from_mode(*mode)
-    }
-
     pub fn from_mode(mode: StrategyMode) -> Self {
         match mode {
             StrategyMode::Single => Strategy::Single,
-            StrategyMode::Fallback => Strategy::Fallback(FallbackConfig::default()),
-            StrategyMode::LoadBalance => Strategy::LoadBalance(LoadBalanceState {
-                counter: AtomicU64::new(0),
-            }),
+            StrategyMode::Fallback => Strategy::Fallback,
+            StrategyMode::LoadBalance => Strategy::LoadBalance,
             StrategyMode::LeastLatency => Strategy::LeastLatency(LeastLatencyState {
                 store: Arc::new(InMemoryLatencyStore::new()),
             }),
-            StrategyMode::CostOptimized => Strategy::CostOptimized(CostOptimizedConfig::default()),
+            StrategyMode::CostOptimized => Strategy::CostOptimized,
             // The advanced strategies carry per-rule configuration; without it
             // they degrade to selecting the first target. Use
             // `from_strategy_config` to supply rules/variants.
@@ -219,7 +166,6 @@ impl Strategy {
                     .map(|v| ABTestVariant {
                         target: v.target.clone(),
                         weight: v.weight,
-                        label: v.label.clone(),
                     })
                     .collect();
                 Strategy::ABTest(ABTestConfig { variants })
@@ -228,6 +174,7 @@ impl Strategy {
         }
     }
 
+    /// Test-only convenience: the routing path uses `from_strategy_config`.
     #[allow(dead_code)]
     pub fn with_latency_store(mode: StrategyMode, store: Arc<dyn LatencyStore>) -> Self {
         match mode {
@@ -250,26 +197,29 @@ impl Strategy {
 
         match self {
             Strategy::Single => Ok(targets[0].clone()),
-            Strategy::Fallback(_config) => {
-                // Try targets in order, return first that supports the model
-                if let Some(target) = targets.first() {
-                    return Ok(target.clone());
+            Strategy::Fallback => Ok(targets[0].clone()),
+            Strategy::LoadBalance => {
+                let total_weight: f64 = targets.iter().map(|t| t.weight.max(0.0)).sum();
+                // All-zero weights would make gen_range panic on an empty
+                // range; treat them as uniform instead.
+                if total_weight <= 0.0 {
+                    let idx = rand::thread_rng().gen_range(0..targets.len());
+                    return Ok(targets[idx].clone());
                 }
-                Ok(targets[0].clone())
-            }
-            Strategy::LoadBalance(_state) => {
-                let total_weight: f64 = targets.iter().map(|t| t.weight).sum();
                 let mut rng = rand::thread_rng();
                 let mut random = rng.gen_range(0.0..total_weight);
 
                 for target in targets {
-                    random -= target.weight;
+                    random -= target.weight.max(0.0);
                     if random <= 0.0 {
                         return Ok(target.clone());
                     }
                 }
 
-                Ok(targets.last().unwrap().clone())
+                Ok(targets
+                    .last()
+                    .cloned()
+                    .expect("targets checked non-empty above"))
             }
             Strategy::LeastLatency(state) => {
                 let mut best_target = None;
@@ -285,7 +235,7 @@ impl Strategy {
 
                 best_target.ok_or_else(|| GatewayError::Internal("No targets".to_string()))
             }
-            Strategy::CostOptimized(_config) => {
+            Strategy::CostOptimized => {
                 // For now, use weight as cost indicator (lower = cheaper)
                 targets
                     .iter()
@@ -342,8 +292,8 @@ impl Strategy {
 
         let ordered = match self {
             Strategy::Single => vec![targets[0].clone()],
-            Strategy::Fallback(_config) => targets.to_vec(),
-            Strategy::LoadBalance(_state) => {
+            Strategy::Fallback => targets.to_vec(),
+            Strategy::LoadBalance => {
                 // Weighted-random primary, remaining targets as fallbacks in a
                 // further weighted-random order.
                 let mut remaining: Vec<Target> = targets.to_vec();
@@ -378,7 +328,7 @@ impl Strategy {
                 with_latency.sort_by_key(|a| a.0);
                 with_latency.into_iter().map(|(_, t)| t).collect()
             }
-            Strategy::CostOptimized(_config) => {
+            Strategy::CostOptimized => {
                 let mut sorted = targets.to_vec();
                 sorted.sort_by(|a, b| {
                     a.weight
@@ -474,20 +424,7 @@ impl Strategy {
             .iter()
             .filter(|m| m.role == Role::User)
             .filter_map(|m| m.content.as_ref())
-            .map(|c| match c {
-                MessageContent::Text(text) => text.as_str(),
-                MessageContent::Parts(parts) => {
-                    let joined = parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            himadri_core::ContentPart::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    Box::leak(joined.into_boxed_str())
-                }
-            })
+            .map(|c| c.flat_text())
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -496,6 +433,15 @@ impl Strategy {
         config: &ABTestConfig,
         targets: &[Target],
     ) -> Result<Target, GatewayError> {
+        // No variants configured (e.g. mode switched to ab_test without
+        // rules): fall back to the first target instead of letting
+        // `gen_range(0.0..0.0)` panic the request.
+        if config.variants.is_empty() {
+            return targets
+                .first()
+                .cloned()
+                .ok_or_else(|| GatewayError::Internal("No targets".to_string()));
+        }
         let total_weight: f64 = config
             .variants
             .iter()
@@ -527,5 +473,3 @@ impl Strategy {
             .ok_or_else(|| GatewayError::Internal("No variants".to_string()))
     }
 }
-
-use himadri_core::MessageContent;

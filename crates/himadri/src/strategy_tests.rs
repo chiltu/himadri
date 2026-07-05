@@ -552,7 +552,6 @@ async fn test_ab_test_distribution() {
                     base_url: None,
                 },
                 weight: 80.0,
-                label: "control".to_string(),
             },
             ABTestVariant {
                 target: Target {
@@ -563,7 +562,6 @@ async fn test_ab_test_distribution() {
                     base_url: None,
                 },
                 weight: 20.0,
-                label: "challenger".to_string(),
             },
         ],
     });
@@ -602,7 +600,6 @@ async fn test_ab_test_equal_weight() {
                     base_url: None,
                 },
                 weight: 1.0,
-                label: "a".to_string(),
             },
             ABTestVariant {
                 target: Target {
@@ -613,7 +610,6 @@ async fn test_ab_test_equal_weight() {
                     base_url: None,
                 },
                 weight: 1.0,
-                label: "b".to_string(),
             },
         ],
     });
@@ -887,4 +883,40 @@ async fn test_strategy_mode_serde_roundtrip_advanced() {
         serde_json::from_str::<Mode>("\"ab_test\"").unwrap(),
         Mode::ABTest
     );
+}
+
+/// Regression: `ab_test` mode with zero configured variants used to panic
+/// (`gen_range` on an empty 0.0..0.0 range) on the first routed request.
+#[tokio::test]
+async fn test_ab_test_without_variants_falls_back() {
+    let strategy = Strategy::from_mode(StrategyMode::ABTest);
+    let targets = test_targets();
+
+    let selected = strategy
+        .select(&test_request("gpt-4"), &targets)
+        .await
+        .unwrap();
+    assert_eq!(selected.provider, "openai");
+
+    let ordered = strategy
+        .select_ordered(&test_request("gpt-4"), &targets)
+        .await
+        .unwrap();
+    assert!(!ordered.is_empty());
+}
+
+/// Regression: all-zero weights used to panic `select` for the
+/// load-balance strategy; they must degrade to a uniform pick.
+#[tokio::test]
+async fn test_load_balance_all_zero_weights() {
+    let strategy = Strategy::from_mode(StrategyMode::LoadBalance);
+    let mut targets = test_targets();
+    for t in &mut targets {
+        t.weight = 0.0;
+    }
+    let selected = strategy
+        .select(&test_request("gpt-4"), &targets)
+        .await
+        .unwrap();
+    assert!(targets.iter().any(|t| t.provider == selected.provider));
 }

@@ -73,10 +73,15 @@ fn parse_cli_args() -> CliArgs {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args();
 
-    let mut config = Config::load_from_env().unwrap_or_else(|e| {
-        eprintln!("Failed to load config: {}, using defaults", e);
-        Config::default()
-    });
+    // Fail fast on a malformed config: silently booting with defaults would
+    // run without the operator's auth/routing settings.
+    let mut config = match Config::load_from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Failed to load config: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // MASTER_KEY env var overrides config
     if let Ok(key) = std::env::var("MASTER_KEY") {
@@ -332,11 +337,35 @@ fn register_providers_from_env(gateway: &Gateway) {
 /// and the env-configured budget and rate-limit plugins).
 fn wire_plugins() -> himadri_plugin::PluginManager {
     let mut plugin_manager = himadri_plugin::PluginManager::new();
-    plugin_manager.register(WordFilterPlugin::new(vec![
-        "password".to_string(),
-        "secret".to_string(),
-    ]));
-    plugin_manager.register(MaxTokenPlugin::new(4096));
+
+    // Word filter is opt-in: WORD_FILTER_BLOCKLIST is a comma-separated
+    // list of blocked words. (A hardcoded default blocklist used to reject
+    // any prompt containing e.g. "password" on every deployment.)
+    if let Ok(blocklist) = std::env::var("WORD_FILTER_BLOCKLIST") {
+        let words: Vec<String> = blocklist
+            .split(',')
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if !words.is_empty() {
+            info!(
+                "Registered word filter with {} blocked word(s)",
+                words.len()
+            );
+            plugin_manager.register(WordFilterPlugin::new(words));
+        }
+    }
+
+    // Global max_tokens cap is opt-in via MAX_TOKENS_LIMIT (used to be a
+    // hardcoded 4096 that rejected any larger request).
+    if let Some(limit) = std::env::var("MAX_TOKENS_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        info!("Registered max-token cap of {}", limit);
+        plugin_manager.register(MaxTokenPlugin::new(limit));
+    }
+
     plugin_manager.register(RequestLoggerPlugin::new());
 
     // Register the budget plugin when a global spend limit and/or token pricing
@@ -450,6 +479,15 @@ async fn init_jwt_discovery() -> Option<Arc<himadri_auth::OidcDiscovery>> {
     match std::env::var("JWT_ISSUER") {
         Ok(issuer) if !issuer.is_empty() => {
             let audience = std::env::var("JWT_AUDIENCE").unwrap_or_default();
+            if audience.is_empty() {
+                // An empty audience makes `aud` validation reject every real
+                // token — a silent auth outage. Refuse to start instead.
+                tracing::error!(
+                    "JWT_ISSUER is set but JWT_AUDIENCE is empty; set JWT_AUDIENCE \
+                     to the expected `aud` claim (typically the OAuth client id)"
+                );
+                std::process::exit(1);
+            }
             let jwks_uri = std::env::var("JWT_JWKS_URI").ok();
             match himadri_auth::OidcDiscovery::new(&issuer, &audience, jwks_uri.as_deref()).await {
                 Ok(discovery) => {
@@ -599,10 +637,17 @@ async fn require_admin_scope(
     axum::extract::Extension(auth): axum::extract::Extension<Option<AuthContext>>,
     request: axum::extract::Request,
     next: middleware::Next,
-) -> Result<axum::response::Response, axum::http::StatusCode> {
+) -> Result<axum::response::Response, axum::response::Response> {
+    use axum::response::IntoResponse;
     match auth {
         Some(ctx) if ctx.scope == AuthScope::Admin => Ok(next.run(request).await),
-        _ => Err(axum::http::StatusCode::FORBIDDEN),
+        _ => Err((
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": { "message": "admin scope required", "type": "gateway_error" }
+            })),
+        )
+            .into_response()),
     }
 }
 
@@ -677,7 +722,10 @@ mod admin_scope_tests {
 
     #[tokio::test]
     async fn admin_scope_is_allowed() {
-        assert_eq!(status_for(Some(ctx_with(AuthScope::Admin))).await, StatusCode::OK);
+        assert_eq!(
+            status_for(Some(ctx_with(AuthScope::Admin))).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

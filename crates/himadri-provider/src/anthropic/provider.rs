@@ -13,6 +13,7 @@ use himadri_core::{
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 
+#[derive(Clone)]
 pub struct AnthropicProvider {
     base_url: String,
 }
@@ -186,12 +187,16 @@ impl AnthropicProvider {
         &self,
         event_type: &str,
         data: &serde_json::Value,
+        input_tokens: &mut u32,
     ) -> Option<Result<StreamChunk, ProviderError>> {
         match event_type {
             "message_start" => {
                 let message = &data["message"];
                 let id = message["id"].as_str().unwrap_or("").to_string();
                 let model = message["model"].as_str().unwrap_or("").to_string();
+                // Anthropic reports prompt tokens only here; stash them for
+                // the final message_delta usage.
+                *input_tokens = message["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
 
                 Some(Ok(StreamChunk {
                     id,
@@ -239,10 +244,13 @@ impl AnthropicProvider {
                     _ => r.to_string(),
                 });
 
-                let usage = data["usage"].as_object().map(|u| Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
-                    total_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
+                let usage = data["usage"].as_object().map(|u| {
+                    let output = u["output_tokens"].as_u64().unwrap_or(0) as u32;
+                    Usage {
+                        prompt_tokens: *input_tokens,
+                        completion_tokens: output,
+                        total_tokens: *input_tokens + output,
+                    }
                 });
 
                 Some(Ok(StreamChunk {
@@ -348,6 +356,7 @@ impl Provider for AnthropicProvider {
         }
 
         let provider = self.clone();
+        let mut input_tokens: u32 = 0;
         let stream = crate::sse::sse_events(response.bytes_stream()).filter_map(move |event| {
             let result = match event {
                 Ok(event) => {
@@ -356,7 +365,9 @@ impl Provider for AnthropicProvider {
                     // pre-existing lenient behavior for Anthropic events.
                     serde_json::from_str::<serde_json::Value>(&event.data)
                         .ok()
-                        .and_then(|data| provider.parse_stream_event(&event_type, &data))
+                        .and_then(|data| {
+                            provider.parse_stream_event(&event_type, &data, &mut input_tokens)
+                        })
                 }
                 Err(e) => Some(Err(e)),
             };
@@ -367,11 +378,43 @@ impl Provider for AnthropicProvider {
     }
 }
 
-impl Clone for AnthropicProvider {
-    fn clone(&self) -> Self {
-        Self {
-            base_url: self.base_url.clone(),
-        }
+#[cfg(test)]
+mod stream_usage_tests {
+    use super::*;
+
+    /// Regression: streamed Anthropic requests used to hardcode
+    /// `prompt_tokens: 0` — the `message_start` input count must flow into
+    /// the final `message_delta` usage.
+    #[test]
+    fn message_start_input_tokens_flow_into_final_usage() {
+        let provider = AnthropicProvider::new(None);
+        let mut input_tokens = 0u32;
+
+        let start = serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3-5-sonnet-20241022",
+                "usage": { "input_tokens": 9, "output_tokens": 1 }
+            }
+        });
+        provider
+            .parse_stream_event("message_start", &start, &mut input_tokens)
+            .unwrap()
+            .unwrap();
+        assert_eq!(input_tokens, 9);
+
+        let delta = serde_json::json!({
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "output_tokens": 5 }
+        });
+        let chunk = provider
+            .parse_stream_event("message_delta", &delta, &mut input_tokens)
+            .unwrap()
+            .unwrap();
+        let usage = chunk.usage.expect("final chunk carries usage");
+        assert_eq!(usage.prompt_tokens, 9);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 14);
     }
 }
 

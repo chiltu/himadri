@@ -51,26 +51,27 @@ impl PluginManager {
         Ok(())
     }
 
+    /// After-request plugins observe an already-produced (and paid-for)
+    /// response, so their failures are logged, never propagated — the
+    /// signature encodes that contract.
     #[instrument(skip(self, ctx), fields(plugin_count = self.after_request.len()))]
-    pub async fn run_after(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
+    pub async fn run_after(&self, ctx: &mut PluginContext) {
         for plugin in &self.after_request {
             debug!("Running after-request plugin: {}", plugin.name());
             if let Err(e) = plugin.execute(ctx).await {
                 error!("Plugin {} failed: {}", plugin.name(), e);
             }
         }
-        Ok(())
     }
 
     #[instrument(skip(self, ctx), fields(plugin_count = self.after_response.len()))]
-    pub async fn run_after_response(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
+    pub async fn run_after_response(&self, ctx: &mut PluginContext) {
         for plugin in &self.after_response {
             debug!("Running after-response plugin: {}", plugin.name());
             if let Err(e) = plugin.execute(ctx).await {
                 error!("After-response plugin {} failed: {}", plugin.name(), e);
             }
         }
-        Ok(())
     }
 
     #[instrument(skip(self, ctx), fields(guardrail_count = self.response_guardrails.len()))]

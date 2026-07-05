@@ -37,6 +37,7 @@ impl Plugin for MaxTokenPlugin {
                         "max_tokens {} exceeds limit of {}",
                         max_tokens, self.max_tokens
                     ),
+                    kind: himadri_plugin::traits::RejectKind::BadRequest,
                 });
             }
         }

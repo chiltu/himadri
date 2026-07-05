@@ -1,14 +1,11 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-
 /// Distributed rate limiter using Redis sliding window.
 /// Falls back to in-memory when Redis is unavailable.
 pub struct RedisRateLimiter {
     client: Option<redis::Client>,
     fallback: crate::ShardedRateLimiter,
     prefix: String,
+    /// Requests allowed per 1-second window.
+    rate: u64,
 }
 
 impl RedisRateLimiter {
@@ -17,7 +14,7 @@ impl RedisRateLimiter {
             match redis::Client::open(url) {
                 Ok(client) => {
                     // Test connection
-                    match client.get_async_connection().await {
+                    match client.get_multiplexed_async_connection().await {
                         Ok(_) => {
                             tracing::info!("Connected to Redis for rate limiting");
                             Some(client)
@@ -45,6 +42,7 @@ impl RedisRateLimiter {
             client,
             fallback: crate::ShardedRateLimiter::new(rate, capacity, 64),
             prefix: "himadri:ratelimit:".to_string(),
+            rate,
         }
     }
 
@@ -68,7 +66,7 @@ impl RedisRateLimiter {
         client: &redis::Client,
         key: &str,
     ) -> Result<bool, redis::RedisError> {
-        let mut conn = client.get_async_connection().await?;
+        let mut conn = client.get_multiplexed_async_connection().await?;
         let redis_key = format!("{}{}", self.prefix, key);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -92,8 +90,7 @@ impl RedisRateLimiter {
             .query_async(&mut conn)
             .await?;
 
-        if count >= 100 {
-            // Default 100 RPS
+        if count >= self.rate {
             return Ok(false);
         }
 

@@ -24,6 +24,32 @@ use crate::gateway::Gateway;
 /// memory-exhaustion DoS.
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// Uniform JSON error for non-`GatewayError` handler failures, so admin
+/// endpoints return the same `{"error": {...}}` envelope as the /v1 API
+/// instead of plain-text bodies or empty responses.
+pub(crate) struct ApiError(pub StatusCode, pub String);
+
+impl ApiError {
+    pub(crate) fn not_found() -> Self {
+        ApiError(StatusCode::NOT_FOUND, "not found".to_string())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = Json(serde_json::json!({
+            "error": { "message": self.1, "type": "gateway_error" }
+        }));
+        (self.0, body).into_response()
+    }
+}
+
+impl From<(StatusCode, String)> for ApiError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        ApiError(status, message)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) gateway: Arc<Gateway>,
@@ -38,8 +64,32 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
     }))
 }
 
-pub(crate) async fn metrics_handler(State(state): State<AppState>) -> String {
-    state.metrics.encode_metrics()
+/// Prometheus metrics. The output includes per-model token volumes and
+/// cost totals, so when a `METRICS_TOKEN` or `MASTER_KEY` is configured a
+/// matching bearer token is required; only a fully unconfigured (dev-mode)
+/// gateway serves metrics unauthenticated — mirroring the API's dev bypass.
+pub(crate) async fn metrics_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // The master key may come from the MASTER_KEY env var *or* the config
+    // file (main.rs merges the env override into config.admin.master_key),
+    // so consult the live config rather than only the environment.
+    let expected =
+        std::env::var("METRICS_TOKEN")
+            .ok()
+            .or(state.gateway.get_config().await.admin.master_key);
+    if let Some(expected) = expected.filter(|t| !t.is_empty()) {
+        let authorized = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|presented| constant_time_eq(presented.as_bytes(), expected.as_bytes()));
+        if !authorized {
+            return ApiError(StatusCode::UNAUTHORIZED, "unauthorized".to_string()).into_response();
+        }
+    }
+    state.metrics.encode_metrics().into_response()
 }
 
 pub(crate) async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
@@ -81,37 +131,20 @@ pub(crate) async fn chat_completions(
 ) -> Response {
     let remote_ip = resolve_remote_ip(peer, &headers);
     if request.stream {
+        use futures::StreamExt;
         match state
             .gateway
             .route_stream(request, auth.as_ref(), remote_ip)
             .await
         {
-            Ok(stream) => {
-                use axum::response::sse::{Event, Sse};
-                use futures::StreamExt;
-                use std::convert::Infallible;
-
-                let event_stream = stream.map(|chunk| match chunk {
-                    Ok(chunk) => {
-                        let data = serde_json::to_string(&chunk).unwrap_or_default();
-                        Ok::<_, Infallible>(Event::default().data(data))
-                    }
-                    Err(e) => {
-                        let error_data = serde_json::json!({
-                            "error": { "message": e.to_string(), "type": "gateway_error" }
-                        });
-                        Ok(Event::default().data(error_data.to_string()))
-                    }
-                });
-
-                Sse::new(event_stream)
-                    .keep_alive(
-                        axum::response::sse::KeepAlive::new()
-                            .interval(std::time::Duration::from_secs(15))
-                            .text("ping"),
-                    )
-                    .into_response()
-            }
+            Ok(stream) => sse_response(stream.map(
+                |chunk: Result<himadri_core::StreamChunk, himadri_provider::ProviderError>| {
+                    chunk.and_then(|c| {
+                        serde_json::to_string(&c)
+                            .map_err(|e| himadri_provider::ProviderError::Parse(e.to_string()))
+                    })
+                },
+            )),
             Err(e) => error_to_response(e),
         }
     } else {
@@ -122,17 +155,152 @@ pub(crate) async fn chat_completions(
     }
 }
 
+/// Legacy `/v1/completions` request: a `prompt` (string or array of
+/// strings) instead of chat `messages`. Translated to a single-user-message
+/// chat request internally; the response is converted back to the
+/// `text_completion` wire shape.
+#[derive(serde::Deserialize)]
+pub(crate) struct LegacyCompletionRequest {
+    model: String,
+    #[serde(default)]
+    prompt: LegacyPrompt,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    stop: Option<serde_json::Value>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    user: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(untagged)]
+pub(crate) enum LegacyPrompt {
+    #[default]
+    None,
+    Text(String),
+    Many(Vec<String>),
+}
+
+impl LegacyPrompt {
+    fn into_text(self) -> String {
+        match self {
+            LegacyPrompt::None => String::new(),
+            LegacyPrompt::Text(t) => t,
+            LegacyPrompt::Many(parts) => parts.join("\n"),
+        }
+    }
+}
+
+fn legacy_to_chat(request: LegacyCompletionRequest) -> Result<ChatCompletionRequest, ApiError> {
+    // The legacy API accepts `stop` as a bare string or an array of strings;
+    // the chat type wants an array. Normalize rather than reject (and never
+    // panic on user-controlled input).
+    let prompt = request.prompt.into_text();
+    if prompt.is_empty() {
+        // A missing/empty prompt is a malformed legacy request (commonly a
+        // chat-shaped body posted to the wrong endpoint); reject loudly
+        // instead of silently forwarding an empty prompt upstream.
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "prompt is required (for chat-style messages use /v1/chat/completions)".to_string(),
+        ));
+    }
+    let stop = match request.stop {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(serde_json::json!([s])),
+        Some(other) => Some(other),
+    };
+    serde_json::from_value(serde_json::json!({
+        "model": request.model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "stop": stop,
+        "stream": request.stream,
+        "user": request.user,
+    }))
+    .map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid completion request: {}", e),
+        )
+    })
+}
+
+fn chat_to_text_completion(response: &himadri_core::ChatCompletionResponse) -> serde_json::Value {
+    serde_json::json!({
+        "id": response.id,
+        "object": "text_completion",
+        "created": response.created,
+        "model": response.model,
+        "choices": response.choices.iter().map(|c| serde_json::json!({
+            "text": c.message.content.clone().unwrap_or_default(),
+            "index": c.index,
+            "logprobs": null,
+            "finish_reason": c.finish_reason,
+        })).collect::<Vec<_>>(),
+        "usage": response.usage,
+    })
+}
+
 pub(crate) async fn completions(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     axum::extract::Extension(auth): axum::extract::Extension<Option<AuthContext>>,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(request): Json<LegacyCompletionRequest>,
 ) -> Response {
     let remote_ip = resolve_remote_ip(peer, &headers);
-    match state.gateway.route(request, auth.as_ref(), remote_ip).await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => error_to_response(e),
+    let stream = request.stream;
+    let chat_request = match legacy_to_chat(request) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+
+    if stream {
+        match state
+            .gateway
+            .route_stream(chat_request, auth.as_ref(), remote_ip)
+            .await
+        {
+            Ok(chunks) => {
+                use futures::StreamExt;
+                sse_response(chunks.map(|chunk| {
+                    chunk.map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "object": "text_completion",
+                            "created": c.created,
+                            "model": c.model,
+                            "choices": c.choices.iter().map(|choice| serde_json::json!({
+                                "text": choice.delta.content.clone().unwrap_or_default(),
+                                "index": choice.index,
+                                "logprobs": null,
+                                "finish_reason": choice.finish_reason,
+                            })).collect::<Vec<_>>(),
+                        })
+                        .to_string()
+                    })
+                }))
+            }
+            Err(e) => error_to_response(e),
+        }
+    } else {
+        match state
+            .gateway
+            .route(chat_request, auth.as_ref(), remote_ip)
+            .await
+        {
+            Ok(response) => Json(chat_to_text_completion(&response)).into_response(),
+            Err(e) => error_to_response(e),
+        }
     }
 }
 
@@ -149,79 +317,79 @@ pub(crate) async fn embeddings(
 
 pub(crate) async fn list_keys(
     State(state): State<AppState>,
-) -> Result<Json<Vec<himadri_admin::ApiKey>>, (StatusCode, String)> {
+) -> Result<Json<Vec<himadri_admin::ApiKey>>, ApiError> {
     Ok(Json(state.admin.list_keys().await))
 }
 
 pub(crate) async fn create_key(
     State(state): State<AppState>,
     Json(request): Json<himadri_admin::CreateApiKeyRequest>,
-) -> Result<(StatusCode, Json<himadri_admin::ApiKey>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<himadri_admin::ApiKey>), ApiError> {
     state
         .admin
         .create_key(request)
         .await
         .map(|key| (StatusCode::CREATED, Json(key)))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 pub(crate) async fn get_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<himadri_admin::ApiKey>, StatusCode> {
+) -> Result<Json<himadri_admin::ApiKey>, ApiError> {
     state
         .admin
         .get_key(&id)
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(ApiError::not_found)
 }
 
 pub(crate) async fn update_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<himadri_admin::UpdateApiKeyRequest>,
-) -> Result<Json<himadri_admin::ApiKey>, StatusCode> {
+) -> Result<Json<himadri_admin::ApiKey>, ApiError> {
     state
         .admin
         .update_key(&id, request)
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(ApiError::not_found)
 }
 
 pub(crate) async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     if state.admin.delete_key(&id).await {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(ApiError::not_found())
     }
 }
 
 pub(crate) async fn revoke_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     if state.admin.revoke_key(&id).await {
         Ok(StatusCode::OK)
     } else {
-        Err(StatusCode::NOT_FOUND)
+        Err(ApiError::not_found())
     }
 }
 
 pub(crate) async fn rotate_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<himadri_admin::ApiKey>, StatusCode> {
+) -> Result<Json<himadri_admin::ApiKey>, ApiError> {
     state
         .admin
         .rotate_key(&id)
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(ApiError::not_found)
 }
 
 pub(crate) async fn passthrough(
@@ -260,7 +428,7 @@ pub(crate) async fn passthrough(
                 response = response.header(key, value);
             }
             response
-                .body(axum::body::Body::from(resp_body))
+                .body(resp_body)
                 .unwrap_or_else(|e| error_to_response(GatewayError::Internal(e.to_string())))
         }
         Err(e) => error_to_response(e),
@@ -269,9 +437,9 @@ pub(crate) async fn passthrough(
 
 pub(crate) async fn reload_config(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let new_config = Config::load_from_env().map_err(|e| {
-        (
+        ApiError(
             StatusCode::BAD_REQUEST,
             format!("Failed to load config: {}", e),
         )
@@ -280,7 +448,7 @@ pub(crate) async fn reload_config(
         .gateway
         .reload_config(new_config)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(serde_json::json!({ "status": "reloaded" })))
 }
 
@@ -311,7 +479,7 @@ pub(crate) async fn usage_stats(State(state): State<AppState>) -> Json<serde_jso
 pub(crate) async fn key_usage_stats(
     State(state): State<AppState>,
     Path(key_id): Path<String>,
-) -> Result<Json<himadri_admin::UsageStats>, StatusCode> {
+) -> Result<Json<himadri_admin::UsageStats>, ApiError> {
     let store = state.gateway.usage_store();
     let stats = store.get_key_stats(&key_id);
     Ok(Json(stats))
@@ -325,12 +493,12 @@ pub(crate) async fn get_config(State(state): State<AppState>) -> Json<himadri_co
 pub(crate) async fn update_config(
     State(state): State<AppState>,
     Json(new_config): Json<himadri_core::Config>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .gateway
         .reload_config(new_config)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(serde_json::json!({ "status": "updated" })))
 }
 
@@ -347,12 +515,12 @@ pub(crate) async fn config_history(State(state): State<AppState>) -> Json<serde_
 pub(crate) async fn config_rollback(
     State(state): State<AppState>,
     Path(version): Path<u32>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .gateway
         .rollback_config(version)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(serde_json::json!({
         "status": "rolled_back",
         "version": version,
@@ -362,24 +530,24 @@ pub(crate) async fn config_rollback(
 pub(crate) async fn list_logs(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<himadri_admin::RequestLogQuery>,
-) -> Result<Json<himadri_admin::RequestLogListResult>, (StatusCode, String)> {
+) -> Result<Json<himadri_admin::RequestLogListResult>, ApiError> {
     let result = state
         .gateway
         .request_log()
         .list(query)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(result))
 }
 
 pub(crate) async fn delete_logs(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<himadri_admin::MaintenanceQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let deleted = state
         .gateway
         .request_log()
         .delete(query)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
@@ -401,13 +569,13 @@ impl AppState {
         &self,
         result: Option<T>,
         label: &str,
-    ) -> Result<(StatusCode, Json<T>), (StatusCode, String)> {
+    ) -> Result<(StatusCode, Json<T>), ApiError> {
         match result {
             Some(v) => {
                 self.rebuild_targets().await;
                 Ok((StatusCode::CREATED, Json(v)))
             }
-            None => Err((
+            None => Err(ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to create {}", label),
             )),
@@ -415,31 +583,37 @@ impl AppState {
     }
 
     /// Entity on success (rebuilding targets), 404 when the id didn't match.
-    async fn updated<T>(&self, result: Option<T>) -> Result<Json<T>, StatusCode> {
+    async fn updated<T>(&self, result: Option<T>) -> Result<Json<T>, ApiError> {
         match result {
             Some(v) => {
                 self.rebuild_targets().await;
                 Ok(Json(v))
             }
-            None => Err(StatusCode::NOT_FOUND),
+            None => Err(ApiError::not_found()),
         }
     }
 
     /// 204 on success (rebuilding targets), 404 when the id didn't match.
-    async fn deleted(&self, deleted: bool) -> Result<StatusCode, StatusCode> {
+    async fn deleted(&self, deleted: bool) -> Result<StatusCode, ApiError> {
         if deleted {
             self.rebuild_targets().await;
             Ok(StatusCode::NO_CONTENT)
         } else {
-            Err(StatusCode::NOT_FOUND)
+            Err(ApiError::not_found())
         }
     }
 }
 
-fn parse_enabled(body: &serde_json::Value) -> bool {
-    body.get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+/// Body of the provider/model toggle endpoints. Type-checked by the
+/// extractor instead of hand-walking a `serde_json::Value`.
+#[derive(serde::Deserialize)]
+pub(crate) struct ToggleBody {
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub(crate) async fn list_providers(
@@ -451,7 +625,7 @@ pub(crate) async fn list_providers(
 pub(crate) async fn create_provider(
     State(state): State<AppState>,
     Json(request): Json<himadri_admin::CreateProviderRequest>,
-) -> Result<(StatusCode, Json<himadri_admin::Provider>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<himadri_admin::Provider>), ApiError> {
     let result = state.admin.create_provider(request).await;
     state.created(result, "provider").await
 }
@@ -459,20 +633,20 @@ pub(crate) async fn create_provider(
 pub(crate) async fn get_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<himadri_admin::Provider>, StatusCode> {
+) -> Result<Json<himadri_admin::Provider>, ApiError> {
     state
         .admin
         .get_provider(&id)
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(ApiError::not_found)
 }
 
 pub(crate) async fn update_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<himadri_admin::UpdateProviderRequest>,
-) -> Result<Json<himadri_admin::Provider>, StatusCode> {
+) -> Result<Json<himadri_admin::Provider>, ApiError> {
     let result = state.admin.update_provider(&id, request).await;
     state.updated(result).await
 }
@@ -480,7 +654,7 @@ pub(crate) async fn update_provider(
 pub(crate) async fn delete_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     let deleted = state.admin.delete_provider(&id).await;
     state.deleted(deleted).await
 }
@@ -488,9 +662,9 @@ pub(crate) async fn delete_provider(
 pub(crate) async fn toggle_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<himadri_admin::Provider>, StatusCode> {
-    let result = state.admin.toggle_provider(&id, parse_enabled(&body)).await;
+    Json(body): Json<ToggleBody>,
+) -> Result<Json<himadri_admin::Provider>, ApiError> {
+    let result = state.admin.toggle_provider(&id, body.enabled).await;
     state.updated(result).await
 }
 
@@ -503,7 +677,7 @@ pub(crate) async fn list_models_api(
 pub(crate) async fn create_model(
     State(state): State<AppState>,
     Json(request): Json<himadri_admin::CreateModelRequest>,
-) -> Result<(StatusCode, Json<himadri_admin::Model>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<himadri_admin::Model>), ApiError> {
     let result = state.admin.create_model(request).await;
     state.created(result, "model").await
 }
@@ -511,20 +685,20 @@ pub(crate) async fn create_model(
 pub(crate) async fn get_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<himadri_admin::Model>, StatusCode> {
+) -> Result<Json<himadri_admin::Model>, ApiError> {
     state
         .admin
         .get_model(&id)
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(ApiError::not_found)
 }
 
 pub(crate) async fn update_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<himadri_admin::UpdateModelRequest>,
-) -> Result<Json<himadri_admin::Model>, StatusCode> {
+) -> Result<Json<himadri_admin::Model>, ApiError> {
     let result = state.admin.update_model(&id, request).await;
     state.updated(result).await
 }
@@ -532,7 +706,7 @@ pub(crate) async fn update_model(
 pub(crate) async fn delete_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     let deleted = state.admin.delete_model(&id).await;
     state.deleted(deleted).await
 }
@@ -540,18 +714,103 @@ pub(crate) async fn delete_model(
 pub(crate) async fn toggle_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<himadri_admin::Model>, StatusCode> {
-    let result = state.admin.toggle_model(&id, parse_enabled(&body)).await;
+    Json(body): Json<ToggleBody>,
+) -> Result<Json<himadri_admin::Model>, ApiError> {
+    let result = state.admin.toggle_model(&id, body.enabled).await;
     state.updated(result).await
+}
+
+/// Build an OpenAI-wire-compatible SSE response from a chunk stream:
+/// chunks as `data:` events, a terminal error event (sanitized, then the
+/// stream ends — clients must not receive further chunks after an error),
+/// and the `data: [DONE]` sentinel OpenAI SDKs use as the end-of-stream
+/// signal.
+fn sse_response<S>(stream: S) -> Response
+where
+    S: futures::Stream<Item = Result<String, himadri_provider::ProviderError>> + Send + 'static,
+{
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::StreamExt;
+    use std::convert::Infallible;
+
+    let event_stream = stream
+        .scan(false, |errored, chunk| {
+            let item = if *errored {
+                None
+            } else {
+                Some(match chunk {
+                    Ok(payload) => Ok::<_, Infallible>(Event::default().data(payload)),
+                    Err(e) => {
+                        *errored = true;
+                        tracing::error!(error = %e, "stream error");
+                        let error_data = serde_json::json!({
+                            "error": {
+                                "message": "stream interrupted by upstream error",
+                                "type": "gateway_error"
+                            }
+                        });
+                        Ok(Event::default().data(error_data.to_string()))
+                    }
+                })
+            };
+            futures::future::ready(item)
+        })
+        .chain(futures::stream::once(async {
+            Ok::<_, Infallible>(Event::default().data("[DONE]"))
+        }));
+
+    Sse::new(event_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// Constant-time comparison, mirroring the admin auth middleware, so the
+/// metrics token can't be probed byte-by-byte via response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn error_to_response(e: GatewayError) -> Response {
     let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // 4xx messages are actionable for the caller; 5xx detail (upstream
+    // bodies, infrastructure specifics) is logged server-side and replaced
+    // with a generic message so nothing internal leaks through the edge.
+    let message = if status.is_server_error() {
+        tracing::error!(error = %e, "gateway error");
+        match &e {
+            GatewayError::CircuitOpen(_) | GatewayError::ServiceUnavailable(_) => {
+                "upstream provider unavailable".to_string()
+            }
+            _ => "internal server error".to_string(),
+        }
+    } else {
+        e.to_string()
+    };
     let body = Json(serde_json::json!({
-        "error": { "message": e.to_string(), "type": "gateway_error" }
+        "error": { "message": message, "type": "gateway_error" }
     }));
-    (status, body).into_response()
+    let mut response = (status, body).into_response();
+    // Clients need backoff guidance on 429s.
+    let retry_after_secs = match &e {
+        GatewayError::RateLimited { retry_after_secs } => Some(*retry_after_secs),
+        GatewayError::QuotaExceeded(_) => Some(60),
+        _ => None,
+    };
+    if let Some(secs) = retry_after_secs {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    response
 }
 
 /// Check if an IP address is loopback or private (RFC 1918 / link-local / loopback).

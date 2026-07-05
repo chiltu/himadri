@@ -71,7 +71,8 @@ in `crates/` is a library crate it composes.
    `StreamUsageRecorder` captures usage from the final stream chunk and
    records at stream end (or client disconnect).
 
-The unauthenticated `/v1/*` fallback in step 1 (`Gateway::proxy`) transparently
+The `/v1/*` fallback in step 1 (`Gateway::proxy`) sits behind the same
+bearer-token auth middleware as the other `/v1` endpoints and transparently
 forwards anything not matched by a specific handler to the first configured
 target — used for provider endpoints himadri doesn't model explicitly.
 

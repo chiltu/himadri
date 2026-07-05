@@ -4,6 +4,8 @@ pub struct Redactor {
     email_regex: Regex,
     jwt_regex: Regex,
     aws_key_regex: Regex,
+    api_key_regex: Regex,
+    bearer_regex: Regex,
 }
 
 impl Redactor {
@@ -12,6 +14,10 @@ impl Redactor {
             email_regex: Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap(),
             jwt_regex: Regex::new(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+").unwrap(),
             aws_key_regex: Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+            // OpenAI-style secrets — including this gateway's own `sk-…`
+            // keys — are the most likely credential to appear in prompts.
+            api_key_regex: Regex::new(r"sk-[a-zA-Z0-9_-]{16,}").unwrap(),
+            bearer_regex: Regex::new(r"(?i)bearer\s+[a-zA-Z0-9._~+/=-]{16,}").unwrap(),
         }
     }
 
@@ -19,12 +25,20 @@ impl Redactor {
         let mut result = input.to_string();
 
         result = self
-            .email_regex
-            .replace_all(&result, "[REDACTED_EMAIL]")
-            .to_string();
-        result = self
             .jwt_regex
             .replace_all(&result, "[REDACTED_JWT]")
+            .to_string();
+        result = self
+            .bearer_regex
+            .replace_all(&result, "[REDACTED_BEARER_TOKEN]")
+            .to_string();
+        result = self
+            .api_key_regex
+            .replace_all(&result, "[REDACTED_API_KEY]")
+            .to_string();
+        result = self
+            .email_regex
+            .replace_all(&result, "[REDACTED_EMAIL]")
             .to_string();
         result = self
             .aws_key_regex

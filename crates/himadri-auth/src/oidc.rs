@@ -86,6 +86,24 @@ impl OidcDiscovery {
         Ok(discovery)
     }
 
+    /// Build a discovery instance from an already-known JWKS, without any
+    /// network I/O. Used by tests to validate tokens against locally
+    /// generated keys; also useful for air-gapped deployments that pin keys.
+    pub fn from_parts(
+        issuer: &str,
+        audience: &str,
+        keys: Vec<jsonwebtoken::jwk::Jwk>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            jwks_uri: String::new(),
+            jwks: RwLock::new(keys),
+            last_refresh: parking_lot::Mutex::new(std::time::Instant::now()),
+            client: reqwest::Client::new(),
+        })
+    }
+
     /// Validate a JWT token and extract claims
     pub fn validate_token(&self, token: &str) -> Result<JwtClaims, AuthError> {
         // Decode header to get kid
@@ -103,8 +121,17 @@ impl OidcDiscovery {
             .find(|k| k.common.key_id.as_deref() == Some(&kid))
             .ok_or_else(|| AuthError::InvalidToken(format!("key not found: {}", kid)))?;
 
-        // Decode and validate
-        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        // Decode and validate. The algorithm comes from the matched JWK
+        // (falling back to the key type's default) rather than being pinned
+        // to RS256, so an IdP rotating to RS384/512, ES256/384 or EdDSA
+        // keeps working.
+        let algorithm = algorithm_for_jwk(jwk).ok_or_else(|| {
+            AuthError::InvalidToken(format!("unsupported JWK algorithm for kid {}", kid))
+        })?;
+        let mut validation = jsonwebtoken::Validation::new(algorithm);
+        // jsonwebtoken validates `exp` by default but NOT `nbf` — enable it
+        // so pre-provisioned / clock-skewed tokens are rejected until valid.
+        validation.validate_nbf = true;
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
 
@@ -162,6 +189,39 @@ impl OidcDiscovery {
         debug!("JWKS refreshed with {} keys", current_jwks.len());
 
         Ok(())
+    }
+}
+
+/// Resolve the signature algorithm to validate with for a JWK: the key's
+/// explicit `alg` when present, otherwise a default derived from the key
+/// type/curve.
+fn algorithm_for_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> Option<jsonwebtoken::Algorithm> {
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm};
+    use jsonwebtoken::Algorithm;
+
+    if let Some(alg) = jwk.common.key_algorithm {
+        return match alg {
+            KeyAlgorithm::RS256 => Some(Algorithm::RS256),
+            KeyAlgorithm::RS384 => Some(Algorithm::RS384),
+            KeyAlgorithm::RS512 => Some(Algorithm::RS512),
+            KeyAlgorithm::PS256 => Some(Algorithm::PS256),
+            KeyAlgorithm::PS384 => Some(Algorithm::PS384),
+            KeyAlgorithm::PS512 => Some(Algorithm::PS512),
+            KeyAlgorithm::ES256 => Some(Algorithm::ES256),
+            KeyAlgorithm::ES384 => Some(Algorithm::ES384),
+            KeyAlgorithm::EdDSA => Some(Algorithm::EdDSA),
+            _ => None,
+        };
+    }
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Some(Algorithm::RS256),
+        AlgorithmParameters::EllipticCurve(ec) => match ec.curve {
+            EllipticCurve::P256 => Some(Algorithm::ES256),
+            EllipticCurve::P384 => Some(Algorithm::ES384),
+            _ => None,
+        },
+        AlgorithmParameters::OctetKeyPair(_) => Some(Algorithm::EdDSA),
+        _ => None,
     }
 }
 

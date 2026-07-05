@@ -142,10 +142,15 @@ mod tests {
         assert_eq!(openai.max_idle_per_host, 200);
 
         let streaming = crate::http_client::TransportConfig::streaming();
-        assert!(streaming.response_header_timeout.is_zero());
+        // Streams have no total deadline but must keep a read timeout so a
+        // stalled upstream cannot pin a connection forever.
+        assert!(streaming.request_timeout.is_zero());
+        assert!(!streaming.read_timeout.is_zero());
 
-        let local = crate::http_client::TransportConfig::local();
-        assert!(!local.http2);
+        // Non-streaming clients need a generous total ceiling: long
+        // completions routinely exceed 30s.
+        let openai_timeout = crate::http_client::TransportConfig::openai().request_timeout;
+        assert!(openai_timeout.as_secs() >= 300);
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -175,8 +180,17 @@ mod tests {
             message: "test".into()
         }
         .retryable());
-        assert!(!ProviderError::Api {
+        assert!(ProviderError::Api {
             status: 500,
+            message: "test".into()
+        }
+        .retryable());
+        // Transport failures must be retryable: a hard-down provider has to
+        // trip the circuit breaker and fall back to the next target.
+        assert!(ProviderError::Network("connection refused".into()).retryable());
+        // Client errors must not burn fallback targets.
+        assert!(!ProviderError::Api {
+            status: 400,
             message: "test".into()
         }
         .retryable());
@@ -238,5 +252,98 @@ mod tests {
         let err = provider.embed(&request, "key").await.unwrap_err();
         assert!(matches!(err, ProviderError::Unsupported(_)));
         assert_eq!(err.status_code(), 501);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HTTP error-mapping tests (no network: reqwest::Response built from
+// synthetic http::Response values)
+// ═══════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use crate::error::ProviderError;
+
+    fn response(status: u16, headers: &[(&str, &str)], body: &str) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        reqwest::Response::from(builder.body(body.to_string()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn upstream_429_honors_retry_after_header() {
+        let resp = response(429, &[("retry-after", "17")], "{}");
+        let err = ProviderError::from_openai_response(resp).await;
+        assert!(matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_secs: 17
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_429_without_header_defaults() {
+        let resp = response(429, &[], "{}");
+        let err = ProviderError::from_openai_response(resp).await;
+        assert!(matches!(
+            err,
+            ProviderError::RateLimited {
+                retry_after_secs: 60
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn upstream_401_maps_to_auth_with_extracted_message() {
+        let resp = response(401, &[], r#"{"error":{"message":"bad key"}}"#);
+        let err = ProviderError::from_openai_response(resp).await;
+        assert!(matches!(err, ProviderError::Auth(m) if m == "bad key"));
+    }
+
+    #[tokio::test]
+    async fn upstream_404_maps_to_model_not_found() {
+        let resp = response(404, &[], r#"{"message":"no such model"}"#);
+        let err = ProviderError::from_openai_response(resp).await;
+        assert!(matches!(err, ProviderError::ModelNotFound(m) if m == "no such model"));
+    }
+
+    #[tokio::test]
+    async fn non_json_body_falls_back_to_raw_text() {
+        let resp = response(502, &[], "<html>bad gateway</html>");
+        let err = ProviderError::from_openai_response(resp).await;
+        assert!(matches!(
+            err,
+            ProviderError::Api { status: 502, ref message } if message.contains("bad gateway")
+        ));
+    }
+
+    /// Gateway-facing mapping: upstream semantics must survive the edge.
+    #[test]
+    fn gateway_error_mapping_preserves_semantics() {
+        use himadri_core::GatewayError;
+
+        let e: GatewayError = ProviderError::RateLimited {
+            retry_after_secs: 5,
+        }
+        .into();
+        assert_eq!(e.status_code(), 429);
+
+        // Upstream auth failure = the gateway's provider key is bad; the
+        // caller's token was fine, so it must NOT surface as 401.
+        let e: GatewayError = ProviderError::Auth("k".into()).into();
+        assert_eq!(e.status_code(), 503);
+
+        let e: GatewayError = ProviderError::Api {
+            status: 400,
+            message: "bad request".into(),
+        }
+        .into();
+        assert_eq!(e.status_code(), 400);
+
+        let e: GatewayError = ProviderError::Network("refused".into()).into();
+        assert_eq!(e.status_code(), 503);
     }
 }

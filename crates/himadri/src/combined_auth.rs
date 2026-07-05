@@ -12,7 +12,8 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use himadri_admin::AuthMiddleware;
 use himadri_auth::OidcDiscovery;
@@ -102,7 +103,7 @@ impl CombinedAuth {
         headers: HeaderMap,
         mut request: axum::extract::Request,
         next: Next,
-    ) -> Result<Response, StatusCode> {
+    ) -> Result<Response, Response> {
         // Dev-mode bypass mirrors AuthMiddleware: no master key => anonymous.
         if auth.jwt.is_none() && auth.api_key.is_bypass() {
             request
@@ -132,7 +133,10 @@ impl CombinedAuth {
                     remote_ip,
                     None,
                 );
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err(auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or missing bearer token",
+                ));
             }
         };
 
@@ -142,25 +146,21 @@ impl CombinedAuth {
         if let Some(discovery) = &auth.jwt {
             if looks_like_jwt(&token) {
                 match discovery.validate_token(&token) {
+                    // `validate_token` already enforces exp/nbf (with leeway),
+                    // signature, issuer and audience during decode.
                     Ok(claims) => {
-                        if claims.is_expired() || claims.is_not_yet_valid() {
-                            auth.audit_failure(
-                                AuditStatus::Unauthorized,
-                                "expired or not-yet-valid token",
-                                remote_ip,
-                                None,
-                            );
-                            return Err(StatusCode::UNAUTHORIZED);
-                        }
                         let ctx = claims.into_auth_context();
-                        if let Err(code) = enforce_required_roles(&ctx) {
+                        if enforce_required_roles(&ctx).is_err() {
                             auth.audit_failure(
                                 AuditStatus::Forbidden,
                                 "principal lacks a required role",
                                 remote_ip,
                                 Some(&ctx),
                             );
-                            return Err(code);
+                            return Err(auth_error(
+                                StatusCode::FORBIDDEN,
+                                "principal lacks a required role",
+                            ));
                         }
                         request.extensions_mut().insert(Some(ctx));
                         return Ok(next.run(request).await);
@@ -175,14 +175,17 @@ impl CombinedAuth {
         // Fall back to API-key / master-key validation.
         match auth.api_key.authenticate(&token).await {
             Ok(Some(ctx)) => {
-                if let Err(code) = enforce_required_roles(&ctx) {
+                if enforce_required_roles(&ctx).is_err() {
                     auth.audit_failure(
                         AuditStatus::Forbidden,
                         "principal lacks a required role",
                         remote_ip,
                         Some(&ctx),
                     );
-                    return Err(code);
+                    return Err(auth_error(
+                        StatusCode::FORBIDDEN,
+                        "principal lacks a required role",
+                    ));
                 }
                 request.extensions_mut().insert(Some(ctx));
                 Ok(next.run(request).await)
@@ -195,14 +198,32 @@ impl CombinedAuth {
                     remote_ip,
                     None,
                 );
-                Err(StatusCode::UNAUTHORIZED)
+                Err(auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or missing bearer token",
+                ))
             }
             Err(()) => {
                 request.extensions_mut().insert(None::<AuthContext>);
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
+                Err(auth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error",
+                ))
             }
         }
     }
+}
+
+/// Auth failures use the same JSON error envelope as every other endpoint
+/// instead of an empty body.
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": "gateway_error" }
+        })),
+    )
+        .into_response()
 }
 
 /// A JWT is three non-empty base64url segments separated by dots. Gateway API
