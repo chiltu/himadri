@@ -110,25 +110,36 @@ impl RbacConfig {
         let mut providers: Option<Vec<String>> = Some(Vec::new());
 
         for p in policies {
-            match &p.models {
-                None => models = None,
-                Some(list) => {
-                    if let Some(acc) = models.as_mut() {
-                        acc.extend(list.iter().cloned());
-                    }
-                }
-            }
-            match &p.providers {
-                None => providers = None,
-                Some(list) => {
-                    if let Some(acc) = providers.as_mut() {
-                        acc.extend(list.iter().cloned());
-                    }
-                }
-            }
+            merge_dimension(&mut models, &p.models);
+            merge_dimension(&mut providers, &p.providers);
         }
 
         Some(EffectivePolicy { models, providers })
+    }
+
+    /// Check `value` against one policy dimension (models or providers),
+    /// selected by `select`, producing `deny(value)` when it isn't permitted.
+    /// Shared by [`check_model`](Self::check_model) and
+    /// [`check_provider`](Self::check_provider).
+    fn check_dimension(
+        &self,
+        roles: &[String],
+        is_admin: bool,
+        value: &str,
+        select: impl Fn(&EffectivePolicy) -> &Option<Vec<String>>,
+        deny: impl Fn(String) -> RbacDenial,
+    ) -> Result<(), RbacDenial> {
+        if !self.enabled || is_admin {
+            return Ok(());
+        }
+        let policy = self
+            .effective_policy(roles)
+            .ok_or(RbacDenial::NoMatchingRole)?;
+        match select(&policy) {
+            None => Ok(()),
+            Some(allowed) if any_match(allowed, value) => Ok(()),
+            Some(_) => Err(deny(value.to_string())),
+        }
     }
 
     /// Check whether the principal (identified by `roles`) may use `model`.
@@ -139,17 +150,13 @@ impl RbacConfig {
         is_admin: bool,
         model: &str,
     ) -> Result<(), RbacDenial> {
-        if !self.enabled || is_admin {
-            return Ok(());
-        }
-        let policy = self
-            .effective_policy(roles)
-            .ok_or(RbacDenial::NoMatchingRole)?;
-        match &policy.models {
-            None => Ok(()),
-            Some(allowed) if any_match(allowed, model) => Ok(()),
-            Some(_) => Err(RbacDenial::ModelForbidden(model.to_string())),
-        }
+        self.check_dimension(
+            roles,
+            is_admin,
+            model,
+            |p| &p.models,
+            RbacDenial::ModelForbidden,
+        )
     }
 
     /// Check whether the principal may route to `provider`.
@@ -159,16 +166,25 @@ impl RbacConfig {
         is_admin: bool,
         provider: &str,
     ) -> Result<(), RbacDenial> {
-        if !self.enabled || is_admin {
-            return Ok(());
-        }
-        let policy = self
-            .effective_policy(roles)
-            .ok_or(RbacDenial::NoMatchingRole)?;
-        match &policy.providers {
-            None => Ok(()),
-            Some(allowed) if any_match(allowed, provider) => Ok(()),
-            Some(_) => Err(RbacDenial::ProviderForbidden(provider.to_string())),
+        self.check_dimension(
+            roles,
+            is_admin,
+            provider,
+            |p| &p.providers,
+            RbacDenial::ProviderForbidden,
+        )
+    }
+}
+
+/// Union one dimension's allow-list into `acc`: `None` (unrestricted) wins and
+/// makes the dimension unrestricted; otherwise the patterns are concatenated.
+fn merge_dimension(acc: &mut Option<Vec<String>>, item: &Option<Vec<String>>) {
+    match item {
+        None => *acc = None,
+        Some(list) => {
+            if let Some(a) = acc.as_mut() {
+                a.extend(list.iter().cloned());
+            }
         }
     }
 }

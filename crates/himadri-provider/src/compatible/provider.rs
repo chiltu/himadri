@@ -6,9 +6,7 @@ use tracing::{debug, instrument};
 use crate::error::ProviderError;
 use crate::http_client::CLIENT_POOL;
 use crate::traits::{BoxStream, Provider};
-use himadri_core::{
-    ChatCompletionRequest, ChatCompletionResponse, ContentPart, MessageContent, StreamChunk,
-};
+use himadri_core::{ChatCompletionRequest, ChatCompletionResponse, StreamChunk};
 
 /// Authentication method for OpenAI-compatible providers.
 #[derive(Debug, Clone)]
@@ -109,98 +107,18 @@ impl OpenAiCompatibleProvider {
         request: &ChatCompletionRequest,
         stream: bool,
     ) -> serde_json::Value {
-        let messages: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                let mut msg = serde_json::json!({
-                    "role": match m.role {
-                        himadri_core::Role::System => "system",
-                        himadri_core::Role::User => "user",
-                        himadri_core::Role::Assistant => "assistant",
-                        himadri_core::Role::Tool => "tool",
-                    },
-                });
-
-                if let Some(content) = &m.content {
-                    match content {
-                        MessageContent::Text(text) => {
-                            msg["content"] = serde_json::Value::String(text.clone());
-                        }
-                        MessageContent::Parts(parts) => {
-                            let content_parts: Vec<serde_json::Value> = parts
-                                .iter()
-                                .map(|p| match p {
-                                    ContentPart::Text { text } => {
-                                        serde_json::json!({
-                                            "type": "text",
-                                            "text": text
-                                        })
-                                    }
-                                    ContentPart::ImageUrl { image_url } => {
-                                        serde_json::json!({
-                                            "type": "image_url",
-                                            "image_url": {
-                                                "url": image_url.url,
-                                                "detail": image_url.detail
-                                            }
-                                        })
-                                    }
-                                })
-                                .collect();
-                            msg["content"] = serde_json::Value::Array(content_parts);
-                        }
-                    }
-                }
-
-                if let Some(name) = &m.name {
-                    msg["name"] = serde_json::Value::String(name.clone());
-                }
-
-                msg
-            })
-            .collect();
-
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "stream": stream,
-        });
-
+        // `ChatCompletionRequest` already serializes to the OpenAI wire shape
+        // (lowercase roles, untagged text/parts content, tools, and — via the
+        // flattened `extra` map — any passthrough params). Serializing it
+        // directly forwards `tool_calls`/`tool_call_id` and passthrough params
+        // that the previous hand-built body silently dropped.
+        let mut body = serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({}));
+        body["stream"] = serde_json::Value::Bool(stream);
         if stream {
             // Ask for usage in the final chunk (OpenAI streaming sends none
             // otherwise), so the gateway can meter streamed requests.
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
-
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if let Some(top_p) = request.top_p {
-            body["top_p"] = serde_json::json!(top_p);
-        }
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
-        if let Some(stop) = &request.stop {
-            body["stop"] = serde_json::json!(stop);
-        }
-        if let Some(presence_penalty) = request.presence_penalty {
-            body["presence_penalty"] = serde_json::json!(presence_penalty);
-        }
-        if let Some(frequency_penalty) = request.frequency_penalty {
-            body["frequency_penalty"] = serde_json::json!(frequency_penalty);
-        }
-        if let Some(user) = &request.user {
-            body["user"] = serde_json::Value::String(user.clone());
-        }
-        if let Some(tools) = &request.tools {
-            body["tools"] = serde_json::json!(tools);
-        }
-        if let Some(tool_choice) = &request.tool_choice {
-            body["tool_choice"] = tool_choice.clone();
-        }
-
         body
     }
 
@@ -229,6 +147,35 @@ impl OpenAiCompatibleProvider {
 
     async fn handle_error(&self, response: reqwest::Response) -> ProviderError {
         ProviderError::from_openai_response(response).await
+    }
+
+    /// POST `body` as JSON to `url` with the provider's auth + extra headers,
+    /// returning the response on 2xx or a mapped `ProviderError` otherwise.
+    /// Shared by `complete` / `complete_stream` / `embed`.
+    async fn send<T: serde::Serialize + ?Sized>(
+        &self,
+        client: &reqwest::Client,
+        url: String,
+        api_key: &str,
+        body: &T,
+        streaming: bool,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let (auth_name, auth_value) = self.build_auth_header(api_key);
+        let mut req = client
+            .post(url)
+            .header(&auth_name, &auth_value)
+            .header("Content-Type", "application/json");
+        if streaming {
+            req = req.header("Accept", "text/event-stream");
+        }
+        for (name, value) in &self.config.extra_headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
+        let response = req.json(body).send().await?;
+        if !response.status().is_success() {
+            return Err(self.handle_error(response).await);
+        }
+        Ok(response)
     }
 
     fn build_auth_header(&self, api_key: &str) -> (String, String) {
@@ -275,22 +222,9 @@ impl Provider for OpenAiCompatibleProvider {
 
         debug!("Sending request to {}", self.config.display_name);
 
-        let (auth_header_name, auth_header_value) = self.build_auth_header(api_key);
-
-        let mut req_builder = client
-            .post(self.get_url())
-            .header(&auth_header_name, &auth_header_value)
-            .header("Content-Type", "application/json");
-
-        for (name, value) in &self.config.extra_headers {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
-        }
-
-        let response = req_builder.json(&body).send().await?;
-
-        if !response.status().is_success() {
-            return Err(self.handle_error(response).await);
-        }
+        let response = self
+            .send(&client, self.get_url(), api_key, &body, false)
+            .await?;
 
         let response_body: serde_json::Value = response.json().await?;
         self.parse_response(response_body)
@@ -307,23 +241,9 @@ impl Provider for OpenAiCompatibleProvider {
 
         debug!("Sending streaming request to {}", self.config.display_name);
 
-        let (auth_header_name, auth_header_value) = self.build_auth_header(api_key);
-
-        let mut req_builder = client
-            .post(self.get_url())
-            .header(&auth_header_name, &auth_header_value)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-
-        for (name, value) in &self.config.extra_headers {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
-        }
-
-        let response = req_builder.json(&body).send().await?;
-
-        if !response.status().is_success() {
-            return Err(self.handle_error(response).await);
-        }
+        let response = self
+            .send(&client, self.get_url(), api_key, &body, true)
+            .await?;
 
         let provider = self.clone();
         let stream = crate::sse::sse_events(response.bytes_stream())
@@ -339,22 +259,9 @@ impl Provider for OpenAiCompatibleProvider {
         api_key: &str,
     ) -> Result<himadri_core::EmbeddingResponse, ProviderError> {
         let client = CLIENT_POOL.for_provider(&self.config.name);
-        let (auth_header_name, auth_header_value) = self.build_auth_header(api_key);
-
-        let mut req_builder = client
-            .post(self.get_embeddings_url())
-            .header(&auth_header_name, &auth_header_value)
-            .header("Content-Type", "application/json");
-
-        for (name, value) in &self.config.extra_headers {
-            req_builder = req_builder.header(name.as_str(), value.as_str());
-        }
-
-        let response = req_builder.json(request).send().await?;
-
-        if !response.status().is_success() {
-            return Err(self.handle_error(response).await);
-        }
+        let response = self
+            .send(&client, self.get_embeddings_url(), api_key, request, false)
+            .await?;
 
         response
             .json::<himadri_core::EmbeddingResponse>()
@@ -366,145 +273,150 @@ impl Provider for OpenAiCompatibleProvider {
 // ─── Pre-configured Providers ────────────────────────────────────────
 
 impl OpenAiCompatibleConfig {
-    pub fn openai() -> Self {
+    /// Build a Bearer-auth preset at the standard `/chat/completions` path.
+    /// The vendor presets below differ only in name, URL, extra headers, and
+    /// advertised model list.
+    fn preset(
+        name: &str,
+        display_name: &str,
+        base_url: &str,
+        extra_headers: Vec<(String, String)>,
+        models: &[&str],
+    ) -> Self {
         Self {
-            name: "openai".to_string(),
-            display_name: "OpenAI".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
+            name: name.to_string(),
+            display_name: display_name.to_string(),
+            base_url: base_url.to_string(),
             auth_method: AuthMethod::Bearer,
             chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec![
-                "gpt-4".to_string(),
-                "gpt-4-turbo".to_string(),
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "gpt-3.5-turbo".to_string(),
-                "o1".to_string(),
-                "o1-mini".to_string(),
-                "o1-pro".to_string(),
-            ],
+            extra_headers,
+            models: models.iter().map(|m| m.to_string()).collect(),
         }
     }
 
+    pub fn openai() -> Self {
+        Self::preset(
+            "openai",
+            "OpenAI",
+            "https://api.openai.com/v1",
+            vec![],
+            &[
+                "gpt-4",
+                "gpt-4-turbo",
+                "gpt-4o",
+                "gpt-4o-mini",
+                "gpt-3.5-turbo",
+                "o1",
+                "o1-mini",
+                "o1-pro",
+            ],
+        )
+    }
+
     pub fn openrouter() -> Self {
-        Self {
-            name: "openrouter".to_string(),
-            display_name: "OpenRouter".to_string(),
-            base_url: "https://openrouter.ai/api/v1".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![
+        Self::preset(
+            "openrouter",
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            vec![
                 (
                     "HTTP-Referer".to_string(),
                     "https://github.com/himadri".to_string(),
                 ),
                 ("X-Title".to_string(), "himadri".to_string()),
             ],
-            models: vec![
-                "openrouter/auto".to_string(),
-                "openai/gpt-4o".to_string(),
-                "anthropic/claude-3.5-sonnet".to_string(),
-                "google/gemini-2.0-flash".to_string(),
+            &[
+                "openrouter/auto",
+                "openai/gpt-4o",
+                "anthropic/claude-3.5-sonnet",
+                "google/gemini-2.0-flash",
             ],
-        }
+        )
     }
 
     pub fn together_ai() -> Self {
-        Self {
-            name: "together".to_string(),
-            display_name: "Together AI".to_string(),
-            base_url: "https://api.together.xyz/v1".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec![
-                "meta-llama/Llama-3-70b-chat-hf".to_string(),
-                "meta-llama/Llama-3-8b-chat-hf".to_string(),
-                "mistralai/Mixtral-8x7B-Instruct-v0.1".to_string(),
+        Self::preset(
+            "together",
+            "Together AI",
+            "https://api.together.xyz/v1",
+            vec![],
+            &[
+                "meta-llama/Llama-3-70b-chat-hf",
+                "meta-llama/Llama-3-8b-chat-hf",
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
             ],
-        }
+        )
     }
 
     pub fn groq() -> Self {
-        Self {
-            name: "groq".to_string(),
-            display_name: "Groq".to_string(),
-            base_url: "https://api.groq.com/openai/v1".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec![
-                "llama3-70b-8192".to_string(),
-                "llama3-8b-8192".to_string(),
-                "mixtral-8x7b-32768".to_string(),
-                "gemma-7b-it".to_string(),
+        Self::preset(
+            "groq",
+            "Groq",
+            "https://api.groq.com/openai/v1",
+            vec![],
+            &[
+                "llama3-70b-8192",
+                "llama3-8b-8192",
+                "mixtral-8x7b-32768",
+                "gemma-7b-it",
             ],
-        }
+        )
     }
 
     pub fn fireworks() -> Self {
-        Self {
-            name: "fireworks".to_string(),
-            display_name: "Fireworks AI".to_string(),
-            base_url: "https://api.fireworks.ai/inference/v1".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec![
-                "accounts/fireworks/models/llama-v3p1-70b-instruct".to_string(),
-                "accounts/fireworks/models/mixtral-8x7b-instruct".to_string(),
+        Self::preset(
+            "fireworks",
+            "Fireworks AI",
+            "https://api.fireworks.ai/inference/v1",
+            vec![],
+            &[
+                "accounts/fireworks/models/llama-v3p1-70b-instruct",
+                "accounts/fireworks/models/mixtral-8x7b-instruct",
             ],
-        }
+        )
     }
 
     pub fn deepinfra() -> Self {
-        Self {
-            name: "deepinfra".to_string(),
-            display_name: "DeepInfra".to_string(),
-            base_url: "https://api.deepinfra.com/v1/openai".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec![
-                "meta-llama/Meta-Llama-3-70B-Instruct".to_string(),
-                "mistralai/Mixtral-8x7B-Instruct-v0.1".to_string(),
+        Self::preset(
+            "deepinfra",
+            "DeepInfra",
+            "https://api.deepinfra.com/v1/openai",
+            vec![],
+            &[
+                "meta-llama/Meta-Llama-3-70B-Instruct",
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
             ],
-        }
+        )
     }
 
     pub fn cerebras() -> Self {
-        Self {
-            name: "cerebras".to_string(),
-            display_name: "Cerebras".to_string(),
-            base_url: "https://api.cerebras.ai/v1".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec!["llama3.1-70b".to_string(), "llama3.1-8b".to_string()],
-        }
+        Self::preset(
+            "cerebras",
+            "Cerebras",
+            "https://api.cerebras.ai/v1",
+            vec![],
+            &["llama3.1-70b", "llama3.1-8b"],
+        )
     }
 
     pub fn novita() -> Self {
-        Self {
-            name: "novita".to_string(),
-            display_name: "Novita AI".to_string(),
-            base_url: "https://api.novita.ai/v3/openai".to_string(),
-            auth_method: AuthMethod::Bearer,
-            chat_completions_path: "/chat/completions".to_string(),
-            extra_headers: vec![],
-            models: vec![
-                "meta-llama/llama-3.1-70b-instruct".to_string(),
-                "meta-llama/llama-3.1-8b-instruct".to_string(),
+        Self::preset(
+            "novita",
+            "Novita AI",
+            "https://api.novita.ai/v3/openai",
+            vec![],
+            &[
+                "meta-llama/llama-3.1-70b-instruct",
+                "meta-llama/llama-3.1-8b-instruct",
             ],
-        }
+        )
     }
 }
 
 #[cfg(test)]
 mod tool_tests {
     use super::*;
-    use himadri_core::{Message, Role, Tool, ToolFunction};
+    use himadri_core::{Message, MessageContent, Role, Tool, ToolFunction};
 
     fn provider() -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(OpenAiCompatibleConfig::openai())
@@ -513,21 +425,7 @@ mod tool_tests {
     fn request_with_tools() -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "gpt-4o".to_string(),
-            messages: vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("What is the weather?".to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            user: None,
+            messages: vec![Message::user("What is the weather?")],
             tools: Some(vec![Tool {
                 tool_type: "function".to_string(),
                 function: ToolFunction {
@@ -540,7 +438,7 @@ mod tool_tests {
                 },
             }]),
             tool_choice: Some(serde_json::json!("auto")),
-            extra: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -550,6 +448,59 @@ mod tool_tests {
         assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn build_request_body_forwards_tool_calls_and_passthrough_params() {
+        // Regression (R1): the previous hand-built body dropped assistant
+        // `tool_calls`, `role: tool` `tool_call_id`, and everything in the
+        // flattened `extra` map (response_format, seed, n, …).
+        let mut request = ChatCompletionRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    tool_calls: Some(vec![himadri_core::ToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: himadri_core::FunctionCall {
+                            name: "get_weather".to_string(),
+                            arguments: "{\"city\":\"Paris\"}".to_string(),
+                        },
+                    }]),
+                    ..Default::default()
+                },
+                Message {
+                    role: Role::Tool,
+                    content: Some(MessageContent::text("sunny")),
+                    tool_call_id: Some("call_1".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        request.extra.insert(
+            "response_format".to_string(),
+            serde_json::json!({ "type": "json_object" }),
+        );
+        request
+            .extra
+            .insert("seed".to_string(), serde_json::json!(42));
+
+        let body = provider().build_request_body(&request, false);
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["id"], "call_1",
+            "assistant tool_calls must survive"
+        );
+        assert_eq!(
+            body["messages"][1]["tool_call_id"], "call_1",
+            "tool message tool_call_id must survive"
+        );
+        assert_eq!(
+            body["response_format"]["type"], "json_object",
+            "passthrough extra params must survive"
+        );
+        assert_eq!(body["seed"], 42);
     }
 
     #[test]

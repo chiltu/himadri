@@ -10,16 +10,28 @@ pub struct AdminHandlers {
     store: StoreBackend,
     provider_store: Option<ProviderStoreBackend>,
     model_store: Option<ModelStoreBackend>,
-    _master_key: Option<String>,
+}
+
+/// Log a store error — otherwise swallowed by the `Option`/`bool` return of the
+/// handler methods — so an operator can see *why* a provider/model mutation
+/// failed (a DB outage, or a validation reason like "provider has models")
+/// instead of only a bare 404/500, then discard it.
+fn logged<T>(op: &str, result: Result<T, String>) -> Option<T> {
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("{op} failed: {e}");
+            None
+        }
+    }
 }
 
 impl AdminHandlers {
-    pub fn new(store: StoreBackend, master_key: Option<String>) -> Self {
+    pub fn new(store: StoreBackend) -> Self {
         Self {
             store,
             provider_store: None,
             model_store: None,
-            _master_key: master_key,
         }
     }
 
@@ -98,7 +110,7 @@ impl AdminHandlers {
             }
         }
         match &self.provider_store {
-            Some(s) => s.create(request).await.ok(),
+            Some(s) => logged("create_provider", s.create(request).await),
             None => None,
         }
     }
@@ -126,21 +138,21 @@ impl AdminHandlers {
             }
         }
         match &self.provider_store {
-            Some(s) => s.update(id, request).await.ok().flatten(),
+            Some(s) => logged("update_provider", s.update(id, request).await).flatten(),
             None => None,
         }
     }
 
     pub async fn delete_provider(&self, id: &str) -> bool {
         match &self.provider_store {
-            Some(s) => s.delete(id).await.unwrap_or(false),
+            Some(s) => logged("delete_provider", s.delete(id).await).unwrap_or(false),
             None => false,
         }
     }
 
     pub async fn toggle_provider(&self, id: &str, enabled: bool) -> Option<Provider> {
         match &self.provider_store {
-            Some(s) => s.toggle(id, enabled).await.ok().flatten(),
+            Some(s) => logged("toggle_provider", s.toggle(id, enabled).await).flatten(),
             None => None,
         }
     }
@@ -170,7 +182,7 @@ impl AdminHandlers {
 
     pub async fn create_model(&self, request: CreateModelRequest) -> Option<Model> {
         match &self.model_store {
-            Some(s) => s.create(request).await.ok(),
+            Some(s) => logged("create_model", s.create(request).await),
             None => None,
         }
     }
@@ -184,21 +196,21 @@ impl AdminHandlers {
 
     pub async fn update_model(&self, id: &str, request: UpdateModelRequest) -> Option<Model> {
         match &self.model_store {
-            Some(s) => s.update(id, request).await.ok().flatten(),
+            Some(s) => logged("update_model", s.update(id, request).await).flatten(),
             None => None,
         }
     }
 
     pub async fn delete_model(&self, id: &str) -> bool {
         match &self.model_store {
-            Some(s) => s.delete(id).await.unwrap_or(false),
+            Some(s) => logged("delete_model", s.delete(id).await).unwrap_or(false),
             None => false,
         }
     }
 
     pub async fn toggle_model(&self, id: &str, enabled: bool) -> Option<Model> {
         match &self.model_store {
-            Some(s) => s.toggle(id, enabled).await.ok().flatten(),
+            Some(s) => logged("toggle_model", s.toggle(id, enabled).await).flatten(),
             None => None,
         }
     }

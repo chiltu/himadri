@@ -47,7 +47,7 @@ pub use usage_store::{
 };
 
 #[cfg(feature = "postgres")]
-pub use postgres_backends::{PostgresConfigStore, PostgresRequestLogStore, PostgresUsageStore};
+pub use postgres_backends::PostgresRequestLogStore;
 #[cfg(feature = "postgres")]
 pub use postgres_provider_store::{PgModelStore, PgProviderStore};
 

@@ -6,6 +6,6 @@ pub mod types;
 
 pub use config::*;
 pub use error::{ConfigError, GatewayError};
-pub use net_guard::{allow_private_provider_urls, provider_url_is_allowed};
+pub use net_guard::{allow_private_provider_urls, ip_is_internal, provider_url_is_allowed};
 pub use rbac::RbacDenial;
 pub use types::*;

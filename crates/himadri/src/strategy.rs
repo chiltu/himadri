@@ -175,7 +175,7 @@ impl Strategy {
     }
 
     /// Test-only convenience: the routing path uses `from_strategy_config`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_latency_store(mode: StrategyMode, store: Arc<dyn LatencyStore>) -> Self {
         match mode {
             StrategyMode::LeastLatency => Strategy::LeastLatency(LeastLatencyState { store }),
@@ -183,96 +183,16 @@ impl Strategy {
         }
     }
 
-    /// Select a single primary target. Retained for tests and callers that do
-    /// not need failover; the routing path uses [`Strategy::select_ordered`].
-    #[allow(dead_code)]
+    /// Select a single primary target. The primary is defined as the first
+    /// element of [`Strategy::select_ordered`], so the two can never diverge.
+    /// Retained for tests and callers that don't need the failover tail.
+    #[cfg(test)]
     pub async fn select(
         &self,
         request: &ChatCompletionRequest,
         targets: &[Target],
     ) -> Result<Target, GatewayError> {
-        if targets.is_empty() {
-            return Err(GatewayError::Internal("No targets configured".to_string()));
-        }
-
-        match self {
-            Strategy::Single => Ok(targets[0].clone()),
-            Strategy::Fallback => Ok(targets[0].clone()),
-            Strategy::LoadBalance => {
-                let total_weight: f64 = targets.iter().map(|t| t.weight.max(0.0)).sum();
-                // All-zero weights would make gen_range panic on an empty
-                // range; treat them as uniform instead.
-                if total_weight <= 0.0 {
-                    let idx = rand::thread_rng().gen_range(0..targets.len());
-                    return Ok(targets[idx].clone());
-                }
-                let mut rng = rand::thread_rng();
-                let mut random = rng.gen_range(0.0..total_weight);
-
-                for target in targets {
-                    random -= target.weight.max(0.0);
-                    if random <= 0.0 {
-                        return Ok(target.clone());
-                    }
-                }
-
-                Ok(targets
-                    .last()
-                    .cloned()
-                    .expect("targets checked non-empty above"))
-            }
-            Strategy::LeastLatency(state) => {
-                let mut best_target = None;
-                let mut best_latency = u64::MAX;
-
-                for target in targets {
-                    let avg = state.store.get_avg_latency(&target.provider).await;
-                    if avg <= best_latency {
-                        best_latency = avg;
-                        best_target = Some(target.clone());
-                    }
-                }
-
-                best_target.ok_or_else(|| GatewayError::Internal("No targets".to_string()))
-            }
-            Strategy::CostOptimized => {
-                // For now, use weight as cost indicator (lower = cheaper)
-                targets
-                    .iter()
-                    .min_by(|a, b| {
-                        a.weight
-                            .partial_cmp(&b.weight)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .cloned()
-                    .ok_or_else(|| GatewayError::Internal("No targets".to_string()))
-            }
-            Strategy::Conditional(config) => {
-                for rule in &config.rules {
-                    if Self::matches_condition(rule, request) {
-                        return Ok(rule.target.clone());
-                    }
-                }
-                config
-                    .fallback
-                    .clone()
-                    .or_else(|| targets.first().cloned())
-                    .ok_or_else(|| GatewayError::Internal("No targets".to_string()))
-            }
-            Strategy::ContentBased(config) => {
-                for rule in &config.rules {
-                    if Self::matches_content_rule(rule, request) {
-                        return Ok(rule.target.clone());
-                    }
-                }
-                config
-                    .fallback
-                    .clone()
-                    .or_else(|| targets.first().cloned())
-                    .ok_or_else(|| GatewayError::Internal("No targets".to_string()))
-            }
-            Strategy::ABTest(config) => Self::select_ab_test_variant(config, targets),
-        }
+        Ok(self.select_ordered(request, targets).await?.remove(0))
     }
 
     /// Select targets in priority order for failover.

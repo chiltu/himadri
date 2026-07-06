@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 /// Request log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,15 +52,22 @@ pub trait RequestLogStore: Send + Sync {
     fn count(&self) -> usize;
 }
 
-/// In-memory request log store
+/// Upper bound on retained in-memory request-log entries. Past this, the
+/// oldest entries are evicted so a long-running gateway can't leak memory
+/// linearly with traffic. (Durable retention is the Postgres store's job.)
+const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+/// In-memory request log store. Bounded ring: eviction is oldest-first.
 pub struct InMemoryRequestLogStore {
-    entries: RwLock<Vec<RequestLogEntry>>,
+    entries: RwLock<VecDeque<RequestLogEntry>>,
+    max_entries: usize,
 }
 
 impl InMemoryRequestLogStore {
     pub fn new() -> Self {
         Self {
-            entries: RwLock::new(Vec::new()),
+            entries: RwLock::new(VecDeque::new()),
+            max_entries: DEFAULT_MAX_ENTRIES,
         }
     }
 }
@@ -67,7 +75,10 @@ impl InMemoryRequestLogStore {
 impl RequestLogStore for InMemoryRequestLogStore {
     fn write(&self, entry: RequestLogEntry) -> Result<(), String> {
         let mut entries = self.entries.write();
-        entries.push(entry);
+        entries.push_back(entry);
+        while entries.len() > self.max_entries {
+            entries.pop_front();
+        }
         Ok(())
     }
 

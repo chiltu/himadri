@@ -26,14 +26,9 @@ pub(crate) fn hash_api_key(key: &str) -> String {
 /// so the original secret cannot be shown again after creation; expose a
 /// short stable identifier derived from the stored value instead.
 pub(crate) fn masked_key_display(stored: &str) -> String {
-    let tail: String = stored
-        .chars()
-        .rev()
-        .take(6)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
+    // Stored values are ASCII (a `sha256:` hex hash, or a legacy plaintext
+    // key), so the last 6 bytes are the last 6 characters.
+    let tail = &stored[stored.len().saturating_sub(6)..];
     format!("sk-****{}", tail)
 }
 
@@ -77,22 +72,13 @@ pub struct ApiKey {
     pub token_budget: Option<TokenBudget>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RateLimitOverride {
-    pub requests_per_second: Option<u64>,
-    pub burst_size: Option<u64>,
-}
+// These were field-for-field duplicates of the core config types; alias them
+// so there's one definition (and no per-boundary conversion — see
+// `middleware::AuthMiddleware::authenticate`).
+pub use himadri_core::OrgTokenBudget as TokenBudget;
+pub use himadri_core::RateLimitOverride;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenBudget {
-    pub max_tokens_per_request: Option<u32>,
-    pub max_tokens_per_day: Option<u64>,
-    pub max_tokens_per_month: Option<u64>,
-    pub cost_limit_per_day: Option<f64>,
-    pub cost_limit_per_month: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateApiKeyRequest {
     pub name: String,
     #[serde(default)]
@@ -143,6 +129,21 @@ pub struct UpdateApiKeyRequest {
 
 // ─── StoreBackend (abstraction over Memory/Postgres) ─────────────────
 
+/// Dispatch a method to the active backend: the in-memory store is
+/// synchronous and infallible (wrapped in `Ok`), the SQL stores are async and
+/// map their `sqlx::Error` to a `String`. Adding a store method is one line.
+macro_rules! store_dispatch {
+    ($self:expr, $method:ident ( $($arg:expr),* )) => {
+        match $self {
+            StoreBackend::Memory(store) => Ok(store.$method($($arg),*)),
+            #[cfg(feature = "postgres")]
+            StoreBackend::Postgres(store) => store.$method($($arg),*).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "sqlite")]
+            StoreBackend::Sqlite(store) => store.$method($($arg),*).await.map_err(|e| e.to_string()),
+        }
+    };
+}
+
 #[derive(Clone)]
 pub enum StoreBackend {
     Memory(Arc<ApiKeyStore>),
@@ -191,33 +192,15 @@ impl StoreBackend {
     }
 
     pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.create(request)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.create(request).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.create(request).await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, create(request))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<ApiKey>, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.get(id)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.get(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.get(id).await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, get(id))
     }
 
     pub async fn list(&self) -> Result<Vec<ApiKey>, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.list()),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.list().await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.list().await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, list())
     }
 
     pub async fn update(
@@ -225,57 +208,23 @@ impl StoreBackend {
         id: &str,
         request: UpdateApiKeyRequest,
     ) -> Result<Option<ApiKey>, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.update(id, request)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => {
-                store.update(id, request).await.map_err(|e| e.to_string())
-            }
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => {
-                store.update(id, request).await.map_err(|e| e.to_string())
-            }
-        }
+        store_dispatch!(self, update(id, request))
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.delete(id)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.delete(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.delete(id).await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, delete(id))
     }
 
     pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.validate(key)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.validate(key).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.validate(key).await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, validate(key))
     }
 
     pub async fn revoke(&self, id: &str) -> Result<bool, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.revoke(id)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.revoke(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.revoke(id).await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, revoke(id))
     }
 
     pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, String> {
-        match self {
-            StoreBackend::Memory(store) => Ok(store.rotate(id)),
-            #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.rotate(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.rotate(id).await.map_err(|e| e.to_string()),
-        }
+        store_dispatch!(self, rotate(id))
     }
 
     pub fn is_empty(&self) -> bool {

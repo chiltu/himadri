@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Per-request usage record
@@ -74,18 +75,68 @@ pub struct ModelPricing {
     pub output_per_m_tokens: f64,
 }
 
-/// In-memory usage store
+/// Upper bound on retained in-memory usage records. Past this, the oldest
+/// records are evicted so a long-running gateway can't leak memory linearly
+/// with traffic. (Durable retention is the Postgres path's job.)
+const DEFAULT_MAX_RECORDS: usize = 100_000;
+
+/// Turn a `key -> (requests, tokens, cost)` aggregation into the top-`n`
+/// rows by request count, mapping each into the caller's row type. Shared by
+/// the by-model and by-provider dashboard breakdowns.
+fn top_n<T>(
+    stats: std::collections::HashMap<String, (u64, u64, f64)>,
+    n: usize,
+    make: impl Fn(String, u64, u64, f64) -> T,
+) -> Vec<T> {
+    let mut items: Vec<(String, (u64, u64, f64))> = stats.into_iter().collect();
+    items.sort_by_key(|(_, (requests, _, _))| std::cmp::Reverse(*requests));
+    items
+        .into_iter()
+        .take(n)
+        .map(|(key, (requests, tokens, cost))| make(key, requests, tokens, cost))
+        .collect()
+}
+
+/// In-memory usage store. Records are held in insertion order in a bounded
+/// ring so eviction is oldest-first and "recent" queries are meaningful.
 pub struct UsageStore {
-    records: Arc<dashmap::DashMap<String, UsageRecord>>,
+    records: Arc<RwLock<VecDeque<UsageRecord>>>,
+    max_records: usize,
     pricing: Arc<Vec<ModelPricing>>,
 }
 
 impl UsageStore {
     pub fn new() -> Self {
         Self {
-            records: Arc::new(DashMap::new()),
-            pricing: Arc::new(Self::default_pricing()),
+            records: Arc::new(RwLock::new(VecDeque::new())),
+            max_records: DEFAULT_MAX_RECORDS,
+            pricing: Arc::new(Self::load_pricing()),
         }
+    }
+
+    /// Built-in pricing, optionally overridden/extended via the
+    /// `PRICING_TABLE` env var (a JSON array of
+    /// `{model, input_per_m_tokens, output_per_m_tokens}`). An entry replaces
+    /// the built-in for a matching model and adds otherwise — so an operator
+    /// can price a model the defaults don't know (which would otherwise cost
+    /// `$0` silently) without a code change.
+    fn load_pricing() -> Vec<ModelPricing> {
+        let mut pricing = Self::default_pricing();
+        let Ok(raw) = std::env::var("PRICING_TABLE") else {
+            return pricing;
+        };
+        match serde_json::from_str::<Vec<ModelPricing>>(&raw) {
+            Ok(overrides) => {
+                for entry in overrides {
+                    match pricing.iter_mut().find(|p| p.model == entry.model) {
+                        Some(existing) => *existing = entry,
+                        None => pricing.push(entry),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("PRICING_TABLE is set but is not valid JSON: {e}"),
+        }
+        pricing
     }
 
     fn default_pricing() -> Vec<ModelPricing> {
@@ -138,9 +189,13 @@ impl UsageStore {
         ]
     }
 
-    /// Record a request
+    /// Record a request, evicting the oldest entries past the cap.
     pub fn record(&self, record: UsageRecord) {
-        self.records.insert(record.request_id.clone(), record);
+        let mut records = self.records.write();
+        records.push_back(record);
+        while records.len() > self.max_records {
+            records.pop_front();
+        }
     }
 
     /// Calculate cost for a request
@@ -167,7 +222,7 @@ impl UsageStore {
         let mut last_request = None;
         let mut models_used = std::collections::HashSet::new();
 
-        for record in self.records.iter() {
+        for record in self.records.read().iter() {
             if record.api_key_id.as_deref() == Some(api_key_id) {
                 total_requests += 1;
                 if record.success {
@@ -217,7 +272,8 @@ impl UsageStore {
         let mut provider_stats: std::collections::HashMap<String, (u64, u64, f64)> =
             std::collections::HashMap::new();
 
-        for record in self.records.iter() {
+        let records = self.records.read();
+        for record in records.iter() {
             total_requests += 1;
             total_tokens += record.total_tokens as u64;
             total_cost += record.cost_usd;
@@ -241,36 +297,32 @@ impl UsageStore {
             pentry.2 += record.cost_usd;
         }
 
-        let mut top_models: Vec<ModelUsage> = model_stats
-            .into_iter()
-            .map(|(model, (requests, tokens, cost))| ModelUsage {
+        let top_models = top_n(model_stats, 10, |model, requests, tokens, cost_usd| {
+            ModelUsage {
                 model,
                 requests,
                 tokens,
-                cost_usd: cost,
-            })
-            .collect();
-        top_models.sort_by_key(|b| std::cmp::Reverse(b.requests));
-        top_models.truncate(10);
-
-        let mut top_providers: Vec<ProviderUsage> = provider_stats
-            .into_iter()
-            .map(|(provider, (requests, tokens, cost))| ProviderUsage {
+                cost_usd,
+            }
+        });
+        let top_providers = top_n(
+            provider_stats,
+            10,
+            |provider, requests, tokens, cost_usd| ProviderUsage {
                 provider,
                 requests,
                 tokens,
-                cost_usd: cost,
-            })
-            .collect();
-        top_providers.sort_by_key(|b| std::cmp::Reverse(b.requests));
-        top_providers.truncate(10);
+                cost_usd,
+            },
+        );
 
-        let recent_errors: Vec<UsageRecord> = self
-            .records
+        // Most-recent-first: records are held oldest→newest, so walk the tail.
+        let recent_errors: Vec<UsageRecord> = records
             .iter()
+            .rev()
             .filter(|r| !r.success)
             .take(10)
-            .map(|r| r.value().clone())
+            .cloned()
             .collect();
 
         DashboardSummary {
@@ -296,7 +348,7 @@ impl UsageStore {
 
     /// Get total record count
     pub fn count(&self) -> usize {
-        self.records.len()
+        self.records.read().len()
     }
 }
 
@@ -337,6 +389,17 @@ mod tests {
         assert_eq!(stats.total_requests, 2);
         assert_eq!(stats.total_tokens, 300);
         assert!((stats.total_cost_usd - 0.03).abs() < 0.001);
+    }
+
+    #[test]
+    fn records_are_bounded_and_evict_oldest() {
+        // Regression (R4): the record set used to grow without bound.
+        let mut store = UsageStore::new();
+        store.max_records = 3;
+        for i in 0..5 {
+            store.record(make_record(&format!("m{i}"), "openai", 10, 0.0));
+        }
+        assert_eq!(store.count(), 3, "old records must be evicted past the cap");
     }
 
     #[test]

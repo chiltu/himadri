@@ -164,16 +164,17 @@ impl AuditLog {
     }
 
     async fn write_loop(dir: PathBuf, mut receiver: mpsc::Receiver<AuditEvent>) {
+        // Create the directory once up front rather than on every event; if
+        // it fails, per-event opens below will surface the error.
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            warn!("Failed to create audit log dir {}: {}", dir.display(), e);
+        }
+
         while let Some(event) = receiver.recv().await {
             let line = match serde_json::to_string(&event) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
-
-            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                warn!("Failed to create audit log dir: {}", e);
-                continue;
-            }
 
             use tokio::io::AsyncWriteExt;
             let path = dir.join(format!("{}.jsonl", event.timestamp.format("%Y-%m-%d")));

@@ -8,7 +8,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::store::StoreBackend;
-use himadri_core::{AuthContext, AuthScope, RateLimitOverride};
+use himadri_core::{AuthContext, AuthScope};
 
 /// Constant-time byte comparison to prevent timing side-channel attacks.
 /// Returns false immediately if lengths differ (length is not secret),
@@ -62,10 +62,8 @@ impl AuthMiddleware {
 
         match self.store.validate(api_key).await {
             Ok(Some(key)) => {
-                let rate_limit_override = key.rate_limit_override.map(|r| RateLimitOverride {
-                    requests_per_second: r.requests_per_second,
-                    burst_size: r.burst_size,
-                });
+                // The stored override is already `himadri_core::RateLimitOverride`.
+                let rate_limit_override = key.rate_limit_override;
                 Ok(Some(AuthContext {
                     // Non-secret principal descriptor; the raw bearer secret
                     // must never ride along in AuthContext (it derives Debug

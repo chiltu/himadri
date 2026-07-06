@@ -122,31 +122,14 @@ impl Plugin for ResponseCachePlugin {
 mod tests {
     use super::*;
     use himadri_core::{
-        ChatCompletionRequest, ChatCompletionResponse, Choice, Message, MessageContent,
-        ResponseMessage, Role,
+        ChatCompletionRequest, ChatCompletionResponse, Choice, Message, ResponseMessage, Role,
     };
 
     fn request(model: &str, prompt: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: model.to_string(),
-            messages: vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text(prompt.to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            user: None,
-            tools: None,
-            tool_choice: None,
-            extra: Default::default(),
+            messages: vec![Message::user(prompt)],
+            ..Default::default()
         }
     }
 

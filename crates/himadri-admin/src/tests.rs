@@ -458,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn test_admin_handlers_crud() {
         let store = crate::store::StoreBackend::Memory(Arc::new(ApiKeyStore::new()));
-        let admin = AdminHandlers::new(store, None);
+        let admin = AdminHandlers::new(store);
         let key = admin
             .create_key(CreateApiKeyRequest {
                 name: "test".to_string(),
@@ -568,7 +568,7 @@ mod tests {
             crate::provider_backend::connect_provider_model_stores(&url, None)
                 .await
                 .expect("sqlite provider/model store");
-        let admin = AdminHandlers::new(StoreBackend::new().await, Some("mk".to_string()))
+        let admin = AdminHandlers::new(StoreBackend::new().await)
             .with_provider_model_stores(provider_store, model_store);
 
         let req = |name: &str, base_url: &str| CreateProviderRequest {

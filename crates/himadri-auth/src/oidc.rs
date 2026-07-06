@@ -59,21 +59,13 @@ impl OidcDiscovery {
 
         debug!("Fetching JWKS from {}", jwks_uri);
 
-        // Fetch initial JWKS
-        let jwks: jsonwebtoken::jwk::JwkSet = client
-            .get(&jwks_uri)
-            .send()
-            .await
-            .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?;
+        let keys = fetch_jwks(&client, &jwks_uri).await?;
 
         let discovery = Arc::new(Self {
             issuer: issuer.to_string(),
             audience: audience.to_string(),
             jwks_uri,
-            jwks: RwLock::new(jwks.keys),
+            jwks: RwLock::new(keys),
             last_refresh: parking_lot::Mutex::new(std::time::Instant::now()),
             client,
         });
@@ -170,18 +162,10 @@ impl OidcDiscovery {
     pub async fn refresh_jwks(&self) -> Result<(), AuthError> {
         debug!("Refreshing JWKS from {}", self.jwks_uri);
 
-        let jwks: jsonwebtoken::jwk::JwkSet = self
-            .client
-            .get(&self.jwks_uri)
-            .send()
-            .await
-            .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?;
+        let keys = fetch_jwks(&self.client, &self.jwks_uri).await?;
 
         let mut current_jwks = self.jwks.write();
-        *current_jwks = jwks.keys;
+        *current_jwks = keys;
 
         let mut last_refresh = self.last_refresh.lock();
         *last_refresh = std::time::Instant::now();
@@ -190,6 +174,23 @@ impl OidcDiscovery {
 
         Ok(())
     }
+}
+
+/// Fetch and parse a JWKS document, mapping transport/parse failures to
+/// [`AuthError::JwksFetchFailed`]. Shared by initial discovery and refresh.
+async fn fetch_jwks(
+    client: &reqwest::Client,
+    uri: &str,
+) -> Result<Vec<jsonwebtoken::jwk::Jwk>, AuthError> {
+    let set: jsonwebtoken::jwk::JwkSet = client
+        .get(uri)
+        .send()
+        .await
+        .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| AuthError::JwksFetchFailed(e.to_string()))?;
+    Ok(set.keys)
 }
 
 /// Resolve the signature algorithm to validate with for a JWK: the key's

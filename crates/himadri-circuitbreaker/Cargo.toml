@@ -9,8 +9,3 @@ parking_lot = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"], optional = true }
-
-[features]
-default = []
-redis = ["dep:redis"]

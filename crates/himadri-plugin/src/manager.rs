@@ -4,6 +4,7 @@ use tracing::{debug, error, instrument};
 use crate::context::PluginContext;
 use crate::traits::{Plugin, PluginError, ResponseAction, ResponseGuardrail, Stage};
 
+#[derive(Default)]
 pub struct PluginManager {
     before_request: Vec<Arc<dyn Plugin>>,
     after_request: Vec<Arc<dyn Plugin>>,
@@ -14,13 +15,7 @@ pub struct PluginManager {
 
 impl PluginManager {
     pub fn new() -> Self {
-        Self {
-            before_request: Vec::new(),
-            after_request: Vec::new(),
-            after_response: Vec::new(),
-            on_error: Vec::new(),
-            response_guardrails: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn register(&mut self, plugin: Arc<dyn Plugin>) {
@@ -51,27 +46,27 @@ impl PluginManager {
         Ok(())
     }
 
-    /// After-request plugins observe an already-produced (and paid-for)
-    /// response, so their failures are logged, never propagated — the
-    /// signature encodes that contract.
-    #[instrument(skip(self, ctx), fields(plugin_count = self.after_request.len()))]
-    pub async fn run_after(&self, ctx: &mut PluginContext) {
-        for plugin in &self.after_request {
-            debug!("Running after-request plugin: {}", plugin.name());
+    /// Run a stage's plugins, logging (never propagating) failures. These
+    /// stages observe an already-produced (and often paid-for) response, so
+    /// a failing observer must not fail the request — the `()` return encodes
+    /// that contract.
+    async fn run_logged(&self, plugins: &[Arc<dyn Plugin>], ctx: &mut PluginContext, stage: &str) {
+        for plugin in plugins {
+            debug!("Running {stage} plugin: {}", plugin.name());
             if let Err(e) = plugin.execute(ctx).await {
-                error!("Plugin {} failed: {}", plugin.name(), e);
+                error!("{stage} plugin {} failed: {}", plugin.name(), e);
             }
         }
     }
 
-    #[instrument(skip(self, ctx), fields(plugin_count = self.after_response.len()))]
+    pub async fn run_after(&self, ctx: &mut PluginContext) {
+        self.run_logged(&self.after_request, ctx, "after-request")
+            .await;
+    }
+
     pub async fn run_after_response(&self, ctx: &mut PluginContext) {
-        for plugin in &self.after_response {
-            debug!("Running after-response plugin: {}", plugin.name());
-            if let Err(e) = plugin.execute(ctx).await {
-                error!("After-response plugin {} failed: {}", plugin.name(), e);
-            }
-        }
+        self.run_logged(&self.after_response, ctx, "after-response")
+            .await;
     }
 
     #[instrument(skip(self, ctx), fields(guardrail_count = self.response_guardrails.len()))]
@@ -90,19 +85,7 @@ impl PluginManager {
         Ok(ResponseAction::Allow)
     }
 
-    #[instrument(skip(self, ctx), fields(plugin_count = self.on_error.len()))]
     pub async fn run_on_error(&self, ctx: &mut PluginContext) {
-        for plugin in &self.on_error {
-            debug!("Running on-error plugin: {}", plugin.name());
-            if let Err(e) = plugin.execute(ctx).await {
-                error!("Error plugin {} failed: {}", plugin.name(), e);
-            }
-        }
-    }
-}
-
-impl Default for PluginManager {
-    fn default() -> Self {
-        Self::new()
+        self.run_logged(&self.on_error, ctx, "on-error").await;
     }
 }

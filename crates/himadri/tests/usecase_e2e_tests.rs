@@ -456,7 +456,7 @@ async fn setup_admin_app(cipher: Option<CipherKey>) -> TestAdminApp {
         .await
         .unwrap();
     let store = StoreBackend::Sqlite(Arc::new(sqlite_store));
-    let mut admin = AdminHandlers::new(store, None);
+    let mut admin = AdminHandlers::new(store);
 
     let (provider_store, model_store) =
         himadri_admin::connect_provider_model_stores(&db_url, cipher)
@@ -1335,7 +1335,7 @@ async fn postgres_provider_crud_parity() {
     let (provider_store, model_store) = himadri_admin::connect_provider_model_stores(&url, None)
         .await
         .expect("postgres provider/model store should connect");
-    let admin = AdminHandlers::new(StoreBackend::new().await, None)
+    let admin = AdminHandlers::new(StoreBackend::new().await)
         .with_provider_model_stores(provider_store, model_store);
 
     let created = admin
@@ -1544,7 +1544,7 @@ async fn postgres_encryption_at_rest_transparent() {
         himadri_admin::connect_provider_model_stores(&url, Some(cipher))
             .await
             .expect("postgres provider/model store should connect");
-    let admin = AdminHandlers::new(StoreBackend::new().await, None)
+    let admin = AdminHandlers::new(StoreBackend::new().await)
         .with_provider_model_stores(provider_store, model_store);
 
     let created = admin

@@ -1,25 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Tools (functions) the model may call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,7 +56,7 @@ pub struct ToolFunction {
     pub parameters: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +67,18 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+impl Message {
+    /// A plain user-text message. Convenience for tests and callers that
+    /// build single-turn requests.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: Some(MessageContent::text(content)),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,7 +168,7 @@ pub struct FunctionCall {
 
 // Response types
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     #[serde(default)]
     pub id: String,
@@ -183,7 +195,7 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseMessage {
     #[serde(default)]
     pub role: Role,
@@ -201,7 +213,7 @@ pub struct Usage {
 
 // Streaming types
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamChunk {
     #[serde(default)]
     pub id: String,
@@ -219,7 +231,7 @@ pub struct StreamChunk {
     pub system_fingerprint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamChoice {
     #[serde(default)]
     pub index: u32,
@@ -228,7 +240,7 @@ pub struct StreamChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
@@ -374,18 +386,30 @@ pub enum AuthScope {
     ApiKey,
 }
 
-impl AuthContext {
-    pub fn anonymous() -> Self {
+/// Least-privilege default (empty principal, `ApiKey` scope). Distinct from
+/// [`AuthContext::anonymous`], which is the dev-bypass `Admin` context.
+impl Default for AuthContext {
+    fn default() -> Self {
         Self {
-            api_key: "anonymous".to_string(),
+            api_key: String::new(),
             key_id: None,
-            scope: AuthScope::Admin,
+            scope: AuthScope::ApiKey,
             org_id: None,
             team_id: None,
             user_id: None,
             rate_limit_override: None,
             roles: Vec::new(),
             budget_limit_usd: None,
+        }
+    }
+}
+
+impl AuthContext {
+    pub fn anonymous() -> Self {
+        Self {
+            api_key: "anonymous".to_string(),
+            scope: AuthScope::Admin,
+            ..Default::default()
         }
     }
 

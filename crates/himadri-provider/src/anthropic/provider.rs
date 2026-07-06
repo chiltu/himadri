@@ -7,11 +7,38 @@ use crate::error::ProviderError;
 use crate::http_client::CLIENT_POOL;
 use crate::traits::{BoxStream, Provider};
 use himadri_core::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, Delta, MessageContent,
-    ResponseMessage, StreamChoice, StreamChunk, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, Delta, FunctionCall, ResponseMessage,
+    StreamChoice, StreamChunk, ToolCall, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+
+/// Map an Anthropic stop reason to the OpenAI `finish_reason` vocabulary.
+fn map_finish_reason(anthropic: &str) -> String {
+    match anthropic {
+        "end_turn" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_calls".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Build an OpenAI-shaped stream chunk with a single choice; `id`/`model` are
+/// left empty (only `message_start` carries them) and filled in by the caller
+/// when needed.
+fn stream_chunk(delta: Delta, finish_reason: Option<String>, usage: Option<Usage>) -> StreamChunk {
+    StreamChunk {
+        object: "chat.completion.chunk".to_string(),
+        created: chrono::Utc::now().timestamp() as u64,
+        choices: vec![StreamChoice {
+            delta,
+            finish_reason,
+            ..Default::default()
+        }],
+        usage,
+        ..Default::default()
+    }
+}
 
 #[derive(Clone)]
 pub struct AnthropicProvider {
@@ -42,18 +69,11 @@ impl AnthropicProvider {
                     }
                 }
                 _ => {
-                    let content = match &m.content {
-                        Some(MessageContent::Text(text)) => text.clone(),
-                        Some(MessageContent::Parts(parts)) => parts
-                            .iter()
-                            .filter_map(|p| match p {
-                                ContentPart::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join(""),
-                        None => String::new(),
-                    };
+                    let content = m
+                        .content
+                        .as_ref()
+                        .map(|c| c.flat_text().into_owned())
+                        .unwrap_or_default();
 
                     messages.push(serde_json::json!({
                         "role": match m.role {
@@ -143,24 +163,45 @@ impl AnthropicProvider {
         let id = response["id"].as_str().unwrap_or("").to_string();
         let model = response["model"].as_str().unwrap_or("").to_string();
 
-        let content = response["content"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|c| c["text"].as_str())
-            .map(|s| s.to_string());
+        // Anthropic returns an array of content blocks: `text` blocks and
+        // `tool_use` blocks. Concatenate the text and translate any tool_use
+        // blocks into OpenAI-style `tool_calls` (previously dropped).
+        let blocks = response["content"].as_array();
+        let content = blocks
+            .map(|arr| {
+                arr.iter()
+                    .filter(|c| c["type"] == "text")
+                    .filter_map(|c| c["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .filter(|s| !s.is_empty());
 
-        let finish_reason = response["stop_reason"].as_str().map(|r| match r {
-            "end_turn" => "stop".to_string(),
-            "max_tokens" => "length".to_string(),
-            _ => r.to_string(),
-        });
+        let tool_calls = blocks
+            .map(|arr| {
+                arr.iter()
+                    .filter(|c| c["type"] == "tool_use")
+                    .map(|c| ToolCall {
+                        id: c["id"].as_str().unwrap_or("").to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: c["name"].as_str().unwrap_or("").to_string(),
+                            // OpenAI carries arguments as a JSON string.
+                            arguments: c["input"].to_string(),
+                        },
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
+        let finish_reason = response["stop_reason"].as_str().map(map_finish_reason);
 
         let choices = vec![Choice {
             index: 0,
             message: ResponseMessage {
                 role: himadri_core::Role::Assistant,
                 content,
-                tool_calls: None,
+                tool_calls,
             },
             finish_reason,
         }];
@@ -192,57 +233,36 @@ impl AnthropicProvider {
         match event_type {
             "message_start" => {
                 let message = &data["message"];
-                let id = message["id"].as_str().unwrap_or("").to_string();
-                let model = message["model"].as_str().unwrap_or("").to_string();
                 // Anthropic reports prompt tokens only here; stash them for
                 // the final message_delta usage.
                 *input_tokens = message["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
 
-                Some(Ok(StreamChunk {
-                    id,
-                    object: "chat.completion.chunk".to_string(),
-                    created: chrono::Utc::now().timestamp() as u64,
-                    model,
-                    choices: vec![StreamChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: Some(himadri_core::Role::Assistant),
-                            content: None,
-                            tool_calls: None,
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                    system_fingerprint: None,
-                }))
+                let mut chunk = stream_chunk(
+                    Delta {
+                        role: Some(himadri_core::Role::Assistant),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                );
+                chunk.id = message["id"].as_str().unwrap_or("").to_string();
+                chunk.model = message["model"].as_str().unwrap_or("").to_string();
+                Some(Ok(chunk))
             }
             "content_block_delta" => {
                 let text = data["delta"]["text"].as_str().unwrap_or("").to_string();
-
-                Some(Ok(StreamChunk {
-                    id: String::new(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: chrono::Utc::now().timestamp() as u64,
-                    model: String::new(),
-                    choices: vec![StreamChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: None,
-                            content: if text.is_empty() { None } else { Some(text) },
-                            tool_calls: None,
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                    system_fingerprint: None,
-                }))
+                let content = if text.is_empty() { None } else { Some(text) };
+                Some(Ok(stream_chunk(
+                    Delta {
+                        content,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                )))
             }
             "message_delta" => {
-                let stop_reason = data["delta"]["stop_reason"].as_str().map(|r| match r {
-                    "end_turn" => "stop".to_string(),
-                    "max_tokens" => "length".to_string(),
-                    _ => r.to_string(),
-                });
+                let stop_reason = data["delta"]["stop_reason"].as_str().map(map_finish_reason);
 
                 let usage = data["usage"].as_object().map(|u| {
                     let output = u["output_tokens"].as_u64().unwrap_or(0) as u32;
@@ -253,23 +273,7 @@ impl AnthropicProvider {
                     }
                 });
 
-                Some(Ok(StreamChunk {
-                    id: String::new(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: chrono::Utc::now().timestamp() as u64,
-                    model: String::new(),
-                    choices: vec![StreamChoice {
-                        index: 0,
-                        delta: Delta {
-                            role: None,
-                            content: None,
-                            tool_calls: None,
-                        },
-                        finish_reason: stop_reason,
-                    }],
-                    usage,
-                    system_fingerprint: None,
-                }))
+                Some(Ok(stream_chunk(Delta::default(), stop_reason, usage)))
             }
             "message_stop" => None,
             "ping" => None,
@@ -421,26 +425,12 @@ mod stream_usage_tests {
 #[cfg(test)]
 mod tool_tests {
     use super::*;
-    use himadri_core::{ChatCompletionRequest, Message, Role, Tool, ToolFunction};
+    use himadri_core::{ChatCompletionRequest, Message, Tool, ToolFunction};
 
     fn request_with_tools(tool_choice: serde_json::Value) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "claude-3-5-sonnet".to_string(),
-            messages: vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("weather?".to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            user: None,
+            messages: vec![Message::user("weather?")],
             tools: Some(vec![Tool {
                 tool_type: "function".to_string(),
                 function: ToolFunction {
@@ -450,7 +440,7 @@ mod tool_tests {
                 },
             }]),
             tool_choice: Some(tool_choice),
-            extra: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -464,6 +454,36 @@ mod tool_tests {
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert!(body["tools"][0].get("function").is_none());
         assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn parse_response_surfaces_tool_use_blocks() {
+        // Regression (R36): tool_use blocks were dropped, so a tool-calling
+        // response came back empty.
+        let provider = AnthropicProvider::new(None);
+        let response = serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-3-5-sonnet",
+            "stop_reason": "tool_use",
+            "content": [
+                { "type": "text", "text": "Let me check." },
+                { "type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                  "input": { "city": "Paris" } }
+            ],
+            "usage": { "input_tokens": 5, "output_tokens": 3 }
+        });
+        let parsed = provider.parse_response(response).unwrap();
+        let choice = &parsed.choices[0];
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls present");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].id, "toolu_1");
+        assert!(calls[0].function.arguments.contains("Paris"));
+        assert_eq!(choice.message.content.as_deref(), Some("Let me check."));
     }
 
     #[test]

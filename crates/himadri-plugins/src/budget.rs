@@ -95,10 +95,6 @@ impl SpendStore {
     }
 }
 
-fn get_or_create_store(store_id: &str, max_keys: usize) -> Arc<SpendStore> {
-    GLOBAL_STORES.get_or_create(store_id, || SpendStore::new(max_keys))
-}
-
 /// Remove accumulated spend for a specific API key from the named store.
 pub fn reset_store_key(store_id: &str, api_key: &str) {
     GLOBAL_STORES.with(store_id, |s| s.reset(api_key));
@@ -171,7 +167,7 @@ impl BudgetPlugin {
             );
         }
 
-        let store = get_or_create_store(&store_id, max_keys);
+        let store = GLOBAL_STORES.get_or_create(&store_id, || SpendStore::new(max_keys));
 
         Ok(Arc::new(Self {
             store_id,
@@ -301,30 +297,14 @@ impl BudgetPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use himadri_core::{ChatCompletionRequest, Message, MessageContent, Role};
+    use himadri_core::{ChatCompletionRequest, Message};
 
     fn make_request_ctx(api_key: Option<&str>) -> PluginContext {
         let mut ctx = PluginContext::from_request(
             &ChatCompletionRequest {
                 model: "test".to_string(),
-                messages: vec![Message {
-                    role: Role::User,
-                    content: Some(MessageContent::Text("Hello".to_string())),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                }],
-                stream: false,
-                temperature: None,
-                top_p: None,
-                max_tokens: None,
-                stop: None,
-                presence_penalty: None,
-                frequency_penalty: None,
-                user: None,
-                tools: None,
-                tool_choice: None,
-                extra: Default::default(),
+                messages: vec![Message::user("Hello")],
+                ..Default::default()
             },
             None,
         );
@@ -362,14 +342,8 @@ mod tests {
     fn auth_with_budget(api_key: &str, budget: Option<f64>) -> himadri_core::AuthContext {
         himadri_core::AuthContext {
             api_key: api_key.to_string(),
-            key_id: None,
-            scope: himadri_core::AuthScope::ApiKey,
-            org_id: None,
-            team_id: None,
-            user_id: None,
-            rate_limit_override: None,
-            roles: Vec::new(),
             budget_limit_usd: budget,
+            ..Default::default()
         }
     }
 
@@ -606,13 +580,14 @@ mod tests {
         let mut ctx2 = make_response_ctx("high-spend", 10, 0);
         plugin.execute(&mut ctx2).await.unwrap();
 
-        // Adding a third key must evict "low-spend" (min spend)
+        // Adding a third key must evict "low-spend": it is the
+        // least-recently-updated entry (eviction is LRU, not lowest-spend).
         let mut ctx3 = make_response_ctx("new-key", 5, 0);
         plugin.execute(&mut ctx3).await.unwrap();
 
-        // low-spend should have been evicted
+        // low-spend (least recently updated) should have been evicted
         assert_eq!(plugin.store.get("low-spend"), 0.0);
-        // high-spend should still be present
+        // high-spend, updated more recently, should still be present
         assert!(plugin.store.get("high-spend") > 0.0);
     }
 

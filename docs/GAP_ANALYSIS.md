@@ -4,6 +4,35 @@
 > Every status below was verified against the source, not the claim.
 > Baseline for comparison is **Bifrost** (himadri is a Rust port of it).
 
+> **⚠️ Historical snapshot (2026-06-26).** This analysis drove a series of
+> sprints that have since **closed most of the gaps below**. Now implemented
+> and wired (see [`CHANGELOG.md`](../CHANGELOG.md) and the current docs):
+>
+> - **Fallback retry loop** — `route`/`route_stream` fail over across targets.
+> - **Conditional / ContentBased / ABTest strategies** — reachable from config
+>   (all 8 strategy modes constructible).
+> - **Response cache plugin** — wired, env-gated by `CACHE_TTL_SECS`, with
+>   hit/miss metrics.
+> - **Request-log persistence** — Postgres request-log store wired (with
+>   in-memory fallback); filtered queries fixed.
+> - **`himadri-auth` compiled and wired** — JWT/OIDC on `/v1` via
+>   `CombinedAuth` (JWKS discovery + refresh); auth-failure auditing.
+> - **RBAC** — per-role model/provider allow-lists with wildcards and
+>   `default_role` ([configuration.md](./configuration.md#rbac-tiered-access)).
+> - **Budgets** — per-principal USD caps enforced and cost accumulated,
+>   including for streamed responses.
+> - **Embeddings** — `POST /v1/embeddings` with provider fallback.
+> - **Tool calling** — `tools`/`tool_choice` modeled in core and translated
+>   per provider (OpenAI-compatible, Anthropic, Gemini, Bedrock).
+> - **`/v1/*` passthrough proxy** — functional (auth-gated, 10 MiB body cap).
+> - **Config history & rollback** — `GET /admin/config/history` and
+>   `POST /admin/config/rollback/{version}` implemented (in-memory history).
+>
+> Still open, as of 2026-07-05: the ~17 additional Bifrost providers, inbound
+> Anthropic/GenAI API schemas, image/audio endpoints, MCP gateway, semantic
+> (non-exact) caching, cluster mode/HA beyond the `redis` feature, and vault
+> secret backends. Statuses in the body below are **not** updated.
+
 ## Status legend
 
 - ✅ **Feature-complete** — implemented *and* wired into the running binary, usable end-to-end

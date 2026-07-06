@@ -22,30 +22,23 @@ impl Redactor {
     }
 
     pub fn redact(&self, input: &str) -> String {
-        let mut result = input.to_string();
-
-        result = self
-            .jwt_regex
-            .replace_all(&result, "[REDACTED_JWT]")
-            .to_string();
-        result = self
-            .bearer_regex
-            .replace_all(&result, "[REDACTED_BEARER_TOKEN]")
-            .to_string();
-        result = self
-            .api_key_regex
-            .replace_all(&result, "[REDACTED_API_KEY]")
-            .to_string();
-        result = self
-            .email_regex
-            .replace_all(&result, "[REDACTED_EMAIL]")
-            .to_string();
-        result = self
-            .aws_key_regex
-            .replace_all(&result, "[REDACTED_AWS_KEY]")
-            .to_string();
-
-        result
+        // Apply each pattern in turn, reallocating only when one actually
+        // matches: `replace_all` returns a borrowed `Cow` (no allocation) on
+        // a clean segment, so a prompt with no secrets allocates just once
+        // (the final `into_owned`).
+        let mut result: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(input);
+        for (regex, replacement) in [
+            (&self.jwt_regex, "[REDACTED_JWT]"),
+            (&self.bearer_regex, "[REDACTED_BEARER_TOKEN]"),
+            (&self.api_key_regex, "[REDACTED_API_KEY]"),
+            (&self.email_regex, "[REDACTED_EMAIL]"),
+            (&self.aws_key_regex, "[REDACTED_AWS_KEY]"),
+        ] {
+            if let std::borrow::Cow::Owned(replaced) = regex.replace_all(&result, replacement) {
+                result = std::borrow::Cow::Owned(replaced);
+            }
+        }
+        result.into_owned()
     }
 }
 

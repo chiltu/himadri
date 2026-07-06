@@ -1,12 +1,6 @@
 mod token_bucket;
 
-#[cfg(feature = "redis")]
-mod redis_store;
-
 pub use token_bucket::{ShardedRateLimiter, TokenBucket};
-
-#[cfg(feature = "redis")]
-pub use redis_store::RedisRateLimiter;
 
 use std::sync::Arc;
 
@@ -31,18 +25,19 @@ impl RateLimiter {
         self.global.allow("global")
     }
 
-    pub fn check_org(&self, org_id: &str, rate: Option<u64>, burst: Option<u64>) -> bool {
+    fn check_entity(&self, prefix: &str, id: &str, rate: Option<u64>, burst: Option<u64>) -> bool {
         let r = rate.unwrap_or(self.default_rate);
         let b = burst.unwrap_or(self.default_burst);
         self.per_entity
-            .allow_with_params(&format!("org:{}", org_id), r, b)
+            .allow_with_params(&format!("{prefix}:{id}"), r, b)
+    }
+
+    pub fn check_org(&self, org_id: &str, rate: Option<u64>, burst: Option<u64>) -> bool {
+        self.check_entity("org", org_id, rate, burst)
     }
 
     pub fn check_key(&self, key_id: &str, rate: Option<u64>, burst: Option<u64>) -> bool {
-        let r = rate.unwrap_or(self.default_rate);
-        let b = burst.unwrap_or(self.default_burst);
-        self.per_entity
-            .allow_with_params(&format!("key:{}", key_id), r, b)
+        self.check_entity("key", key_id, rate, burst)
     }
 
     pub fn clear(&self) {

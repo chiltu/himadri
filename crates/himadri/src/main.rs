@@ -1,8 +1,8 @@
+// `gateway`, `strategy` and `latency_store` live in the library crate
+// (`himadri::*`); the binary consumes them rather than compiling its own copy.
+// Only `handlers` and `combined_auth` are binary-local.
 mod combined_auth;
-mod gateway;
 mod handlers;
-mod latency_store;
-mod strategy;
 
 use axum::{
     middleware,
@@ -23,12 +23,11 @@ use himadri_plugins::{
     RequestLoggerPlugin, ResponseCachePlugin, WordFilterPlugin,
 };
 use himadri_provider::{
-    AnthropicProvider, BedrockProvider, GeminiProvider, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider,
+    AnthropicProvider, GeminiProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
 };
 
-use gateway::Gateway;
 use handlers::{AppState, *};
+use himadri::gateway::Gateway;
 
 /// Command-line options. Parsed by hand to avoid an argument-parser
 /// dependency for two flags.
@@ -260,76 +259,48 @@ fn register_providers_from_env(gateway: &Gateway) {
         info!("Registered Azure OpenAI provider");
     }
 
-    // Register Bedrock if configured
-    if let (Some(access_key), Some(secret_key)) = (
-        std::env::var("AWS_ACCESS_KEY_ID").ok(),
-        std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
-    ) {
-        let region = std::env::var("AWS_REGION").ok();
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        gateway.register_provider(Arc::new(BedrockProvider::new(
-            region.as_deref(),
-            &access_key,
-            &secret_key,
-            session_token.as_deref(),
-        )));
-        info!("Registered AWS Bedrock provider");
-    }
-
-    // Register OpenRouter if configured
-    if std::env::var("OPENROUTER_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::openrouter(),
-        )));
-        info!("Registered OpenRouter provider");
-    }
-
-    // Register Together AI if configured
-    if std::env::var("TOGETHER_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::together_ai(),
-        )));
-        info!("Registered Together AI provider");
-    }
-
-    // Register Groq if configured
-    if std::env::var("GROQ_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::groq(),
-        )));
-        info!("Registered Groq provider");
-    }
-
-    // Register Fireworks if configured
-    if std::env::var("FIREWORKS_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::fireworks(),
-        )));
-        info!("Registered Fireworks AI provider");
-    }
-
-    // Register DeepInfra if configured
-    if std::env::var("DEEPINFRA_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::deepinfra(),
-        )));
-        info!("Registered DeepInfra provider");
-    }
-
-    // Register Cerebras if configured
-    if std::env::var("CEREBRAS_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::cerebras(),
-        )));
-        info!("Registered Cerebras provider");
-    }
-
-    // Register Novita if configured
-    if std::env::var("NOVITA_API_KEY").is_ok() {
-        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(
-            OpenAiCompatibleConfig::novita(),
-        )));
-        info!("Registered Novita AI provider");
+    // OpenAI-compatible vendors: registered when their API-key env var is set.
+    // Adding a vendor is one table row (plus its `OpenAiCompatibleConfig`
+    // preset). Row = (API-key env var, config factory, display name).
+    type ProviderPreset = (&'static str, fn() -> OpenAiCompatibleConfig, &'static str);
+    let openai_compatible: &[ProviderPreset] = &[
+        (
+            "OPENROUTER_API_KEY",
+            OpenAiCompatibleConfig::openrouter,
+            "OpenRouter",
+        ),
+        (
+            "TOGETHER_API_KEY",
+            OpenAiCompatibleConfig::together_ai,
+            "Together AI",
+        ),
+        ("GROQ_API_KEY", OpenAiCompatibleConfig::groq, "Groq"),
+        (
+            "FIREWORKS_API_KEY",
+            OpenAiCompatibleConfig::fireworks,
+            "Fireworks AI",
+        ),
+        (
+            "DEEPINFRA_API_KEY",
+            OpenAiCompatibleConfig::deepinfra,
+            "DeepInfra",
+        ),
+        (
+            "CEREBRAS_API_KEY",
+            OpenAiCompatibleConfig::cerebras,
+            "Cerebras",
+        ),
+        (
+            "NOVITA_API_KEY",
+            OpenAiCompatibleConfig::novita,
+            "Novita AI",
+        ),
+    ];
+    for &(env_var, config_fn, display_name) in openai_compatible {
+        if std::env::var(env_var).is_ok() {
+            gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(config_fn())));
+            info!("Registered {} provider", display_name);
+        }
     }
 }
 
@@ -405,29 +376,28 @@ fn wire_plugins() -> himadri_plugin::PluginManager {
         }
     }
 
-    // Register rate limit plugin if configured
-    if let Ok(rpm) = std::env::var("RATE_LIMIT_KEY_RPM") {
-        if let Ok(rpm_val) = rpm.parse::<u64>() {
-            if let Ok(rl_plugin) = RateLimitPlugin::new(RateLimitConfig {
-                key_rpm: Some(rpm_val),
-                ..Default::default()
-            }) {
-                plugin_manager.register(rl_plugin);
-                info!("Registered rate limit plugin with {} RPM per key", rpm_val);
+    // Register the rate-limit plugin when a per-key and/or per-IP limit is
+    // configured. Both scopes share one plugin, and the global limiter stays
+    // unset so configuring a key/IP limit doesn't silently impose an
+    // unrelated global request cap.
+    let key_rpm = std::env::var("RATE_LIMIT_KEY_RPM")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let ip_rpm = std::env::var("RATE_LIMIT_IP_RPM")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    if key_rpm.is_some() || ip_rpm.is_some() {
+        if let Ok(rl_plugin) = RateLimitPlugin::new(RateLimitConfig {
+            key_rpm,
+            ip_rpm,
+            ..Default::default()
+        }) {
+            plugin_manager.register(rl_plugin);
+            if let Some(rpm) = key_rpm {
+                info!("Registered rate limit: {} RPM per key", rpm);
             }
-        }
-    }
-
-    // Register per-IP rate limit plugin if configured
-    if let Ok(rpm) = std::env::var("RATE_LIMIT_IP_RPM") {
-        if let Ok(rpm_val) = rpm.parse::<u64>() {
-            if let Ok(rl_plugin) = RateLimitPlugin::new(RateLimitConfig {
-                ip_rpm: Some(rpm_val),
-                requests_per_second: Some(1_000_000), // high global limit so only IP check matters
-                ..Default::default()
-            }) {
-                plugin_manager.register(rl_plugin);
-                info!("Registered rate limit plugin with {} RPM per IP", rpm_val);
+            if let Some(rpm) = ip_rpm {
+                info!("Registered rate limit: {} RPM per IP", rpm);
             }
         }
     }
@@ -450,7 +420,7 @@ async fn build_admin(config: &Config) -> (Arc<AdminHandlers>, Arc<AuthMiddleware
 
     // Initialize provider and model stores (SQLite or Postgres, selected by
     // DATABASE_URL's scheme — see himadri_admin::provider_backend).
-    let mut admin = AdminHandlers::new(store.clone(), master_key.clone());
+    let mut admin = AdminHandlers::new(store.clone());
     let cipher = himadri_admin::CipherKey::from_env();
     if cipher.is_none() {
         tracing::warn!(

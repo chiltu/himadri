@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use himadri_plugin::context::PluginContext;
 use himadri_plugin::traits::{Plugin, PluginError, PluginType, Stage};
 
-// ─── Sliding Window Counter ──────────────────────────────────────────
+// ─── Fixed Window Counter ────────────────────────────────────────────
 
 /// A fixed-window counter that tracks requests within a time window.
 /// (Counts reset at window boundaries rather than sliding continuously.)
@@ -51,7 +51,7 @@ impl FixedWindowCounter {
 
     /// Try to consume N requests. Returns true if allowed.
     fn allow_n(&self, n: u64) -> bool {
-        let w = self.window_index(now_micros() as u64);
+        let w = self.window_index(now_micros());
         self.packed
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |packed| {
                 let count = if packed >> 32 == w {
@@ -67,7 +67,7 @@ impl FixedWindowCounter {
 
     /// Get current count in the window.
     fn count(&self) -> u64 {
-        let w = self.window_index(now_micros() as u64);
+        let w = self.window_index(now_micros());
         let packed = self.packed.load(Ordering::Acquire);
         if packed >> 32 == w {
             packed & COUNT_MASK
@@ -78,23 +78,24 @@ impl FixedWindowCounter {
 
     /// Reset the counter.
     fn reset(&self) {
-        let w = self.window_index(now_micros() as u64);
+        let w = self.window_index(now_micros());
         self.packed.store(w << 32, Ordering::Release);
     }
 }
 
 /// Monotonic microseconds: window rollover must not jump when the wall
 /// clock steps (NTP).
-fn now_micros() -> i64 {
+fn now_micros() -> u64 {
     static EPOCH: once_cell::sync::Lazy<std::time::Instant> =
         once_cell::sync::Lazy::new(std::time::Instant::now);
-    EPOCH.elapsed().as_micros() as i64
+    EPOCH.elapsed().as_micros() as u64
 }
 
 // ─── Sharded Rate Limiter Store ──────────────────────────────────────
 
-/// Per-key rate limiter store with LRU eviction.
-/// Uses sharding to reduce lock contention across keys.
+/// Per-key rate limiter store. Sharded to reduce lock contention across keys;
+/// at capacity a *random* key is evicted (chosen to deny an attacker targeted
+/// eviction of a specific victim's counter).
 struct RateLimiterStore {
     shards: Vec<parking_lot::RwLock<HashMap<String, Arc<FixedWindowCounter>>>>,
     num_shards: usize,
@@ -220,8 +221,10 @@ pub fn get_request_count(store_id: &str, key: &str) -> u64 {
 const DEFAULT_MAX_KEYS: usize = 100_000;
 
 pub struct RateLimitPlugin {
-    /// Global rate limiter (requests per window)
-    global_limiter: Arc<FixedWindowCounter>,
+    /// Global rate limiter (requests per window). Opt-in: `None` skips the
+    /// global check entirely, so a per-key/user/IP-only config imposes no
+    /// unrelated global cap.
+    global_limiter: Option<Arc<FixedWindowCounter>>,
     /// Per-API-key rate limiter store
     key_store: Option<Arc<RateLimiterStore>>,
     /// Per-user rate limiter store
@@ -232,42 +235,30 @@ pub struct RateLimitPlugin {
 
 impl RateLimitPlugin {
     pub fn new(config: RateLimitConfig) -> Result<Arc<Self>, String> {
-        let rps = config.requests_per_second.unwrap_or(100);
         let window = Duration::from_secs(1);
         let max_keys = config.max_keys.unwrap_or(DEFAULT_MAX_KEYS);
 
-        // Create global limiter
-        let global_limiter = Arc::new(FixedWindowCounter::new(rps, window));
+        // Global limiter is opt-in: only enforce a global cap when
+        // `requests_per_second` is set. Defaulting it to 100 used to silently
+        // impose a global ceiling on a key/user/IP-only configuration.
+        let global_limiter = config
+            .requests_per_second
+            .map(|rps| Arc::new(FixedWindowCounter::new(rps, window)));
 
-        // Create per-key store if configured
-        let key_store = config.key_rpm.map(|rpm| {
+        // Per-scope stores share the same 1-minute RPM window; each is created
+        // only when its limit is configured.
+        let store_id = config.store_id.as_deref().unwrap_or("default");
+        let make_store = |scope: &str, rpm: u64| {
             get_or_create_store(
-                &format!("key-{}", config.store_id.as_deref().unwrap_or("default")),
-                rpm,                     // max_requests per window (the RPM value itself)
-                Duration::from_secs(60), // 1-minute window for RPM
-                max_keys,
-            )
-        });
-
-        // Create per-user store if configured
-        let user_store = config.user_rpm.map(|rpm| {
-            get_or_create_store(
-                &format!("user-{}", config.store_id.as_deref().unwrap_or("default")),
-                rpm,
+                &format!("{scope}-{store_id}"),
+                rpm, // max_requests per window (the RPM value itself)
                 Duration::from_secs(60),
                 max_keys,
             )
-        });
-
-        // Create per-IP store if configured
-        let ip_store = config.ip_rpm.map(|rpm| {
-            get_or_create_store(
-                &format!("ip-{}", config.store_id.as_deref().unwrap_or("default")),
-                rpm,
-                Duration::from_secs(60),
-                max_keys,
-            )
-        });
+        };
+        let key_store = config.key_rpm.map(|rpm| make_store("key", rpm));
+        let user_store = config.user_rpm.map(|rpm| make_store("user", rpm));
+        let ip_store = config.ip_rpm.map(|rpm| make_store("ip", rpm));
 
         Ok(Arc::new(Self {
             global_limiter,
@@ -275,6 +266,18 @@ impl RateLimitPlugin {
             user_store,
             ip_store,
         }))
+    }
+
+    /// Build a 429 rejection with a Retry-After hint. Shared by every
+    /// per-scope check so the rejection shape can't drift between them.
+    fn rejected(&self, reason: &str) -> PluginError {
+        PluginError::Rejected {
+            name: self.name().to_string(),
+            reason: reason.to_string(),
+            kind: himadri_plugin::RejectKind::RateLimited {
+                retry_after_secs: 60,
+            },
+        }
     }
 }
 
@@ -303,59 +306,37 @@ impl Plugin for RateLimitPlugin {
     }
 
     async fn execute(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
-        // 1. Check global rate limit
-        if !self.global_limiter.allow() {
-            return Err(PluginError::Rejected {
-                name: self.name().to_string(),
-                reason: "rate limit exceeded".to_string(),
-                kind: himadri_plugin::RejectKind::RateLimited {
-                    retry_after_secs: 60,
-                },
-            });
+        // 1. Global rate limit (only when configured).
+        if let Some(ref global) = self.global_limiter {
+            if !global.allow() {
+                return Err(self.rejected("rate limit exceeded"));
+            }
         }
 
-        // 2. Check per-API-key rate limit
+        // 2. Per-API-key rate limit.
         if let Some(ref key_store) = self.key_store {
             if let Some(key) = Self::get_api_key(ctx) {
                 if !key_store.allow(&key) {
-                    return Err(PluginError::Rejected {
-                        name: self.name().to_string(),
-                        reason: "per-key rate limit exceeded".to_string(),
-                        kind: himadri_plugin::RejectKind::RateLimited {
-                            retry_after_secs: 60,
-                        },
-                    });
+                    return Err(self.rejected("per-key rate limit exceeded"));
                 }
             }
         }
 
-        // 3. Check per-user rate limit
+        // 3. Per-user rate limit.
         if let Some(ref user_store) = self.user_store {
             if let Some(user_id) = Self::get_user_id(ctx) {
                 if !user_store.allow(&user_id) {
-                    return Err(PluginError::Rejected {
-                        name: self.name().to_string(),
-                        reason: "per-user rate limit exceeded".to_string(),
-                        kind: himadri_plugin::RejectKind::RateLimited {
-                            retry_after_secs: 60,
-                        },
-                    });
+                    return Err(self.rejected("per-user rate limit exceeded"));
                 }
             }
         }
 
-        // 4. Check per-IP rate limit
+        // 4. Per-IP rate limit. Validate the IP format first to prevent key
+        // injection via malformed strings.
         if let Some(ref ip_store) = self.ip_store {
             if let Some(ref ip) = ctx.remote_ip {
-                // Validate IP format to prevent key injection via malformed strings
                 if ip.parse::<std::net::IpAddr>().is_ok() && !ip_store.allow(ip) {
-                    return Err(PluginError::Rejected {
-                        name: self.name().to_string(),
-                        reason: "per-IP rate limit exceeded".to_string(),
-                        kind: himadri_plugin::RejectKind::RateLimited {
-                            retry_after_secs: 60,
-                        },
-                    });
+                    return Err(self.rejected("per-IP rate limit exceeded"));
                 }
             }
         }
@@ -394,30 +375,14 @@ impl RateLimitPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use himadri_core::{ChatCompletionRequest, Message, MessageContent, Role};
+    use himadri_core::{ChatCompletionRequest, Message};
 
     fn make_request_ctx(api_key: Option<&str>) -> PluginContext {
         let mut ctx = PluginContext::from_request(
             &ChatCompletionRequest {
                 model: "test".to_string(),
-                messages: vec![Message {
-                    role: Role::User,
-                    content: Some(MessageContent::Text("Hello".to_string())),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                }],
-                stream: false,
-                temperature: None,
-                top_p: None,
-                max_tokens: None,
-                stop: None,
-                presence_penalty: None,
-                frequency_penalty: None,
-                user: None,
-                tools: None,
-                tool_choice: None,
-                extra: Default::default(),
+                messages: vec![Message::user("Hello")],
+                ..Default::default()
             },
             None,
         );
@@ -431,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sliding_window_allows_within_limit() {
+    fn test_fixed_window_allows_within_limit() {
         let counter = FixedWindowCounter::new(10, Duration::from_secs(1));
         for _ in 0..10 {
             assert!(counter.allow());
@@ -440,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sliding_window_resets_after_window() {
+    fn test_fixed_window_resets_after_window() {
         let counter = FixedWindowCounter::new(5, Duration::from_millis(100));
         for _ in 0..5 {
             assert!(counter.allow());
@@ -578,6 +543,27 @@ mod tests {
 
         // Should allow many requests
         for _ in 0..1000 {
+            let mut ctx = make_request_ctx(None);
+            assert!(plugin.execute(&mut ctx).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn key_only_config_imposes_no_global_cap() {
+        // Regression (R3): a key-RPM-only plugin must not impose a global
+        // ceiling. The global limiter used to default to 100 rps, so >100
+        // unkeyed requests/sec were wrongly rejected.
+        let plugin = RateLimitPlugin::new(RateLimitConfig {
+            key_rpm: Some(1_000_000),
+            store_id: Some("test-no-global-cap".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(plugin.global_limiter.is_none());
+
+        // No api key on the context → per-key check is skipped; with no global
+        // limiter, far more than 100 requests pass.
+        for _ in 0..500 {
             let mut ctx = make_request_ctx(None);
             assert!(plugin.execute(&mut ctx).await.is_ok());
         }

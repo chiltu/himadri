@@ -72,8 +72,10 @@ pub fn provider_url_is_allowed(url: &str, allow_private: bool) -> Result<(), Str
 }
 
 /// True for addresses that should not be reachable from an
-/// operator-configured provider URL by default.
-fn ip_is_internal(ip: IpAddr) -> bool {
+/// operator-configured provider URL by default. Also used to decide whether a
+/// TCP peer is a trusted reverse proxy (private/loopback) when resolving
+/// client IPs from `X-Forwarded-For`.
+pub fn ip_is_internal(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()

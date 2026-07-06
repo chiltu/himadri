@@ -17,6 +17,20 @@ use crate::postgres_provider_store::{PgModelStore, PgProviderStore};
 #[cfg(feature = "sqlite")]
 use crate::provider_store::{ModelStore, ProviderStore};
 
+/// Dispatch a method to the active SQL backend, mapping `sqlx::Error` to a
+/// `String`. Shared by both provider and model backends; adding a store
+/// method is one line instead of a two-armed `match`.
+macro_rules! pm_dispatch {
+    ($self:expr, $method:ident ( $($arg:expr),* )) => {
+        match $self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(s) => s.$method($($arg),*).await.map_err(|e| e.to_string()),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(s) => s.$method($($arg),*).await.map_err(|e| e.to_string()),
+        }
+    };
+}
+
 #[derive(Clone)]
 pub enum ProviderStoreBackend {
     #[cfg(feature = "sqlite")]
@@ -35,39 +49,19 @@ pub enum ModelStoreBackend {
 
 impl ProviderStoreBackend {
     pub async fn create(&self, request: CreateProviderRequest) -> Result<Provider, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.create(request).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.create(request).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, create(request))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Provider>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.get(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.get(id).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, get(id))
     }
 
     pub async fn list(&self) -> Result<Vec<Provider>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.list().await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.list().await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, list())
     }
 
     pub async fn list_enabled(&self) -> Result<Vec<Provider>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.list_enabled().await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.list_enabled().await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, list_enabled())
     }
 
     pub async fn update(
@@ -75,83 +69,37 @@ impl ProviderStoreBackend {
         id: &str,
         request: UpdateProviderRequest,
     ) -> Result<Option<Provider>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.update(id, request).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.update(id, request).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, update(id, request))
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.delete(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.delete(id).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, delete(id))
     }
 
     pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Provider>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.toggle(id, enabled).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.toggle(id, enabled).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, toggle(id, enabled))
     }
 }
 
 impl ModelStoreBackend {
     pub async fn create(&self, request: CreateModelRequest) -> Result<Model, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.create(request).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.create(request).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, create(request))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<Model>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.get(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.get(id).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, get(id))
     }
 
     pub async fn list(&self) -> Result<Vec<Model>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.list().await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.list().await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, list())
     }
 
     pub async fn list_by_provider(&self, provider_id: &str) -> Result<Vec<Model>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s
-                .list_by_provider(provider_id)
-                .await
-                .map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s
-                .list_by_provider(provider_id)
-                .await
-                .map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, list_by_provider(provider_id))
     }
 
     pub async fn list_enabled(&self) -> Result<Vec<Model>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.list_enabled().await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.list_enabled().await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, list_enabled())
     }
 
     pub async fn update(
@@ -159,30 +107,15 @@ impl ModelStoreBackend {
         id: &str,
         request: UpdateModelRequest,
     ) -> Result<Option<Model>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.update(id, request).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.update(id, request).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, update(id, request))
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.delete(id).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.delete(id).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, delete(id))
     }
 
     pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, String> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.toggle(id, enabled).await.map_err(|e| e.to_string()),
-            #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.toggle(id, enabled).await.map_err(|e| e.to_string()),
-        }
+        pm_dispatch!(self, toggle(id, enabled))
     }
 }
 

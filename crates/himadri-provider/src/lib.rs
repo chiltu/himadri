@@ -1,12 +1,10 @@
 pub mod anthropic;
-pub mod bedrock;
 pub mod compatible;
 pub mod error;
 pub mod gemini;
 pub mod http_client;
 pub mod sse;
 pub mod traits;
-pub mod types;
 
 pub use error::ProviderError;
 pub use http_client::ProviderHttpClient;
@@ -17,7 +15,6 @@ pub use compatible::{AuthMethod, OpenAiCompatibleConfig, OpenAiCompatibleProvide
 
 // Specific provider implementations (only for non-OpenAI-compatible APIs)
 pub use anthropic::AnthropicProvider;
-pub use bedrock::BedrockProvider;
 pub use gemini::GeminiProvider;
 
 // Convenience re-exports for backward compatibility

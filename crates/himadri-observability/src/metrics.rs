@@ -97,35 +97,22 @@ impl Metrics {
         ))
         .unwrap();
 
-        registry.register(Box::new(requests_total.clone())).unwrap();
-        registry
-            .register(Box::new(request_duration.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(tokens_input_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(tokens_output_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(provider_errors.clone()))
-            .unwrap();
-        registry.register(Box::new(cost_usd_total.clone())).unwrap();
-        registry
-            .register(Box::new(rate_limit_rejections.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(circuit_breaker_state.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(active_connections.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_hits_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(cache_misses_total.clone()))
-            .unwrap();
+        let collectors: [Box<dyn prometheus::core::Collector>; 11] = [
+            Box::new(requests_total.clone()),
+            Box::new(request_duration.clone()),
+            Box::new(tokens_input_total.clone()),
+            Box::new(tokens_output_total.clone()),
+            Box::new(provider_errors.clone()),
+            Box::new(cost_usd_total.clone()),
+            Box::new(rate_limit_rejections.clone()),
+            Box::new(circuit_breaker_state.clone()),
+            Box::new(active_connections.clone()),
+            Box::new(cache_hits_total.clone()),
+            Box::new(cache_misses_total.clone()),
+        ];
+        for collector in collectors {
+            registry.register(collector).unwrap();
+        }
 
         Self {
             registry,

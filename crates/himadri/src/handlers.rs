@@ -17,7 +17,7 @@ use himadri_core::{
 };
 use himadri_observability::Metrics;
 
-use crate::gateway::Gateway;
+use himadri::gateway::Gateway;
 
 /// Maximum buffered body size for the `/v1/*` passthrough proxy (10 MiB).
 /// Large enough for typical multimodal/base64 payloads, bounded to prevent
@@ -813,26 +813,6 @@ fn error_to_response(e: GatewayError) -> Response {
     response
 }
 
-/// Check if an IP address is loopback or private (RFC 1918 / link-local / loopback).
-fn is_private_or_loopback(ip: std::net::IpAddr) -> bool {
-    ip.is_loopback()
-        || match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64 // 100.64.0.0/10 (CGNAT)
-                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // 169.254.0.0/16 (link-local)
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local() // fc00::/7
-                    || v6.is_unicast_link_local() // fe80::/10
-            }
-        }
-}
-
 /// Resolve the client's IP address.
 ///
 /// Uses TCP peer address as the source of truth. Only falls back to proxy
@@ -848,7 +828,7 @@ fn resolve_remote_ip(
     // In that case, we can cautiously trust proxy headers — but only the
     // rightmost IP that isn't another private/loopback address (i.e., the
     // outermost client added by the last non-proxy hop).
-    if is_private_or_loopback(peer_ip) {
+    if himadri_core::ip_is_internal(peer_ip) {
         if let Some(ip) = trusted_proxy_ip(headers) {
             return Some(ip);
         }
@@ -872,7 +852,7 @@ fn trusted_proxy_ip(headers: &axum::http::HeaderMap) -> Option<String> {
             for ip_str in s.split(',').rev() {
                 let ip_str = ip_str.trim();
                 if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
-                    if !is_private_or_loopback(addr) {
+                    if !himadri_core::ip_is_internal(addr) {
                         return Some(addr.to_string());
                     }
                 }
@@ -885,7 +865,7 @@ fn trusted_proxy_ip(headers: &axum::http::HeaderMap) -> Option<String> {
         if let Ok(s) = val.to_str() {
             let ip_str = s.trim();
             if let Ok(addr) = ip_str.parse::<std::net::IpAddr>() {
-                if !is_private_or_loopback(addr) {
+                if !himadri_core::ip_is_internal(addr) {
                     return Some(addr.to_string());
                 }
             }

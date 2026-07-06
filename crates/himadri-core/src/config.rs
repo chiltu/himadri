@@ -76,17 +76,11 @@ pub struct RolePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CorsConfig {
-    #[serde(default = "default_true")]
     pub enabled: bool,
-
-    #[serde(default)]
     pub allowed_origins: Vec<String>,
-
-    #[serde(default = "default_cors_methods")]
     pub allowed_methods: Vec<String>,
-
-    #[serde(default = "default_cors_headers")]
     pub allowed_headers: Vec<String>,
 }
 
@@ -236,27 +230,22 @@ pub struct AuditConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StrategyConfig {
-    #[serde(default = "default_strategy_mode")]
     pub mode: StrategyMode,
 
-    #[serde(default)]
     pub fallback_timeout_ms: u64,
 
     /// Rules for the `conditional` strategy (matched in order).
-    #[serde(default)]
     pub conditional_rules: Vec<ConditionalRuleConfig>,
 
     /// Rules for the `content_based` strategy (matched in order).
-    #[serde(default)]
     pub content_rules: Vec<ContentRuleConfig>,
 
     /// Variants for the `ab_test` strategy.
-    #[serde(default)]
     pub ab_variants: Vec<ABVariantConfig>,
 
     /// Fallback target for `conditional` / `content_based` when no rule matches.
-    #[serde(default)]
     pub strategy_fallback: Option<Target>,
 }
 
@@ -355,17 +344,11 @@ pub struct ObservabilityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TracingConfig {
-    #[serde(default)]
     pub enabled: bool,
-
-    #[serde(default = "default_service_name")]
     pub service_name: String,
-
-    #[serde(default)]
     pub endpoint: Option<String>,
-
-    #[serde(default = "default_sample_ratio")]
     pub sample_ratio: f64,
 }
 
@@ -389,11 +372,9 @@ fn default_sample_ratio() -> f64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MetricsConfig {
-    #[serde(default = "default_true")]
     pub enabled: bool,
-
-    #[serde(default = "default_metrics_path")]
     pub path: String,
 }
 
@@ -410,19 +391,11 @@ fn default_metrics_path() -> String {
     "/metrics".to_string()
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RateLimitConfig {
-    #[serde(default)]
     pub enabled: bool,
-
-    #[serde(default = "default_rate_limit_rps")]
     pub requests_per_second: u64,
-
-    #[serde(default = "default_rate_limit_burst")]
     pub burst_size: u64,
 }
 
@@ -445,15 +418,15 @@ fn default_rate_limit_burst() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AdminConfig {
-    #[serde(default = "default_admin_enabled")]
     pub enabled: bool,
 
     /// Master admin key. Never serialized: `Config` is returned verbatim by
     /// `GET /admin/config` and `/admin/config/history`, and the master key
     /// must not be readable by admin-scoped principals (e.g. JWT-role
     /// admins) or flow into config exports (CWE-522).
-    #[serde(default, skip_serializing)]
+    #[serde(skip_serializing)]
     pub master_key: Option<String>,
 }
 
@@ -466,17 +439,13 @@ impl Default for AdminConfig {
     }
 }
 
-fn default_admin_enabled() -> bool {
-    true
-}
-
 impl Config {
     pub fn load_from_env() -> Result<Self, ConfigError> {
         if let Ok(path) = std::env::var("GATEWAY_CONFIG") {
             return Self::load_from_file(&path);
         }
 
-        Ok(Self::default_config())
+        Ok(Self::default())
     }
 
     pub fn load_from_file(path: &str) -> Result<Self, ConfigError> {
@@ -513,8 +482,10 @@ impl Config {
 
         Ok(())
     }
+}
 
-    fn default_config() -> Self {
+impl Default for Config {
+    fn default() -> Self {
         Self {
             strategy: StrategyConfig::default(),
             targets: vec![Target {
@@ -532,11 +503,5 @@ impl Config {
             cors: CorsConfig::default(),
             rbac: RbacConfig::default(),
         }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self::default_config()
     }
 }

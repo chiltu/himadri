@@ -28,13 +28,4 @@ pub enum AuthError {
 
     #[error("configuration error: {0}")]
     Config(String),
-
-    #[error("token request failed: {0}")]
-    TokenRequestFailed(String),
-
-    #[error("introspection failed: {0}")]
-    IntrospectionFailed(String),
-
-    #[error("token is inactive")]
-    TokenInactive,
 }

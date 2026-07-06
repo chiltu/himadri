@@ -816,19 +816,10 @@ impl Gateway {
         let api_key = self.get_api_key(target)?;
         let url = format!("{}{}", base_url.trim_end_matches('/'), path);
 
-        let mut req_builder = match method {
-            "GET" => PROXY_CLIENT.get(&url),
-            "POST" => PROXY_CLIENT.post(&url),
-            "PUT" => PROXY_CLIENT.put(&url),
-            "DELETE" => PROXY_CLIENT.delete(&url),
-            "PATCH" => PROXY_CLIENT.patch(&url),
-            _ => {
-                let m: reqwest::Method = method
-                    .parse()
-                    .map_err(|_| GatewayError::BadRequest(format!("Invalid method: {}", method)))?;
-                PROXY_CLIENT.request(m, &url)
-            }
-        };
+        let m: reqwest::Method = method
+            .parse()
+            .map_err(|_| GatewayError::BadRequest(format!("Invalid method: {}", method)))?;
+        let mut req_builder = PROXY_CLIENT.request(m, &url);
 
         for (key, value) in headers.iter() {
             if key == "authorization" || key == "host" || key == "content-length" {

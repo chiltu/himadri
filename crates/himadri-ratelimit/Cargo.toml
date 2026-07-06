@@ -9,9 +9,4 @@ parking_lot = { workspace = true }
 ahash = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"], optional = true }
 uuid = { workspace = true }
-
-[features]
-default = []
-redis = ["dep:redis"]

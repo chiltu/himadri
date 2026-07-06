@@ -7,11 +7,20 @@ use crate::error::ProviderError;
 use crate::http_client::CLIENT_POOL;
 use crate::traits::{BoxStream, Provider};
 use himadri_core::{
-    ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart, Delta, MessageContent,
-    ResponseMessage, StreamChoice, StreamChunk, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, Choice, Delta, FunctionCall, ResponseMessage,
+    StreamChoice, StreamChunk, ToolCall, Usage,
 };
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// Map a Gemini finish reason to the OpenAI `finish_reason` vocabulary.
+fn map_finish_reason(gemini: &str) -> String {
+    match gemini {
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        other => other.to_string(),
+    }
+}
 
 #[derive(Clone)]
 pub struct GeminiProvider {
@@ -38,15 +47,7 @@ impl GeminiProvider {
                 };
 
                 let text = match &m.content {
-                    Some(MessageContent::Text(text)) => text.clone(),
-                    Some(MessageContent::Parts(parts)) => parts
-                        .iter()
-                        .filter_map(|p| match p {
-                            ContentPart::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(""),
+                    Some(content) => content.flat_text().into_owned(),
                     None => return None,
                 };
 
@@ -151,24 +152,44 @@ impl GeminiProvider {
             .and_then(|arr| arr.first())
             .ok_or_else(|| ProviderError::Internal("No candidates in response".to_string()))?;
 
-        let content = candidate["content"]["parts"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|p| p["text"].as_str())
-            .map(|s| s.to_string());
+        // A candidate's parts hold `text` and/or `functionCall` entries.
+        // Concatenate the text and translate functionCall parts into
+        // OpenAI-style `tool_calls` (previously dropped).
+        let parts = candidate["content"]["parts"].as_array();
+        let content = parts
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .filter(|s| !s.is_empty());
 
-        let finish_reason = candidate["finishReason"].as_str().map(|r| match r {
-            "STOP" => "stop".to_string(),
-            "MAX_TOKENS" => "length".to_string(),
-            _ => r.to_string(),
-        });
+        let tool_calls = parts
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|p| p.get("functionCall"))
+                    .map(|fc| ToolCall {
+                        id: format!("call-{}", uuid::Uuid::new_v4()),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: fc["name"].as_str().unwrap_or("").to_string(),
+                            // OpenAI carries arguments as a JSON string.
+                            arguments: fc["args"].to_string(),
+                        },
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
+        let finish_reason = candidate["finishReason"].as_str().map(map_finish_reason);
 
         let choices = vec![Choice {
             index: 0,
             message: ResponseMessage {
                 role: himadri_core::Role::Assistant,
                 content,
-                tool_calls: None,
+                tool_calls,
             },
             finish_reason,
         }];
@@ -204,11 +225,7 @@ impl GeminiProvider {
                 .and_then(|p| p["text"].as_str())
                 .map(|s| s.to_string());
 
-            let finish = candidate["finishReason"].as_str().map(|r| match r {
-                "STOP" => "stop".to_string(),
-                "MAX_TOKENS" => "length".to_string(),
-                _ => r.to_string(),
-            });
+            let finish = candidate["finishReason"].as_str().map(map_finish_reason);
 
             (text, finish)
         } else {
@@ -281,14 +298,16 @@ impl Provider for GeminiProvider {
 
         debug!("Sending request to Gemini");
 
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url, request.model, api_key
-        );
+        // Pass the key via the `x-goog-api-key` header, never the URL query
+        // string: reqwest includes the full URL in its error `Display`, which
+        // flows into `ProviderError::Network` and thus logs / audit / 502
+        // bodies — leaking the provider credential.
+        let url = format!("{}/models/{}:generateContent", self.base_url, request.model);
 
         let response = client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", api_key)
             .json(&body)
             .send()
             .await?;
@@ -313,14 +332,17 @@ impl Provider for GeminiProvider {
 
         debug!("Sending streaming request to Gemini");
 
+        // Key travels in the `x-goog-api-key` header, not the URL (see
+        // `complete` above — a URL-embedded key leaks through error text).
         let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, request.model, api_key
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, request.model
         );
 
         let response = client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", api_key)
             .header("Accept", "text/event-stream")
             .json(&body)
             .send()
@@ -367,26 +389,12 @@ impl Provider for GeminiProvider {
 #[cfg(test)]
 mod tool_tests {
     use super::*;
-    use himadri_core::{ChatCompletionRequest, Message, Role, Tool, ToolFunction};
+    use himadri_core::{ChatCompletionRequest, Message, Tool, ToolFunction};
 
     fn request_with_tools(tool_choice: serde_json::Value) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "gemini-1.5-pro".to_string(),
-            messages: vec![Message {
-                role: Role::User,
-                content: Some(MessageContent::Text("weather?".to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            stop: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            user: None,
+            messages: vec![Message::user("weather?")],
             tools: Some(vec![Tool {
                 tool_type: "function".to_string(),
                 function: ToolFunction {
@@ -396,7 +404,7 @@ mod tool_tests {
                 },
             }]),
             tool_choice: Some(tool_choice),
-            extra: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -409,6 +417,31 @@ mod tool_tests {
             "get_weather"
         );
         assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+    }
+
+    #[test]
+    fn parse_response_surfaces_function_calls() {
+        // Regression (R36): functionCall parts were dropped.
+        let provider = GeminiProvider::new(None);
+        let response = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "text": "Checking." },
+                    { "functionCall": { "name": "get_weather", "args": { "city": "Paris" } } }
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let parsed = provider.parse_response(response, "gemini-1.5-pro").unwrap();
+        let choice = &parsed.choices[0];
+        let calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool_calls present");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert!(calls[0].function.arguments.contains("Paris"));
+        assert_eq!(choice.message.content.as_deref(), Some("Checking."));
     }
 
     #[test]
