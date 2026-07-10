@@ -19,7 +19,6 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Table,
   TableBody,
@@ -353,83 +352,78 @@ export default function KeysPage() {
             </div>
           )}
 
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle>All Keys</CardTitle>
-                <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-                  <DialogTrigger asChild>
-                    <Button>Create Key</Button>
-                  </DialogTrigger>
-                  <DialogContent>
-                    <DialogHeader>
-                      <DialogTitle>Create API Key</DialogTitle>
-                    </DialogHeader>
-                    <div className="space-y-4">
-                      <KeyFormFields form={createForm} onChange={setCreateForm} />
-                      <Button onClick={handleCreate} className="w-full">Create</Button>
+          <div className="flex items-center justify-between">
+            <h1 className="text-lg font-semibold">All Keys</h1>
+            <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+              <DialogTrigger asChild>
+                <Button>Create Key</Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Create API Key</DialogTitle>
+                </DialogHeader>
+                <div className="space-y-4">
+                  <KeyFormFields form={createForm} onChange={setCreateForm} />
+                  <Button onClick={handleCreate} className="w-full">Create</Button>
+                </div>
+              </DialogContent>
+            </Dialog>
+          </div>
+
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Key</TableHead>
+                <TableHead>Scopes</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Created</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {keys.map((k) => (
+                <TableRow key={k.id}>
+                  <TableCell className="font-medium">{k.name}</TableCell>
+                  <TableCell className="font-mono text-sm">{k.key.slice(0, 8)}...{k.key.slice(-4)}</TableCell>
+                  <TableCell>
+                    <div className="flex gap-1">
+                      {k.scopes.map((s) => (
+                        <Badge key={s} variant="secondary">{s}</Badge>
+                      ))}
                     </div>
-                  </DialogContent>
-                </Dialog>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Name</TableHead>
-                    <TableHead>Key</TableHead>
-                    <TableHead>Scopes</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Created</TableHead>
-                    <TableHead className="text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {keys.map((k) => (
-                    <TableRow key={k.id}>
-                      <TableCell className="font-medium">{k.name}</TableCell>
-                      <TableCell className="font-mono text-sm">{k.key.slice(0, 8)}...{k.key.slice(-4)}</TableCell>
-                      <TableCell>
-                        <div className="flex gap-1">
-                          {k.scopes.map((s) => (
-                            <Badge key={s} variant="secondary">{s}</Badge>
-                          ))}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant={k.enabled ? "default" : "destructive"}>
-                          {k.enabled ? "Active" : "Disabled"}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="text-sm">{new Date(k.created_at).toLocaleDateString()}</TableCell>
-                      <TableCell className="text-right">
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button variant="ghost" size="sm">...</Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={() => openEdit(k)}>Edit</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => handleToggle(k)}>
-                              {k.enabled ? "Disable" : "Enable"}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => handleRotate(k.id)}>Rotate Key</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => handleRevoke(k.id)}>Revoke</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => handleDelete(k.id)} className="text-destructive">Delete</DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                  {keys.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={6} className="text-center text-muted-foreground py-8">No API keys yet</TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={k.enabled ? "default" : "destructive"}>
+                      {k.enabled ? "Active" : "Disabled"}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-sm">{new Date(k.created_at).toLocaleDateString()}</TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="sm">...</Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => openEdit(k)}>Edit</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleToggle(k)}>
+                          {k.enabled ? "Disable" : "Enable"}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleRotate(k.id)}>Rotate Key</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleRevoke(k.id)}>Revoke</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleDelete(k.id)} className="text-destructive">Delete</DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                </TableRow>
+              ))}
+              {keys.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-center text-muted-foreground py-8">No API keys yet</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
         </div>
       </SidebarInset>
     </SidebarProvider>

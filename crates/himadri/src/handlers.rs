@@ -27,6 +27,7 @@ const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// Uniform JSON error for non-`GatewayError` handler failures, so admin
 /// endpoints return the same `{"error": {...}}` envelope as the /v1 API
 /// instead of plain-text bodies or empty responses.
+#[derive(Debug)]
 pub(crate) struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
@@ -50,11 +51,80 @@ impl From<(StatusCode, String)> for ApiError {
     }
 }
 
+/// The single place admin-store errors become HTTP statuses. `Validation`
+/// and `Conflict` messages are written for the client and returned verbatim;
+/// `Store` detail (SQL, connection errors) is already logged by the admin
+/// facade and must not be echoed to clients.
+impl From<himadri_admin::AdminError> for ApiError {
+    fn from(e: himadri_admin::AdminError) -> Self {
+        use himadri_admin::AdminError;
+        match e {
+            AdminError::NotFound => ApiError::not_found(),
+            AdminError::Validation(m) => ApiError(StatusCode::BAD_REQUEST, m),
+            AdminError::Conflict(m) => ApiError(StatusCode::CONFLICT, m),
+            AdminError::Store(_) => ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal storage error".to_string(),
+            ),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) gateway: Arc<Gateway>,
     pub(crate) admin: Arc<AdminHandlers>,
     pub(crate) metrics: Arc<Metrics>,
+    /// Present when the dev/break-glass admin login is enabled
+    /// (`DEV_ADMIN_PASSWORD`); issues and signs the login tokens.
+    pub(crate) admin_login: Option<Arc<himadri_auth::AdminLogin>>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct DevAdminLoginRequest {
+    username: String,
+    password: String,
+}
+
+/// `POST /auth/admin/login` — dev/break-glass admin login.
+///
+/// Verifies the `DEV_ADMIN_USERNAME`/`DEV_ADMIN_PASSWORD` credentials in
+/// constant time and returns a short-lived admin JWT that the combined auth
+/// middleware accepts like any other bearer token. Responds 404 when the
+/// mechanism is disabled so the endpoint's existence isn't advertised, and
+/// audits + rate-slows failed attempts (this is a password endpoint).
+pub(crate) async fn dev_admin_login(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DevAdminLoginRequest>,
+) -> Result<Json<himadri_auth::IssuedAdminToken>, ApiError> {
+    let Some(login) = &state.admin_login else {
+        return Err(ApiError::not_found());
+    };
+
+    if !login.verify(&body.username, &body.password) {
+        let remote_ip = resolve_remote_ip(peer, &headers);
+        state.gateway.audit_log_arc().log_auth_failure(
+            himadri_observability::AuditStatus::Unauthorized,
+            "dev admin login: invalid credentials",
+            remote_ip,
+            Some(body.username.clone()),
+            None,
+        );
+        // Blunt brute-force damper; per-IP rate limiting would be better but
+        // this endpoint only exists in dev/break-glass configurations.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid username or password".to_string(),
+        ));
+    }
+
+    let issued = login
+        .issue()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(issued))
 }
 
 pub(crate) async fn health() -> Json<serde_json::Value> {
@@ -93,7 +163,14 @@ pub(crate) async fn metrics_handler(
 }
 
 pub(crate) async fn list_models(State(state): State<AppState>) -> Json<ModelListResponse> {
-    let admin_models = state.admin.list_enabled_models_for_api().await;
+    // On a store error, fall back to the env-provider catalog below rather
+    // than failing the whole endpoint: /v1/models is availability-first and
+    // the failure is already logged by the admin facade.
+    let admin_models = state
+        .admin
+        .list_enabled_models_for_api()
+        .await
+        .unwrap_or_default();
     if !admin_models.is_empty() {
         return Json(ModelListResponse {
             object: "list".to_string(),
@@ -318,7 +395,7 @@ pub(crate) async fn embeddings(
 pub(crate) async fn list_keys(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<himadri_admin::ApiKey>>, ApiError> {
-    Ok(Json(state.admin.list_keys().await))
+    Ok(Json(state.admin.list_keys().await?))
 }
 
 pub(crate) async fn create_key(
@@ -330,7 +407,7 @@ pub(crate) async fn create_key(
         .create_key(request)
         .await
         .map(|key| (StatusCode::CREATED, Json(key)))
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(ApiError::from)
 }
 
 pub(crate) async fn get_key(
@@ -340,7 +417,7 @@ pub(crate) async fn get_key(
     state
         .admin
         .get_key(&id)
-        .await
+        .await?
         .map(Json)
         .ok_or_else(ApiError::not_found)
 }
@@ -353,7 +430,7 @@ pub(crate) async fn update_key(
     state
         .admin
         .update_key(&id, request)
-        .await
+        .await?
         .map(Json)
         .ok_or_else(ApiError::not_found)
 }
@@ -362,10 +439,13 @@ pub(crate) async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if state.admin.delete_key(&id).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::not_found())
+    // A store failure must surface as a 500, not collapse into the 404 arm:
+    // the row may still exist, and "not found" would tell the client the
+    // delete succeeded.
+    match state.admin.delete_key(&id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(ApiError::not_found()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -373,10 +453,10 @@ pub(crate) async fn revoke_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if state.admin.revoke_key(&id).await {
-        Ok(StatusCode::OK)
-    } else {
-        Err(ApiError::not_found())
+    match state.admin.revoke_key(&id).await {
+        Ok(true) => Ok(StatusCode::OK),
+        Ok(false) => Err(ApiError::not_found()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -387,7 +467,7 @@ pub(crate) async fn rotate_key(
     state
         .admin
         .rotate_key(&id)
-        .await
+        .await?
         .map(Json)
         .ok_or_else(ApiError::not_found)
 }
@@ -449,6 +529,7 @@ pub(crate) async fn reload_config(
         .reload_config(new_config)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    state.reassert_db_targets_after_config().await;
     Ok(Json(serde_json::json!({ "status": "reloaded" })))
 }
 
@@ -457,7 +538,7 @@ pub(crate) async fn reload_config(
 pub(crate) async fn dashboard(
     State(state): State<AppState>,
 ) -> Json<himadri_admin::DashboardSummary> {
-    let key_count = state.admin.list_keys().await.len();
+    let key_count = state.admin.list_keys().await.map_or(0, |k| k.len());
     let dashboard = state.gateway.usage_store().get_dashboard(key_count);
     Json(dashboard)
 }
@@ -499,6 +580,7 @@ pub(crate) async fn update_config(
         .reload_config(new_config)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    state.reassert_db_targets_after_config().await;
     Ok(Json(serde_json::json!({ "status": "updated" })))
 }
 
@@ -521,6 +603,7 @@ pub(crate) async fn config_rollback(
         .rollback_config(version)
         .await
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    state.reassert_db_targets_after_config().await;
     Ok(Json(serde_json::json!({
         "status": "rolled_back",
         "version": version,
@@ -554,52 +637,108 @@ pub(crate) async fn delete_logs(
 // ─── Provider / Model Handlers ───────────────────────────────────────
 
 impl AppState {
-    /// Rebuild the gateway's routing targets from the DB-backed provider and
-    /// model stores. Must be called after any mutation of either store.
+    /// Rebuild the gateway's routing targets from the DB-backed model and
+    /// endpoint stores. Must be called after any mutation of either store.
+    ///
+    /// If either list fails, the previous targets are kept: rebuilding from a
+    /// partial read would silently wipe live routing state over a transient
+    /// DB error.
     async fn rebuild_targets(&self) {
-        let providers = self.admin.list_providers().await;
-        let models = self.admin.list_models().await;
+        let (models, endpoints) = match (
+            self.admin.list_models().await,
+            self.admin.list_endpoints().await,
+        ) {
+            (Ok(m), Ok(e)) => (m, e),
+            _ => {
+                tracing::warn!("skipping target rebuild: model/endpoint stores unavailable");
+                return;
+            }
+        };
         self.gateway
-            .rebuild_targets_from_db(&providers, &models)
+            .rebuild_targets_from_db(&models, &endpoints)
             .await;
     }
 
-    /// 201 + entity on success (rebuilding targets), 500 with `label` on failure.
+    /// Re-assert DB-derived routing targets after a config apply.
+    ///
+    /// Applying a config (reload / update / rollback) overwrites the live
+    /// targets with the config document's `targets`. When the provider/model
+    /// tables are populated they are the source of truth, so a config save
+    /// would otherwise silently drop every DB-registered provider/model from
+    /// routing until the next provider/model mutation. Re-running the DB
+    /// rebuild here keeps the two in sync. When the DB has no providers the
+    /// config-supplied targets stand, preserving env/file-driven deployments.
+    async fn reassert_db_targets_after_config(&self) {
+        // A store error keeps the config-supplied targets (same reasoning as
+        // `rebuild_targets`: never replace live routing over a failed read).
+        let (models, endpoints) = match (
+            self.admin.list_models().await,
+            self.admin.list_endpoints().await,
+        ) {
+            (Ok(m), Ok(e)) => (m, e),
+            _ => {
+                tracing::warn!("skipping DB target reassert: model/endpoint stores unavailable");
+                return;
+            }
+        };
+        // Guard on *active* targets, not merely on rows existing: a DB whose
+        // endpoints are all disabled would rebuild to an empty target list and
+        // wipe the config's own targets — a full routing outage.
+        if !Gateway::db_has_active_targets(&models, &endpoints) {
+            return;
+        }
+        self.gateway
+            .rebuild_targets_from_db(&models, &endpoints)
+            .await;
+    }
+
+    /// 201 + entity on success (rebuilding targets); errors map per
+    /// [`ApiError::from`] (400 validation, 409 conflict, 500 store).
     async fn created<T>(
         &self,
-        result: Option<T>,
-        label: &str,
+        result: Result<T, himadri_admin::AdminError>,
     ) -> Result<(StatusCode, Json<T>), ApiError> {
         match result {
-            Some(v) => {
+            Ok(v) => {
                 self.rebuild_targets().await;
                 Ok((StatusCode::CREATED, Json(v)))
             }
-            None => Err(ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create {}", label),
-            )),
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// Entity on success (rebuilding targets), 404 when the id didn't match.
-    async fn updated<T>(&self, result: Option<T>) -> Result<Json<T>, ApiError> {
+    /// Entity on success (rebuilding targets), 404 when the id didn't match,
+    /// errors per [`ApiError::from`].
+    async fn updated<T>(
+        &self,
+        result: Result<Option<T>, himadri_admin::AdminError>,
+    ) -> Result<Json<T>, ApiError> {
         match result {
-            Some(v) => {
+            Ok(Some(v)) => {
                 self.rebuild_targets().await;
                 Ok(Json(v))
             }
-            None => Err(ApiError::not_found()),
+            Ok(None) => Err(ApiError::not_found()),
+            Err(e) => Err(e.into()),
         }
     }
 
-    /// 204 on success (rebuilding targets), 404 when the id didn't match.
-    async fn deleted(&self, deleted: bool) -> Result<StatusCode, ApiError> {
-        if deleted {
-            self.rebuild_targets().await;
-            Ok(StatusCode::NO_CONTENT)
-        } else {
-            Err(ApiError::not_found())
+    /// 204 on success (rebuilding targets), 404 when the id didn't match,
+    /// 409 Conflict — carrying the guard's message — when a validation guard
+    /// blocked the delete (e.g. "model is enabled"), and 500 when the store
+    /// itself failed. Distinguishing the last two was the point of
+    /// `AdminError`: a DB outage must not masquerade as a client mistake.
+    async fn deleted(
+        &self,
+        result: Result<bool, himadri_admin::AdminError>,
+    ) -> Result<StatusCode, ApiError> {
+        match result {
+            Ok(true) => {
+                self.rebuild_targets().await;
+                Ok(StatusCode::NO_CONTENT)
+            }
+            Ok(false) => Err(ApiError::not_found()),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -616,62 +755,10 @@ fn default_true() -> bool {
     true
 }
 
-pub(crate) async fn list_providers(
-    State(state): State<AppState>,
-) -> Json<Vec<himadri_admin::Provider>> {
-    Json(state.admin.list_providers().await)
-}
-
-pub(crate) async fn create_provider(
-    State(state): State<AppState>,
-    Json(request): Json<himadri_admin::CreateProviderRequest>,
-) -> Result<(StatusCode, Json<himadri_admin::Provider>), ApiError> {
-    let result = state.admin.create_provider(request).await;
-    state.created(result, "provider").await
-}
-
-pub(crate) async fn get_provider(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<himadri_admin::Provider>, ApiError> {
-    state
-        .admin
-        .get_provider(&id)
-        .await
-        .map(Json)
-        .ok_or_else(ApiError::not_found)
-}
-
-pub(crate) async fn update_provider(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<himadri_admin::UpdateProviderRequest>,
-) -> Result<Json<himadri_admin::Provider>, ApiError> {
-    let result = state.admin.update_provider(&id, request).await;
-    state.updated(result).await
-}
-
-pub(crate) async fn delete_provider(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let deleted = state.admin.delete_provider(&id).await;
-    state.deleted(deleted).await
-}
-
-pub(crate) async fn toggle_provider(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<ToggleBody>,
-) -> Result<Json<himadri_admin::Provider>, ApiError> {
-    let result = state.admin.toggle_provider(&id, body.enabled).await;
-    state.updated(result).await
-}
-
 pub(crate) async fn list_models_api(
     State(state): State<AppState>,
-) -> Json<Vec<himadri_admin::Model>> {
-    Json(state.admin.list_models().await)
+) -> Result<Json<Vec<himadri_admin::Model>>, ApiError> {
+    Ok(Json(state.admin.list_models().await?))
 }
 
 pub(crate) async fn create_model(
@@ -679,7 +766,7 @@ pub(crate) async fn create_model(
     Json(request): Json<himadri_admin::CreateModelRequest>,
 ) -> Result<(StatusCode, Json<himadri_admin::Model>), ApiError> {
     let result = state.admin.create_model(request).await;
-    state.created(result, "model").await
+    state.created(result).await
 }
 
 pub(crate) async fn get_model(
@@ -689,7 +776,7 @@ pub(crate) async fn get_model(
     state
         .admin
         .get_model(&id)
-        .await
+        .await?
         .map(Json)
         .ok_or_else(ApiError::not_found)
 }
@@ -718,6 +805,118 @@ pub(crate) async fn toggle_model(
 ) -> Result<Json<himadri_admin::Model>, ApiError> {
     let result = state.admin.toggle_model(&id, body.enabled).await;
     state.updated(result).await
+}
+
+// ─── Model Endpoint Handlers ─────────────────────────────────────────
+
+/// Strip the (decrypted) API key before returning an endpoint over HTTP. The
+/// admin UI never needs the key back — it only writes it — so redacting here
+/// avoids echoing credentials to every list/get caller.
+fn redact_endpoint(mut e: himadri_admin::ModelEndpoint) -> himadri_admin::ModelEndpoint {
+    if e.api_key.is_some() {
+        e.api_key = None;
+    }
+    e
+}
+
+/// All endpoints across every model (keys redacted). Lets the UI compute which
+/// models are active and enumerate providers in use without an N+1 fetch.
+pub(crate) async fn list_all_model_endpoints(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<himadri_admin::ModelEndpoint>>, ApiError> {
+    Ok(Json(
+        state
+            .admin
+            .list_endpoints()
+            .await?
+            .into_iter()
+            .map(redact_endpoint)
+            .collect(),
+    ))
+}
+
+pub(crate) async fn list_model_endpoints(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<Vec<himadri_admin::ModelEndpoint>>, ApiError> {
+    Ok(Json(
+        state
+            .admin
+            .list_endpoints_by_model(&model_id)
+            .await?
+            .into_iter()
+            .map(redact_endpoint)
+            .collect(),
+    ))
+}
+
+pub(crate) async fn create_model_endpoint(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    Json(request): Json<himadri_admin::CreateModelEndpointRequest>,
+) -> Result<(StatusCode, Json<himadri_admin::ModelEndpoint>), ApiError> {
+    // Redact before the HTTP response — create may return a plaintext key for
+    // internal use, but clients (and logs that capture bodies) must never see it.
+    let result = state
+        .admin
+        .create_endpoint(&model_id, request)
+        .await
+        .map(redact_endpoint);
+    state.created(result).await
+}
+
+pub(crate) async fn get_model_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<himadri_admin::ModelEndpoint>, ApiError> {
+    state
+        .admin
+        .get_endpoint(&id)
+        .await?
+        .map(redact_endpoint)
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+pub(crate) async fn update_model_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<himadri_admin::UpdateModelEndpointRequest>,
+) -> Result<Json<himadri_admin::ModelEndpoint>, ApiError> {
+    let result = state
+        .admin
+        .update_endpoint(&id, request)
+        .await
+        .map(|opt| opt.map(redact_endpoint));
+    state.updated(result).await
+}
+
+pub(crate) async fn delete_model_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let result = state.admin.delete_endpoint(&id).await;
+    state.deleted(result).await
+}
+
+pub(crate) async fn toggle_model_endpoint(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ToggleBody>,
+) -> Result<Json<himadri_admin::ModelEndpoint>, ApiError> {
+    let result = state
+        .admin
+        .toggle_endpoint(&id, body.enabled)
+        .await
+        .map(|opt| opt.map(redact_endpoint));
+    state.updated(result).await
+}
+
+/// Provider types with a built-in preset, for the admin UI's provider picker.
+/// Served from the shared registry so the UI can't drift from what the
+/// gateway actually routes.
+pub(crate) async fn known_providers() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "data": himadri_core::KNOWN_PROVIDER_TYPES }))
 }
 
 /// Build an OpenAI-wire-compatible SSE response from a chunk stream:
@@ -872,4 +1071,94 @@ fn trusted_proxy_ip(headers: &axum::http::HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod dev_admin_login_tests {
+    use super::*;
+    use axum::extract::ConnectInfo;
+
+    async fn state(login: Option<Arc<himadri_auth::AdminLogin>>) -> AppState {
+        let gateway = Arc::new(Gateway::new(Config::default(), Arc::new(Metrics::new())));
+        AppState {
+            metrics: gateway.metrics(),
+            gateway,
+            admin: Arc::new(AdminHandlers::new(himadri_admin::StoreBackend::new().await)),
+            admin_login: login,
+        }
+    }
+
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("127.0.0.1:9999".parse().unwrap())
+    }
+
+    fn req(username: &str, password: &str) -> Json<DevAdminLoginRequest> {
+        Json(DevAdminLoginRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+        })
+    }
+
+    /// Disabled (no DEV_ADMIN_PASSWORD) → 404, so the endpoint's existence
+    /// isn't advertised on production deployments.
+    #[tokio::test]
+    async fn responds_not_found_when_disabled() {
+        let state = state(None).await;
+        let err = dev_admin_login(
+            State(state),
+            peer(),
+            axum::http::HeaderMap::new(),
+            req("admin", "hunter2"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_credentials_with_401() {
+        let login = Arc::new(himadri_auth::AdminLogin::new(
+            "admin".to_string(),
+            "hunter2".to_string(),
+            3600,
+        ));
+        let state = state(Some(login)).await;
+        let err = dev_admin_login(
+            State(state),
+            peer(),
+            axum::http::HeaderMap::new(),
+            req("admin", "wrong"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Valid credentials return a bearer token that the same AdminLogin
+    /// instance (i.e. the combined auth middleware) validates as an
+    /// Admin-scope principal.
+    #[tokio::test]
+    async fn issues_admin_token_for_valid_credentials() {
+        let login = Arc::new(himadri_auth::AdminLogin::new(
+            "admin".to_string(),
+            "hunter2".to_string(),
+            3600,
+        ));
+        let state = state(Some(login.clone())).await;
+        let Json(issued) = dev_admin_login(
+            State(state),
+            peer(),
+            axum::http::HeaderMap::new(),
+            req("admin", "hunter2"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(issued.token_type, "Bearer");
+        let ctx = login
+            .validate(&issued.access_token)
+            .expect("issued token must validate")
+            .into_auth_context();
+        assert_eq!(ctx.scope, himadri_core::AuthScope::Admin);
+    }
 }

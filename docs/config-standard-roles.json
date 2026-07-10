@@ -1,0 +1,64 @@
+{
+  "strategy": {
+    "mode": "single"
+  },
+  "targets": [
+    {
+      "provider": "openai",
+      "weight": 1.0,
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  ],
+  "admin": {
+    "master_key_required": true
+  },
+  "rbac": {
+    "enabled": true,
+    "default_role": "user",
+    "roles": {
+      "user": {
+        "description": "Basic authenticated user",
+        "models": [
+          "gpt-4o-mini",
+          "claude-3-5-haiku"
+        ],
+        "providers": null
+      },
+      "power-user": {
+        "description": "Extended access to all models/providers",
+        "models": null,
+        "providers": null
+      },
+      "analyst": {
+        "description": "Read-only: usage logs and audit trails",
+        "models": null,
+        "providers": null
+      },
+      "admin": {
+        "description": "Full gateway control",
+        "models": null,
+        "providers": null
+      }
+    }
+  },
+  "rate_limit": {
+    "enabled": false,
+    "requests_per_second": 100,
+    "burst_size": 200
+  },
+  "orgs": {},
+  "cors": {
+    "enabled": false,
+    "allowed_origins": [],
+    "allowed_methods": [
+      "GET",
+      "POST",
+      "PUT",
+      "DELETE"
+    ],
+    "allowed_headers": [
+      "Authorization",
+      "Content-Type"
+    ]
+  }
+}

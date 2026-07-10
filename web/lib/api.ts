@@ -1,20 +1,54 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
+/** Browser storage key for the admin session token (a short-lived JWT from
+ * `POST /auth/admin/login`). The legacy name is kept so sessions created
+ * before the master-key login was removed migrate cleanly. */
+const AUTH_TOKEN_KEY = "himadri_master_key";
+
+/**
+ * Read the admin session token.
+ *
+ * Prefer `sessionStorage` so the token is not written to durable disk storage
+ * and is cleared when the tab/window closes. Fall back to (and migrate away
+ * from) legacy `localStorage` entries so existing sessions keep working once.
+ *
+ * Note: any token readable from JS remains XSS-sensitive; httpOnly cookie
+ * sessions are the proper long-term fix for production multi-user dashboards.
+ * The blast radius is bounded now: this is a short-lived login JWT, not the
+ * gateway master key.
+ */
 function getAuthToken(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("himadri_master_key");
+  const fromSession = sessionStorage.getItem(AUTH_TOKEN_KEY);
+  if (fromSession) return fromSession;
+
+  const legacy = localStorage.getItem(AUTH_TOKEN_KEY);
+  if (legacy) {
+    sessionStorage.setItem(AUTH_TOKEN_KEY, legacy);
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    return legacy;
+  }
+  return null;
 }
 
 export function setAuthToken(key: string) {
-  localStorage.setItem("himadri_master_key", key);
+  sessionStorage.setItem(AUTH_TOKEN_KEY, key);
+  // Drop any prior durable copy so the secret is not left on disk.
+  localStorage.removeItem(AUTH_TOKEN_KEY);
 }
 
 export function clearAuthToken() {
-  localStorage.removeItem("himadri_master_key");
+  sessionStorage.removeItem(AUTH_TOKEN_KEY);
+  localStorage.removeItem(AUTH_TOKEN_KEY);
 }
 
 export function isAuthenticated(): boolean {
   return getAuthToken() !== null;
+}
+
+/** Exported for non-`request()` callers (e.g. streaming playground fetch). */
+export function getSessionToken(): string | null {
+  return getAuthToken();
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -41,7 +75,15 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const body = await res.text();
     throw new Error(`API error ${res.status}: ${body}`);
   }
-  return res.json();
+
+  // 204 No Content (e.g. successful DELETE) and other empty-body responses have
+  // no JSON to parse — calling res.json() on them throws "Unexpected end of JSON
+  // input". Return undefined so callers expecting no payload resolve cleanly.
+  if (res.status === 204 || res.headers.get("content-length") === "0") {
+    return undefined as T;
+  }
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 export interface ApiKey {
@@ -115,37 +157,11 @@ export interface UpdateApiKeyRequest {
   } | null;
 }
 
-export interface Provider {
-  id: string;
-  name: string;
-  enabled: boolean;
-  api_key?: string;
-  base_url?: string;
-  weight: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface CreateProviderRequest {
-  name: string;
-  enabled?: boolean;
-  api_key?: string;
-  base_url?: string;
-  weight?: number;
-}
-
-export interface UpdateProviderRequest {
-  name?: string;
-  enabled?: boolean;
-  api_key?: string;
-  base_url?: string;
-  weight?: number;
-}
-
+/** A model is a first-party entity that owns one or more provider endpoints.
+ *  It is "active" (routable) only when it has at least one enabled endpoint. */
 export interface Model {
   id: string;
   name: string;
-  provider_id: string;
   display_name?: string;
   enabled: boolean;
   created_at: string;
@@ -154,15 +170,43 @@ export interface Model {
 
 export interface CreateModelRequest {
   name: string;
-  provider_id: string;
   display_name?: string;
   enabled?: boolean;
 }
 
 export interface UpdateModelRequest {
   name?: string;
-  provider_id?: string;
   display_name?: string;
+  enabled?: boolean;
+}
+
+/** One provider route for a model: a provider type + credentials + weight. */
+export interface ModelEndpoint {
+  id: string;
+  model_id: string;
+  provider_type: string;
+  base_url?: string;
+  api_key?: string;
+  /** Routing weight among the model's endpoints. Defaults to 1.0. */
+  weight: number;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateModelEndpointRequest {
+  provider_type: string;
+  base_url?: string;
+  api_key?: string;
+  weight?: number;
+  enabled?: boolean;
+}
+
+export interface UpdateModelEndpointRequest {
+  provider_type?: string;
+  base_url?: string;
+  api_key?: string;
+  weight?: number;
   enabled?: boolean;
 }
 
@@ -405,12 +449,6 @@ export interface RequestLogQuery {
 }
 
 export const api = {
-  // Auth
-  testAuth: (key: string) =>
-    fetch(`${API_BASE}/admin/dashboard`, {
-      headers: { Authorization: `Bearer ${key}` },
-    }).then((r) => r.ok),
-
   // Keys
   listKeys: () => request<ApiKey[]>("/admin/keys"),
   createKey: (data: CreateApiKeyRequest) =>
@@ -425,19 +463,7 @@ export const api = {
   rotateKey: (id: string) =>
     request<ApiKey>(`/admin/keys/${id}/rotate`, { method: "POST" }),
 
-  // Providers
-  listProviders: () => request<Provider[]>("/admin/providers"),
-  createProvider: (data: CreateProviderRequest) =>
-    request<Provider>("/admin/providers", { method: "POST", body: JSON.stringify(data) }),
-  getProvider: (id: string) => request<Provider>(`/admin/providers/${id}`),
-  updateProvider: (id: string, data: UpdateProviderRequest) =>
-    request<Provider>(`/admin/providers/${id}`, { method: "PUT", body: JSON.stringify(data) }),
-  deleteProvider: (id: string) =>
-    request<void>(`/admin/providers/${id}`, { method: "DELETE" }),
-  toggleProvider: (id: string, enabled: boolean) =>
-    request<Provider>(`/admin/providers/${id}/toggle`, { method: "POST", body: JSON.stringify({ enabled }) }),
-
-  // Models
+  // Models (first-party)
   listModels: () => request<Model[]>("/admin/models"),
   createModel: (data: CreateModelRequest) =>
     request<Model>("/admin/models", { method: "POST", body: JSON.stringify(data) }),
@@ -448,6 +474,39 @@ export const api = {
     request<void>(`/admin/models/${id}`, { method: "DELETE" }),
   toggleModel: (id: string, enabled: boolean) =>
     request<Model>(`/admin/models/${id}/toggle`, { method: "POST", body: JSON.stringify({ enabled }) }),
+
+  // Model endpoints (a model's provider routes)
+  listAllEndpoints: () => request<ModelEndpoint[]>("/admin/endpoints"),
+  listEndpoints: (modelId: string) =>
+    request<ModelEndpoint[]>(`/admin/models/${modelId}/endpoints`),
+  createEndpoint: (modelId: string, data: CreateModelEndpointRequest) =>
+    request<ModelEndpoint>(`/admin/models/${modelId}/endpoints`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  updateEndpoint: (id: string, data: UpdateModelEndpointRequest) =>
+    request<ModelEndpoint>(`/admin/endpoints/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteEndpoint: (id: string) =>
+    request<void>(`/admin/endpoints/${id}`, { method: "DELETE" }),
+  toggleEndpoint: (id: string, enabled: boolean) =>
+    request<ModelEndpoint>(`/admin/endpoints/${id}/toggle`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  knownProviders: () =>
+    request<{ data: string[] }>("/admin/known-providers").then((r) => r.data),
+
+  /**
+   * Dev/break-glass admin login (enabled on the gateway via
+   * DEV_ADMIN_PASSWORD). Exchanges a username+password for a short-lived
+   * admin JWT; store it with setAuthToken. 404 means the mechanism is
+   * disabled on this gateway.
+   */
+  adminLogin: (username: string, password: string) =>
+    request<{ access_token: string; token_type: string; expires_in: number }>(
+      "/auth/admin/login",
+      { method: "POST", body: JSON.stringify({ username, password }) },
+    ),
 
   // Dashboard & Usage
   dashboard: () => request<DashboardSummary>("/admin/dashboard"),

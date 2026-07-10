@@ -1,7 +1,7 @@
 "use client"
 
-import { useEffect, useState, useRef } from "react"
-import { api, type Model } from "@/lib/api"
+import { useEffect, useMemo, useState, useRef } from "react"
+import { api, type Model, type ModelEndpoint, getSessionToken } from "@/lib/api"
 import { AuthGuard } from "@/components/auth-guard"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
@@ -19,18 +19,36 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
+import { Textarea } from "@/components/ui/textarea"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { HugeiconsIcon } from "@hugeicons/react"
+import { SentIcon, DashboardSpeed01Icon, BubbleChatIcon } from "@hugeicons/core-free-icons"
 
 interface Message {
   role: "user" | "assistant" | "system"
   content: string
 }
 
+// Model context windows are not exposed by the admin API, so we show usage
+// against a conservative default window and estimate tokens from characters
+// (~4 chars/token) — labelled as an approximation in the UI.
+const CONTEXT_WINDOW = 128_000
+
+function formatTokens(n: number): string {
+  return n >= 1000 ? `${Math.round(n / 1000)}K` : `${n}`
+}
+
 export default function PlaygroundPage() {
   const [models, setModels] = useState<Model[]>([])
+  const [endpoints, setEndpoints] = useState<ModelEndpoint[]>([])
   const [selectedModel, setSelectedModel] = useState("")
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
@@ -40,13 +58,22 @@ export default function PlaygroundPage() {
 
   useEffect(() => {
     api.listModels().then(setModels).catch((e) => setError(e.message))
+    api.listAllEndpoints().then(setEndpoints).catch((e) => setError(e.message))
   }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
-  const enabledModels = models.filter((m) => m.enabled)
+  // A model is usable only when it's enabled *and* has an enabled provider
+  // endpoint — otherwise a request would 404 with "no provider configured".
+  const activeModelIds = new Set(endpoints.filter((e) => e.enabled).map((e) => e.model_id))
+  const enabledModels = models.filter((m) => m.enabled && activeModelIds.has(m.id))
+
+  const usedTokens = useMemo(() => {
+    const chars = messages.reduce((sum, m) => sum + m.content.length, 0)
+    return Math.ceil(chars / 4)
+  }, [messages])
 
   const sendMessage = async () => {
     if (!input.trim() || !selectedModel || loading) return
@@ -65,8 +92,10 @@ export default function PlaygroundPage() {
           headers: {
             "Content-Type": "application/json",
             // API keys are hashed at rest and never returned after creation,
-            // so the playground authenticates with the admin session key.
-            Authorization: `Bearer ${localStorage.getItem("himadri_master_key") ?? ""}`,
+            // so the playground authenticates with the admin session token.
+            // Read via the shared helper — the token lives in sessionStorage,
+            // not localStorage.
+            Authorization: `Bearer ${getSessionToken() ?? ""}`,
           },
           body: JSON.stringify({
             model: selectedModel,
@@ -103,10 +132,7 @@ export default function PlaygroundPage() {
     }
   }
 
-  const clearChat = () => {
-    setMessages([])
-    setError(null)
-  }
+  const canSend = Boolean(input.trim()) && Boolean(selectedModel) && !loading
 
   return (
     <AuthGuard>
@@ -130,104 +156,107 @@ export default function PlaygroundPage() {
               </Breadcrumb>
             </div>
           </header>
-          <div className="flex flex-1 flex-col gap-4 p-4 pt-0">
+
+          <div className="relative flex h-[calc(100svh-4rem)] flex-col overflow-hidden">
             {error && (
-              <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+              <div className="mx-4 mt-3 shrink-0 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
                 {error}
                 <Button variant="ghost" size="sm" className="ml-2" onClick={() => setError(null)}>Dismiss</Button>
               </div>
             )}
 
-            {/* Configuration */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm">Configuration</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div>
-                    <Label>Model</Label>
-                    <select
-                      value={selectedModel}
-                      onChange={(e) => setSelectedModel(e.target.value)}
-                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+            {/* Scrollable message history — content scrolls underneath the floating composer */}
+            <ScrollArea className="min-h-0 flex-1">
+              <div className="mx-auto max-w-3xl space-y-4 px-4 pt-4 pb-40">
+                {messages.length === 0 && (
+                  <div className="flex h-[40vh] items-center justify-center text-center text-sm text-muted-foreground">
+                    {enabledModels.length === 0
+                      ? "Add a model with an enabled provider endpoint on the Models page, then start chatting."
+                      : "Pick a model in the composer below, then start chatting."}
+                  </div>
+                )}
+                {messages.map((msg, i) => (
+                  <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+                    <div className={`max-w-[80%] rounded-lg p-3 ${
+                      msg.role === "user"
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted"
+                    }`}>
+                      <div className="mb-1 text-xs font-medium">
+                        {msg.role === "user" ? "You" : "Assistant"}
+                      </div>
+                      <div className="text-sm whitespace-pre-wrap">{msg.content}</div>
+                    </div>
+                  </div>
+                ))}
+                {loading && (
+                  <div className="flex justify-start">
+                    <div className="rounded-lg bg-muted p-3">
+                      <div className="mb-1 text-xs font-medium">Assistant</div>
+                      <div className="text-sm text-muted-foreground">Thinking…</div>
+                    </div>
+                  </div>
+                )}
+                <div ref={messagesEndRef} />
+              </div>
+            </ScrollArea>
+
+            {/* Floating composer pinned to the bottom of the page */}
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-6">
+              <div className="pointer-events-auto w-full max-w-3xl rounded-2xl border bg-background/95 shadow-lg backdrop-blur supports-[backdrop-filter]:bg-background/80">
+                {/* Top panel: model selection (left) + context badges (right) */}
+                <div className="flex items-center gap-2 border-b px-2 py-1.5">
+                  <Select value={selectedModel} onValueChange={setSelectedModel}>
+                    <SelectTrigger
+                      size="sm"
+                      className="h-7 w-auto min-w-[150px] border-0 bg-transparent px-2 shadow-none hover:bg-muted focus-visible:ring-0"
                     >
-                      <option value="">Select model</option>
+                      <SelectValue placeholder="Select model" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {enabledModels.length === 0 && (
+                        <SelectItem value="__none__" disabled>No enabled models</SelectItem>
+                      )}
                       {enabledModels.map((m) => (
-                        <option key={m.id} value={m.name}>{m.display_name || m.name}</option>
+                        <SelectItem key={m.id} value={m.name}>{m.display_name || m.name}</SelectItem>
                       ))}
-                    </select>
+                    </SelectContent>
+                  </Select>
+                  <div className="ml-auto flex items-center gap-1.5">
+                    <Badge variant="secondary" className="font-normal tabular-nums" aria-label="Context usage">
+                      <HugeiconsIcon icon={DashboardSpeed01Icon} strokeWidth={2} />
+                      ~{usedTokens.toLocaleString()} / {formatTokens(CONTEXT_WINDOW)}
+                    </Badge>
+                    <Badge variant="secondary" className="font-normal tabular-nums" aria-label="Messages exchanged">
+                      <HugeiconsIcon icon={BubbleChatIcon} strokeWidth={2} />
+                      {messages.length}
+                    </Badge>
                   </div>
-                  <div>
-                    <Label>Authentication</Label>
-                    <p className="flex h-9 items-center text-sm text-muted-foreground">
-                      Requests use your admin session key
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Chat Area */}
-            <Card className="flex-1 flex flex-col">
-              <CardHeader className="flex flex-row items-center justify-between">
-                <CardTitle className="text-sm">Chat</CardTitle>
-                <div className="flex items-center gap-2">
-                  <Badge variant="outline">{messages.length} messages</Badge>
-                  <Button variant="outline" size="sm" onClick={clearChat}>Clear</Button>
-                </div>
-              </CardHeader>
-              <CardContent className="flex-1 flex flex-col gap-4 overflow-hidden">
-                {/* Messages */}
-                <div className="flex-1 overflow-auto space-y-4 min-h-[300px] max-h-[500px]">
-                  {messages.length === 0 && (
-                    <div className="flex items-center justify-center h-full text-muted-foreground">
-                      Select a model, then start chatting
-                    </div>
-                  )}
-                  {messages.map((msg, i) => (
-                    <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                      <div className={`max-w-[80%] rounded-lg p-3 ${
-                        msg.role === "user"
-                          ? "bg-primary text-primary-foreground"
-                          : "bg-muted"
-                      }`}>
-                        <div className="text-xs font-medium mb-1">
-                          {msg.role === "user" ? "You" : "Assistant"}
-                        </div>
-                        <div className="text-sm whitespace-pre-wrap">{msg.content}</div>
-                      </div>
-                    </div>
-                  ))}
-                  {loading && (
-                    <div className="flex justify-start">
-                      <div className="bg-muted rounded-lg p-3">
-                        <div className="text-xs font-medium mb-1">Assistant</div>
-                        <div className="text-sm text-muted-foreground">Thinking...</div>
-                      </div>
-                    </div>
-                  )}
-                  <div ref={messagesEndRef} />
                 </div>
 
-                {/* Input */}
-                <div className="flex gap-2">
-                  <Input
+                {/* Input with a floating send button inside the text area */}
+                <div className="relative">
+                  <Textarea
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder={selectedModel ? "Type a message..." : "Select a model first"}
-                    disabled={!selectedModel || loading}
+                    placeholder={enabledModels.length === 0 ? "No enabled models available" : "Message the model…"}
+                    disabled={loading || enabledModels.length === 0}
+                    rows={1}
+                    className="max-h-40 min-h-[56px] resize-none border-0 bg-transparent px-4 py-3 pr-14 shadow-none focus-visible:ring-0"
                   />
                   <Button
+                    size="icon"
+                    className="absolute bottom-2.5 right-2.5 rounded-full"
                     onClick={sendMessage}
-                    disabled={!input.trim() || !selectedModel || loading}
+                    disabled={!canSend}
+                    aria-label="Send message"
                   >
-                    Send
+                    <HugeiconsIcon icon={SentIcon} strokeWidth={2} />
                   </Button>
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+            </div>
           </div>
         </SidebarInset>
       </SidebarProvider>

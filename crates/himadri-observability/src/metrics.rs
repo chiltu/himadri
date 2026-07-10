@@ -27,7 +27,7 @@ impl Metrics {
             Opts::new("himadri_requests_total", "Total number of requests"),
             &["provider", "model"],
         )
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let request_duration = Histogram::with_opts(
             HistogramOpts::new(
@@ -38,25 +38,25 @@ impl Metrics {
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
             ]),
         )
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let tokens_input_total = IntCounterVec::new(
             Opts::new("himadri_tokens_input_total", "Total input tokens"),
             &["provider", "model"],
         )
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let tokens_output_total = IntCounterVec::new(
             Opts::new("himadri_tokens_output_total", "Total output tokens"),
             &["provider", "model"],
         )
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let provider_errors = IntCounterVec::new(
             Opts::new("himadri_provider_errors_total", "Total provider errors"),
             &["provider", "model"],
         )
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let cost_usd_total = IntCounterVec::new(
             Opts::new(
@@ -65,37 +65,37 @@ impl Metrics {
             ),
             &["provider", "model"],
         )
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let rate_limit_rejections = IntCounter::with_opts(Opts::new(
             "himadri_rate_limit_rejections_total",
             "Total rate limit rejections",
         ))
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let circuit_breaker_state = IntGauge::with_opts(Opts::new(
             "himadri_circuit_breaker_state",
             "Circuit breaker state (0=closed, 1=open, 2=half_open)",
         ))
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let active_connections = IntGauge::with_opts(Opts::new(
             "himadri_active_connections",
             "Number of active connections",
         ))
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let cache_hits_total = IntCounter::with_opts(Opts::new(
             "himadri_cache_hits_total",
             "Total response cache hits",
         ))
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let cache_misses_total = IntCounter::with_opts(Opts::new(
             "himadri_cache_misses_total",
             "Total response cache misses",
         ))
-        .unwrap();
+        .expect("static metric definition is valid");
 
         let collectors: [Box<dyn prometheus::core::Collector>; 11] = [
             Box::new(requests_total.clone()),
@@ -110,8 +110,12 @@ impl Metrics {
             Box::new(cache_hits_total.clone()),
             Box::new(cache_misses_total.clone()),
         ];
+        // The registry is created fresh above, so registration can only fail
+        // on a duplicate metric name within this constructor itself.
         for collector in collectors {
-            registry.register(collector).unwrap();
+            registry
+                .register(collector)
+                .expect("metric already registered on a fresh registry");
         }
 
         Self {
@@ -134,8 +138,10 @@ impl Metrics {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        String::from_utf8(buffer).unwrap()
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .expect("text-encoding gathered metrics into a Vec cannot fail");
+        String::from_utf8(buffer).expect("prometheus text format is UTF-8")
     }
 }
 

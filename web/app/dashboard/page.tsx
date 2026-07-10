@@ -18,7 +18,6 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Table,
   TableBody,
@@ -68,133 +67,105 @@ export default function DashboardPage() {
 
           {data && (
             <>
-              <div className="grid auto-rows-min gap-4 md:grid-cols-4">
-                <Card>
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Total Requests</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="text-2xl font-bold">{data.total_requests.toLocaleString()}</div>
-                  </CardContent>
-                </Card>
-                <Card>
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Total Tokens</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="text-2xl font-bold">{data.total_tokens.toLocaleString()}</div>
-                  </CardContent>
-                </Card>
-                <Card>
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Total Cost</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="text-2xl font-bold">${data.total_cost_usd.toFixed(4)}</div>
-                  </CardContent>
-                </Card>
-                <Card>
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Avg Latency</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="text-2xl font-bold">{data.avg_latency_ms.toFixed(0)}ms</div>
-                  </CardContent>
-                </Card>
+              <div className="grid auto-rows-min gap-6 border-b pb-6 sm:grid-cols-2 md:grid-cols-4">
+                <div>
+                  <div className="text-sm text-muted-foreground">Total Requests</div>
+                  <div className="mt-1 text-2xl font-bold">{data.total_requests.toLocaleString()}</div>
+                </div>
+                <div>
+                  <div className="text-sm text-muted-foreground">Total Tokens</div>
+                  <div className="mt-1 text-2xl font-bold">{data.total_tokens.toLocaleString()}</div>
+                </div>
+                <div>
+                  <div className="text-sm text-muted-foreground">Total Cost</div>
+                  <div className="mt-1 text-2xl font-bold">${data.total_cost_usd.toFixed(4)}</div>
+                </div>
+                <div>
+                  <div className="text-sm text-muted-foreground">Avg Latency</div>
+                  <div className="mt-1 text-2xl font-bold">{data.avg_latency_ms.toFixed(0)}ms</div>
+                </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Top Models</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead>Model</TableHead>
-                          <TableHead className="text-right">Requests</TableHead>
-                          <TableHead className="text-right">Cost</TableHead>
+              <div className="grid gap-8 md:grid-cols-2">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">Top Models</h2>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Model</TableHead>
+                        <TableHead className="text-right">Requests</TableHead>
+                        <TableHead className="text-right">Cost</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {data.top_models.map((m) => (
+                        <TableRow key={m.model}>
+                          <TableCell className="font-mono text-sm">{m.model}</TableCell>
+                          <TableCell className="text-right">{m.requests.toLocaleString()}</TableCell>
+                          <TableCell className="text-right">${m.cost_usd.toFixed(4)}</TableCell>
                         </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {data.top_models.map((m) => (
-                          <TableRow key={m.model}>
-                            <TableCell className="font-mono text-sm">{m.model}</TableCell>
-                            <TableCell className="text-right">{m.requests.toLocaleString()}</TableCell>
-                            <TableCell className="text-right">${m.cost_usd.toFixed(4)}</TableCell>
-                          </TableRow>
-                        ))}
-                        {data.top_models.length === 0 && (
-                          <TableRow>
-                            <TableCell colSpan={3} className="text-center text-muted-foreground">No data yet</TableCell>
-                          </TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
+                      ))}
+                      {data.top_models.length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={3} className="text-center text-muted-foreground">No data yet</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </section>
 
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Top Providers</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead>Provider</TableHead>
-                          <TableHead className="text-right">Requests</TableHead>
-                          <TableHead className="text-right">Cost</TableHead>
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">Top Providers</h2>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Provider</TableHead>
+                        <TableHead className="text-right">Requests</TableHead>
+                        <TableHead className="text-right">Cost</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {data.top_providers.map((p) => (
+                        <TableRow key={p.provider}>
+                          <TableCell className="font-mono text-sm">{p.provider}</TableCell>
+                          <TableCell className="text-right">{p.requests.toLocaleString()}</TableCell>
+                          <TableCell className="text-right">${p.cost_usd.toFixed(4)}</TableCell>
                         </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {data.top_providers.map((p) => (
-                          <TableRow key={p.provider}>
-                            <TableCell className="font-mono text-sm">{p.provider}</TableCell>
-                            <TableCell className="text-right">{p.requests.toLocaleString()}</TableCell>
-                            <TableCell className="text-right">${p.cost_usd.toFixed(4)}</TableCell>
-                          </TableRow>
-                        ))}
-                        {data.top_providers.length === 0 && (
-                          <TableRow>
-                            <TableCell colSpan={3} className="text-center text-muted-foreground">No data yet</TableCell>
-                          </TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
+                      ))}
+                      {data.top_providers.length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={3} className="text-center text-muted-foreground">No data yet</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </section>
               </div>
 
               {data.recent_errors.length > 0 && (
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Recent Errors</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead>Time</TableHead>
-                          <TableHead>Model</TableHead>
-                          <TableHead>Error</TableHead>
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">Recent Errors</h2>
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Time</TableHead>
+                        <TableHead>Model</TableHead>
+                        <TableHead>Error</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {data.recent_errors.map((e) => (
+                        <TableRow key={e.request_id}>
+                          <TableCell className="text-sm">{new Date(e.created_at).toLocaleString()}</TableCell>
+                          <TableCell className="font-mono text-sm">{e.model}</TableCell>
+                          <TableCell>
+                            <Badge variant="destructive">{e.error_message || "Unknown error"}</Badge>
+                          </TableCell>
                         </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {data.recent_errors.map((e) => (
-                          <TableRow key={e.request_id}>
-                            <TableCell className="text-sm">{new Date(e.created_at).toLocaleString()}</TableCell>
-                            <TableCell className="font-mono text-sm">{e.model}</TableCell>
-                            <TableCell>
-                              <Badge variant="destructive">{e.error_message || "Unknown error"}</Badge>
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </section>
               )}
             </>
           )}

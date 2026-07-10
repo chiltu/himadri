@@ -3,7 +3,6 @@
 import * as React from "react"
 
 import { NavMain } from "@/components/nav-main"
-import { NavProjects } from "@/components/nav-projects"
 import { NavUser } from "@/components/nav-user"
 import { TeamSwitcher } from "@/components/team-switcher"
 import {
@@ -14,7 +13,9 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar"
 import { HugeiconsIcon } from "@hugeicons/react"
-import { LayoutBottomIcon, AudioWave01Icon, CommandIcon, ComputerTerminalIcon, RoboticIcon, BookOpen02Icon, Settings05Icon, CropIcon, PieChartIcon, MapsIcon } from "@hugeicons/core-free-icons"
+import { LayoutBottomIcon, AudioWave01Icon, CommandIcon, ComputerTerminalIcon, RoboticIcon, Settings05Icon, DashboardSquareIcon, DollarIcon, CropIcon, PieChartIcon, MapsIcon, LockKeyIcon, User, UserGroupIcon, HelpSquareIcon } from "@hugeicons/core-free-icons"
+import { Separator } from "./ui/separator"
+import { NavSettings } from "./nav-settings"
 
 // This is sample data.
 const data = {
@@ -48,6 +49,20 @@ const data = {
   ],
   navMain: [
     {
+      title: "Home",
+      url: "/dashboard",
+      icon: (
+        <HugeiconsIcon icon={DashboardSquareIcon} strokeWidth={2} />
+      ),
+      isActive: true,
+      items: [
+        {
+          title: "Dashboard",
+          url: "/dashboard"
+        }
+      ]
+    },
+    {
       title: "Playground",
       url: "#",
       icon: (
@@ -69,7 +84,7 @@ const data = {
       ),
       items: [
         {
-          title: "All Models",
+          title: "Models",
           url: "/dashboard/models",
         },
         {
@@ -82,7 +97,7 @@ const data = {
       title: "Cost",
       url: "#",
       icon: (
-        <HugeiconsIcon icon={BookOpen02Icon} strokeWidth={2} />
+        <HugeiconsIcon icon={DollarIcon} strokeWidth={2} />
       ),
       items: [
         {
@@ -109,26 +124,33 @@ const data = {
       ],
     },
   ],
-  projects: [
+  navSettings: [
     {
-      name: "Design Engineering",
+      name: "API Keys",
       url: "#",
       icon: (
-        <HugeiconsIcon icon={CropIcon} strokeWidth={2} />
+        <HugeiconsIcon icon={LockKeyIcon} strokeWidth={2} />
       ),
     },
     {
-      name: "Sales & Marketing",
+      name: "Routing Targets",
       url: "#",
       icon: (
         <HugeiconsIcon icon={PieChartIcon} strokeWidth={2} />
       ),
     },
     {
-      name: "Travel",
+      name: "User Management",
       url: "#",
       icon: (
-        <HugeiconsIcon icon={MapsIcon} strokeWidth={2} />
+        <HugeiconsIcon icon={UserGroupIcon} strokeWidth={2} />
+      ),
+    },
+    {
+      name: "Documentation",
+      url: "#",
+      icon: (
+        <HugeiconsIcon icon={HelpSquareIcon} strokeWidth={2} />
       ),
     },
   ],
@@ -142,7 +164,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       </SidebarHeader>
       <SidebarContent>
         <NavMain items={data.navMain} />
-        <NavProjects projects={data.projects} />
+        <NavSettings projects={data.navSettings} />
       </SidebarContent>
       <SidebarFooter>
         <NavUser user={data.user} />

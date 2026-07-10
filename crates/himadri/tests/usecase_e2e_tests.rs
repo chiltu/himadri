@@ -1,7 +1,7 @@
 //! Use-case-driven end-to-end tests covering the admin/gateway surface added
 //! and fixed across recent sprints: RBAC, per-principal budgets, provider
-//! failover, response caching, the provider/model admin CRUD API (SQLite and
-//! Postgres), provider-API-key encryption at rest, and the SQLite timestamp
+//! failover, response caching, the model/endpoint admin CRUD API (SQLite and
+//! Postgres), endpoint-API-key encryption at rest, and the SQLite timestamp
 //! bug fix (see `sqlite_time`/`parse_sqlite_timestamp`).
 //!
 //! Group A drives `Gateway` directly (no HTTP), following the precedent in
@@ -24,9 +24,8 @@ use axum::{
 use tokio::net::TcpListener;
 
 use himadri_admin::{
-    AdminHandlers, ApiKey, CipherKey, CreateApiKeyRequest, CreateModelRequest,
-    CreateProviderRequest, Model, Provider, StoreBackend, UpdateApiKeyRequest, UpdateModelRequest,
-    UpdateProviderRequest,
+    AdminHandlers, ApiKey, CipherKey, CreateApiKeyRequest, CreateModelEndpointRequest,
+    CreateModelRequest, Model, StoreBackend, UpdateApiKeyRequest, UpdateModelRequest,
 };
 use himadri_core::{
     AuthContext, AuthScope, ChatCompletionRequest, Config, GatewayError, Message, MessageContent,
@@ -46,6 +45,7 @@ fn target(provider: &str) -> Target {
         provider: provider.to_string(),
         weight: 1.0,
         models: None,
+        id: None,
         api_key_env: None,
         base_url: None,
     }
@@ -458,11 +458,10 @@ async fn setup_admin_app(cipher: Option<CipherKey>) -> TestAdminApp {
     let store = StoreBackend::Sqlite(Arc::new(sqlite_store));
     let mut admin = AdminHandlers::new(store);
 
-    let (provider_store, model_store) =
-        himadri_admin::connect_provider_model_stores(&db_url, cipher)
-            .await
-            .expect("sqlite provider/model store should connect");
-    admin = admin.with_provider_model_stores(provider_store, model_store);
+    let (model_store, endpoint_store) = himadri_admin::connect_model_stores(&db_url, cipher)
+        .await
+        .expect("sqlite model store should connect");
+    admin = admin.with_model_stores(model_store, endpoint_store);
 
     let gateway = Arc::new(himadri::Gateway::new(Config::default(), metrics()));
     let state = AdminAppState {
@@ -478,17 +477,6 @@ async fn setup_admin_app(cipher: Option<CipherKey>) -> TestAdminApp {
         )
         .route("/admin/keys/{id}/rotate", post(rotate_key_h))
         .route("/admin/keys/{id}/revoke", post(revoke_key_h))
-        .route(
-            "/admin/providers",
-            get(list_providers_h).post(create_provider_h),
-        )
-        .route(
-            "/admin/providers/{id}",
-            get(get_provider_h)
-                .put(update_provider_h)
-                .delete(delete_provider_h),
-        )
-        .route("/admin/providers/{id}/toggle", post(toggle_provider_h))
         .route("/admin/models", get(list_models_h).post(create_model_h))
         .route(
             "/admin/models/{id}",
@@ -516,8 +504,12 @@ async fn setup_admin_app(cipher: Option<CipherKey>) -> TestAdminApp {
     }
 }
 
-async fn list_keys_h(State(s): State<AdminAppState>) -> Json<Vec<ApiKey>> {
-    Json(s.admin.list_keys().await)
+async fn list_keys_h(State(s): State<AdminAppState>) -> Result<Json<Vec<ApiKey>>, StatusCode> {
+    s.admin
+        .list_keys()
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 async fn create_key_h(
     State(s): State<AdminAppState>,
@@ -527,7 +519,7 @@ async fn create_key_h(
         .create_key(req)
         .await
         .map(|k| (StatusCode::CREATED, Json(k)))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 async fn get_key_h(
     State(s): State<AdminAppState>,
@@ -536,6 +528,7 @@ async fn get_key_h(
     s.admin
         .get_key(&id)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -547,14 +540,15 @@ async fn update_key_h(
     s.admin
         .update_key(&id, req)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
 async fn delete_key_h(State(s): State<AdminAppState>, Path(id): Path<String>) -> StatusCode {
-    if s.admin.delete_key(&id).await {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    match s.admin.delete_key(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 async fn rotate_key_h(
@@ -564,79 +558,24 @@ async fn rotate_key_h(
     s.admin
         .rotate_key(&id)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
 async fn revoke_key_h(State(s): State<AdminAppState>, Path(id): Path<String>) -> StatusCode {
-    if s.admin.revoke_key(&id).await {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
+    match s.admin.revoke_key(&id).await {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
-async fn list_providers_h(State(s): State<AdminAppState>) -> Json<Vec<Provider>> {
-    Json(s.admin.list_providers().await)
-}
-async fn create_provider_h(
-    State(s): State<AdminAppState>,
-    Json(req): Json<CreateProviderRequest>,
-) -> Result<(StatusCode, Json<Provider>), (StatusCode, String)> {
+async fn list_models_h(State(s): State<AdminAppState>) -> Result<Json<Vec<Model>>, StatusCode> {
     s.admin
-        .create_provider(req)
-        .await
-        .map(|p| (StatusCode::CREATED, Json(p)))
-        .ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "create failed".to_string(),
-        ))
-}
-async fn get_provider_h(
-    State(s): State<AdminAppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Provider>, StatusCode> {
-    s.admin
-        .get_provider(&id)
+        .list_models()
         .await
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
-}
-async fn update_provider_h(
-    State(s): State<AdminAppState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateProviderRequest>,
-) -> Result<Json<Provider>, StatusCode> {
-    s.admin
-        .update_provider(&id, req)
-        .await
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
-}
-async fn delete_provider_h(
-    State(s): State<AdminAppState>,
-    Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    if s.admin.delete_provider(&id).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((StatusCode::CONFLICT, "delete failed".to_string()))
-    }
-}
-async fn toggle_provider_h(
-    State(s): State<AdminAppState>,
-    Path(id): Path<String>,
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<Provider>, (StatusCode, String)> {
-    let enabled = body["enabled"].as_bool().unwrap_or(true);
-    s.admin
-        .toggle_provider(&id, enabled)
-        .await
-        .map(Json)
-        .ok_or((StatusCode::CONFLICT, "toggle failed".to_string()))
-}
-
-async fn list_models_h(State(s): State<AdminAppState>) -> Json<Vec<Model>> {
-    Json(s.admin.list_models().await)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 async fn create_model_h(
     State(s): State<AdminAppState>,
@@ -646,7 +585,7 @@ async fn create_model_h(
         .create_model(req)
         .await
         .map(|m| (StatusCode::CREATED, Json(m)))
-        .ok_or((StatusCode::BAD_REQUEST, "create failed".to_string()))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
 }
 async fn get_model_h(
     State(s): State<AdminAppState>,
@@ -655,6 +594,7 @@ async fn get_model_h(
     s.admin
         .get_model(&id)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -666,6 +606,7 @@ async fn update_model_h(
     s.admin
         .update_model(&id, req)
         .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -673,10 +614,13 @@ async fn delete_model_h(
     State(s): State<AdminAppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if s.admin.delete_model(&id).await {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((StatusCode::CONFLICT, "delete failed".to_string()))
+    match s.admin.delete_model(&id).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "not found".to_string())),
+        // Mirror the real handlers' mapping: guard conflicts are 409, store
+        // failures 500.
+        Err(himadri_admin::AdminError::Conflict(m)) => Err((StatusCode::CONFLICT, m)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 async fn toggle_model_h(
@@ -688,12 +632,13 @@ async fn toggle_model_h(
     s.admin
         .toggle_model(&id, enabled)
         .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(Json)
-        .ok_or((StatusCode::CONFLICT, "toggle failed".to_string()))
+        .ok_or((StatusCode::NOT_FOUND, "not found".to_string()))
 }
 
 async fn dashboard_h(State(s): State<AdminAppState>) -> Json<serde_json::Value> {
-    let key_count = s.admin.list_keys().await.len();
+    let key_count = s.admin.list_keys().await.map_or(0, |k| k.len());
     let dashboard = s.gateway.usage_store().get_dashboard(key_count);
     Json(serde_json::json!({ "total_keys": key_count, "dashboard": dashboard }))
 }
@@ -726,221 +671,18 @@ async fn config_rollback_h(
     Ok(Json(serde_json::json!({ "status": "rolled_back" })))
 }
 
-fn create_provider_req(name: &str, api_key: Option<&str>) -> CreateProviderRequest {
-    CreateProviderRequest {
-        name: name.to_string(),
-        enabled: true,
-        api_key: api_key.map(|s| s.to_string()),
-        base_url: None,
-        weight: 1.0,
-    }
-}
-
-/// Use case: an operator registers a new upstream provider, reads it back,
-/// edits its weight, and removes it once it's no longer needed.
-#[tokio::test]
-async fn provider_full_crud_lifecycle() {
-    let app = setup_admin_app(None).await;
-    let client = reqwest::Client::new();
-
-    let created: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req("acme", Some("sk-acme")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(created.name, "acme");
-    assert_eq!(created.weight, 1.0);
-
-    let fetched: Provider = client
-        .get(format!("{}/admin/providers/{}", app.url, created.id))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(fetched.id, created.id);
-
-    let updated: Provider = client
-        .put(format!("{}/admin/providers/{}", app.url, created.id))
-        .json(&serde_json::json!({"weight": 5.0}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(updated.weight, 5.0);
-    assert_eq!(updated.name, "acme", "unspecified fields must be preserved");
-
-    let del_status = client
-        .delete(format!("{}/admin/providers/{}", app.url, created.id))
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(del_status, 204);
-
-    let after_delete = client
-        .get(format!("{}/admin/providers/{}", app.url, created.id))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(after_delete.status(), 404);
-}
-
-/// Use case: an operator tries to delete a provider that still has models
-/// attached — the gateway must refuse rather than orphan the models.
-#[tokio::test]
-async fn provider_delete_blocked_when_models_exist() {
-    let app = setup_admin_app(None).await;
-    let client = reqwest::Client::new();
-
-    let provider: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req("with-model", None))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    client
-        .post(format!("{}/admin/models", app.url))
-        .json(&CreateModelRequest {
-            name: "gpt-x".to_string(),
-            provider_id: provider.id.clone(),
-            display_name: None,
-            enabled: true,
-        })
-        .send()
-        .await
-        .unwrap();
-
-    let del_status = client
-        .delete(format!("{}/admin/providers/{}", app.url, provider.id))
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(
-        del_status, 409,
-        "deleting a provider with models must be rejected"
-    );
-}
-
-/// Use case: an operator tries to disable a provider that still has an
-/// *enabled* model on it — disabling must be refused so no in-flight
-/// routing target silently goes stale.
-#[tokio::test]
-async fn provider_disable_blocked_when_enabled_models_exist() {
-    let app = setup_admin_app(None).await;
-    let client = reqwest::Client::new();
-
-    let provider: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req("has-enabled-model", None))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    client
-        .post(format!("{}/admin/models", app.url))
-        .json(&CreateModelRequest {
-            name: "gpt-y".to_string(),
-            provider_id: provider.id.clone(),
-            display_name: None,
-            enabled: true,
-        })
-        .send()
-        .await
-        .unwrap();
-
-    let toggle_status = client
-        .post(format!(
-            "{}/admin/providers/{}/toggle",
-            app.url, provider.id
-        ))
-        .json(&serde_json::json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap()
-        .status();
-    assert_eq!(toggle_status, 409);
-}
-
-/// Use case: an operator tries to add a model under a provider they've
-/// disabled — creation must fail up front rather than producing an
-/// unusable, unreachable model.
-#[tokio::test]
-async fn model_create_fails_for_disabled_provider() {
-    let app = setup_admin_app(None).await;
-    let client = reqwest::Client::new();
-
-    let provider: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req("disabled-provider", None))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    client
-        .post(format!(
-            "{}/admin/providers/{}/toggle",
-            app.url, provider.id
-        ))
-        .json(&serde_json::json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap();
-
-    let resp = client
-        .post(format!("{}/admin/models", app.url))
-        .json(&CreateModelRequest {
-            name: "should-fail".to_string(),
-            provider_id: provider.id,
-            display_name: None,
-            enabled: true,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-}
-
-/// Use case: an operator adds a model, enables/disables it, and confirms
-/// deletion is blocked while it's live (mirroring the provider guard above)
-/// but succeeds once disabled.
+/// Use case: an operator onboards a model (first-party, no provider needed),
+/// enables/disables it, and confirms deletion is blocked while it's live but
+/// succeeds once disabled.
 #[tokio::test]
 async fn model_full_crud_lifecycle() {
     let app = setup_admin_app(None).await;
     let client = reqwest::Client::new();
 
-    let provider: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req("model-lifecycle-provider", None))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
     let model: Model = client
         .post(format!("{}/admin/models", app.url))
         .json(&CreateModelRequest {
             name: "gpt-z".to_string(),
-            provider_id: provider.id.clone(),
             display_name: Some("GPT Z".to_string()),
             enabled: true,
         })
@@ -980,88 +722,100 @@ async fn model_full_crud_lifecycle() {
     assert_eq!(deleted.status(), 204);
 }
 
-/// Use case: a secret provider API key is stored encrypted at rest — the
-/// admin API must still return it in plaintext to authenticated callers,
-/// while the raw database row is unreadable ciphertext.
+/// Use case: a model is inactive until it has an enabled endpoint. Onboarding a
+/// model exposes nothing on `/v1/models`; attaching a provider endpoint
+/// activates it (with the endpoint's provider type as `owned_by` and its key
+/// round-tripping decrypted); disabling the endpoint deactivates it again.
 #[tokio::test]
-async fn provider_encryption_at_rest_transparent() {
-    let key_bytes: [u8; 32] = rand_bytes_32();
-    let cipher = CipherKey::from_base64(&base64_encode(&key_bytes)).expect("valid 32-byte key");
-    let app = setup_admin_app(Some(cipher)).await;
-    let client = reqwest::Client::new();
+async fn model_endpoint_lifecycle_controls_activation() {
+    let db_path =
+        std::env::temp_dir().join(format!("himadri-endpoint-test-{}.db", uuid::Uuid::new_v4()));
+    let db_url = format!("sqlite://{}", db_path.display());
+    // A 32-byte key (base64) so the endpoint api_key is encrypted at rest and
+    // must round-trip decrypted through the store.
+    let cipher = CipherKey::from_base64("MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=").unwrap();
 
-    let created: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req(
-            "secret-provider",
-            Some("sk-top-secret-123"),
-        ))
-        .send()
+    let (model_store, endpoint_store) = himadri_admin::connect_model_stores(&db_url, Some(cipher))
+        .await
+        .expect("sqlite stores should connect");
+    let admin = AdminHandlers::new(StoreBackend::new().await)
+        .with_model_stores(model_store, endpoint_store);
+
+    // Onboard a model — no endpoints yet, so it's inactive (absent from the
+    // OpenAI-facing model list).
+    let model = admin
+        .create_model(CreateModelRequest {
+            name: "gpt-z".to_string(),
+            display_name: Some("GPT Z".to_string()),
+            enabled: true,
+        })
+        .await
+        .expect("model created");
+    assert!(admin
+        .list_enabled_models_for_api()
         .await
         .unwrap()
-        .json()
+        .is_empty());
+
+    // Attach a provider endpoint — the model becomes active.
+    let ep = admin
+        .create_endpoint(
+            &model.id,
+            CreateModelEndpointRequest {
+                provider_type: "openai".to_string(),
+                base_url: Some("https://api.openai.com/v1".to_string()),
+                api_key: Some("sk-secret".to_string()),
+                weight: 1.0,
+                enabled: true,
+            },
+        )
         .await
-        .unwrap();
-    assert_eq!(
-        created.api_key.as_deref(),
-        Some("sk-top-secret-123"),
-        "API response must return the decrypted plaintext"
-    );
+        .expect("endpoint created");
 
-    let db_url = format!("sqlite://{}", app.db_path.display());
-    let pool = sqlx::sqlite::SqlitePool::connect(&db_url).await.unwrap();
-    let (raw_api_key,): (String,) = sqlx::query_as("SELECT api_key FROM providers WHERE id = ?")
-        .bind(&created.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(
-        raw_api_key.starts_with("enc:v1:"),
-        "raw DB row must be ciphertext, got: {raw_api_key}"
-    );
-    assert_ne!(raw_api_key, "sk-top-secret-123");
-}
+    let active = admin.list_enabled_models_for_api().await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, "gpt-z");
+    assert_eq!(active[0].owned_by, "openai");
 
-/// Regression test: SQLite-backed providers must record a real creation
-/// timestamp, not the Unix epoch (the `datetime('now')`-vs-RFC3339 bug fixed
-/// this session).
-#[tokio::test]
-async fn provider_created_at_is_real_timestamp_not_epoch() {
-    let app = setup_admin_app(None).await;
-    let client = reqwest::Client::new();
-    let before = chrono::Utc::now();
-
-    let created: Provider = client
-        .post(format!("{}/admin/providers", app.url))
-        .json(&create_provider_req("ts-provider", None))
-        .send()
+    // The endpoint's key round-trips decrypted through the store.
+    let fetched = admin
+        .get_endpoint(&ep.id)
         .await
         .unwrap()
-        .json()
-        .await
-        .unwrap();
+        .expect("endpoint exists");
+    assert_eq!(fetched.api_key.as_deref(), Some("sk-secret"));
 
-    assert!(
-        created.created_at > before - chrono::Duration::seconds(5),
-        "created_at should be ~now, got {}",
-        created.created_at
-    );
-
-    // Updating must also refresh updated_at to a real timestamp, not epoch.
-    let updated: Provider = client
-        .put(format!("{}/admin/providers/{}", app.url, created.id))
-        .json(&serde_json::json!({"weight": 2.0}))
-        .send()
+    // Disable the endpoint — the model is inactive again.
+    admin.toggle_endpoint(&ep.id, false).await.expect("toggled");
+    assert!(admin
+        .list_enabled_models_for_api()
         .await
         .unwrap()
-        .json()
+        .is_empty());
+
+    // Regression: an enabled endpoint that routing would skip (unknown
+    // provider type, no base_url) must not activate the model either —
+    // otherwise `/v1/models` advertises a model whose completions 404.
+    admin
+        .create_endpoint(
+            &model.id,
+            CreateModelEndpointRequest {
+                provider_type: "mystery-vendor".to_string(),
+                base_url: None,
+                api_key: Some("sk-other".to_string()),
+                weight: 1.0,
+                enabled: true,
+            },
+        )
         .await
-        .unwrap();
-    assert!(
-        updated.updated_at > before - chrono::Duration::seconds(5),
-        "updated_at should be ~now, got {}",
-        updated.updated_at
-    );
+        .expect("endpoint created");
+    assert!(admin
+        .list_enabled_models_for_api()
+        .await
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_file(&db_path);
 }
 
 /// Regression test: SQLite-backed API keys must record a real creation
@@ -1323,48 +1077,6 @@ fn postgres_test_url() -> Option<String> {
     std::env::var("TEST_POSTGRES_URL").ok()
 }
 
-/// Use case: the same provider CRUD an operator relies on for SQLite
-/// deployments must also work when the gateway is deployed against
-/// Postgres — the gap this session's Postgres provider-store fix closed.
-#[tokio::test]
-async fn postgres_provider_crud_parity() {
-    let Some(url) = postgres_test_url() else {
-        eprintln!("skipping postgres_provider_crud_parity: TEST_POSTGRES_URL not set");
-        return;
-    };
-    let (provider_store, model_store) = himadri_admin::connect_provider_model_stores(&url, None)
-        .await
-        .expect("postgres provider/model store should connect");
-    let admin = AdminHandlers::new(StoreBackend::new().await)
-        .with_provider_model_stores(provider_store, model_store);
-
-    let created = admin
-        .create_provider(create_provider_req(
-            "pg-parity-provider",
-            Some("sk-pg-secret"),
-        ))
-        .await
-        .expect("create should succeed against postgres");
-    assert_eq!(created.api_key.as_deref(), Some("sk-pg-secret"));
-
-    let listed = admin.list_providers().await;
-    assert!(listed.iter().any(|p| p.id == created.id));
-
-    let updated = admin
-        .update_provider(
-            &created.id,
-            UpdateProviderRequest {
-                weight: Some(9.0),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("update should succeed");
-    assert_eq!(updated.weight, 9.0);
-
-    assert!(admin.delete_provider(&created.id).await);
-}
-
 /// Use case: API-key update semantics must match SQLite — partial updates
 /// keep unspecified fields, `Some(None)` clears nullable fields, and
 /// budget/model restrictions round-trip.
@@ -1489,6 +1201,25 @@ async fn postgres_request_log_filters_are_bound() {
     store.write(entry("openai")).unwrap();
     store.write(entry("anthropic")).unwrap();
 
+    // `write` enqueues to a background flusher; poll until all three rows
+    // are visible before asserting on filters, or the test races its own
+    // writes.
+    let all = RequestLogQuery {
+        model: Some(tag.clone()),
+        ..Default::default()
+    };
+    for _ in 0..100 {
+        if store.list(all.clone()).map(|r| r.total).unwrap_or(0) >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        store.list(all).expect("list should succeed").total,
+        3,
+        "all writes must flush"
+    );
+
     // Filtered list: model + provider must both apply (previously errored).
     let listed = store
         .list(RequestLogQuery {
@@ -1527,58 +1258,4 @@ async fn postgres_request_log_filters_are_bound() {
             ..Default::default()
         })
         .unwrap();
-}
-
-/// Use case: encryption at rest for provider secrets must behave identically
-/// on Postgres as on SQLite.
-#[tokio::test]
-async fn postgres_encryption_at_rest_transparent() {
-    let Some(url) = postgres_test_url() else {
-        eprintln!("skipping postgres_encryption_at_rest_transparent: TEST_POSTGRES_URL not set");
-        return;
-    };
-    let key_bytes: [u8; 32] = rand_bytes_32();
-    let cipher = CipherKey::from_base64(&base64_encode(&key_bytes)).unwrap();
-
-    let (provider_store, model_store) =
-        himadri_admin::connect_provider_model_stores(&url, Some(cipher))
-            .await
-            .expect("postgres provider/model store should connect");
-    let admin = AdminHandlers::new(StoreBackend::new().await)
-        .with_provider_model_stores(provider_store, model_store);
-
-    let created = admin
-        .create_provider(create_provider_req(
-            "pg-secret-provider",
-            Some("sk-pg-top-secret"),
-        ))
-        .await
-        .expect("create should succeed");
-    assert_eq!(created.api_key.as_deref(), Some("sk-pg-top-secret"));
-
-    let pool = sqlx::postgres::PgPool::connect(&url).await.unwrap();
-    let row: (String,) = sqlx::query_as("SELECT api_key FROM providers WHERE id = $1::uuid")
-        .bind(&created.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(
-        row.0.starts_with("enc:v1:"),
-        "raw postgres row must be ciphertext, got: {}",
-        row.0
-    );
-
-    admin.delete_provider(&created.id).await;
-}
-
-fn rand_bytes_32() -> [u8; 32] {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    STANDARD.encode(bytes)
 }

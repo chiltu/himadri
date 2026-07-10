@@ -1,42 +1,34 @@
-//! Backend-agnostic wrapper over the provider/model stores, mirroring
+//! Backend-agnostic wrapper over the model/endpoint stores, mirroring
 //! [`crate::store::StoreBackend`]'s pattern for API keys. `connect` picks
-//! SQLite or Postgres based on `DATABASE_URL`'s scheme so that, unlike the
-//! previous SQLite-only `ProviderStore`, provider/model admin CRUD actually
-//! works when the gateway is deployed against Postgres.
+//! SQLite or Postgres based on `DATABASE_URL`'s scheme so that model/endpoint
+//! admin CRUD works against either backend.
 
 use std::sync::Arc;
 
 use crate::crypto::CipherKey;
+use crate::error::AdminError;
 use crate::models::{
-    CreateModelRequest, CreateProviderRequest, Model, Provider, UpdateModelRequest,
-    UpdateProviderRequest,
+    CreateModelEndpointRequest, CreateModelRequest, Model, ModelEndpoint,
+    UpdateModelEndpointRequest, UpdateModelRequest,
 };
 
 #[cfg(feature = "postgres")]
-use crate::postgres_provider_store::{PgModelStore, PgProviderStore};
+use crate::postgres_provider_store::{PgModelEndpointStore, PgModelStore};
 #[cfg(feature = "sqlite")]
-use crate::provider_store::{ModelStore, ProviderStore};
+use crate::provider_store::{ModelEndpointStore, ModelStore};
 
-/// Dispatch a method to the active SQL backend, mapping `sqlx::Error` to a
-/// `String`. Shared by both provider and model backends; adding a store
-/// method is one line instead of a two-armed `match`.
+/// Dispatch a method to the active SQL backend, converting the store's error
+/// into [`AdminError`]. Shared by both store backends; adding a store method
+/// is one line instead of a two-armed `match`.
 macro_rules! pm_dispatch {
     ($self:expr, $method:ident ( $($arg:expr),* )) => {
         match $self {
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(s) => s.$method($($arg),*).await.map_err(|e| e.to_string()),
+            Self::Sqlite(s) => s.$method($($arg),*).await.map_err(AdminError::from),
             #[cfg(feature = "postgres")]
-            Self::Postgres(s) => s.$method($($arg),*).await.map_err(|e| e.to_string()),
+            Self::Postgres(s) => s.$method($($arg),*).await.map_err(AdminError::from),
         }
     };
-}
-
-#[derive(Clone)]
-pub enum ProviderStoreBackend {
-    #[cfg(feature = "sqlite")]
-    Sqlite(Arc<ProviderStore>),
-    #[cfg(feature = "postgres")]
-    Postgres(Arc<PgProviderStore>),
 }
 
 #[derive(Clone)]
@@ -47,58 +39,28 @@ pub enum ModelStoreBackend {
     Postgres(Arc<PgModelStore>),
 }
 
-impl ProviderStoreBackend {
-    pub async fn create(&self, request: CreateProviderRequest) -> Result<Provider, String> {
-        pm_dispatch!(self, create(request))
-    }
-
-    pub async fn get(&self, id: &str) -> Result<Option<Provider>, String> {
-        pm_dispatch!(self, get(id))
-    }
-
-    pub async fn list(&self) -> Result<Vec<Provider>, String> {
-        pm_dispatch!(self, list())
-    }
-
-    pub async fn list_enabled(&self) -> Result<Vec<Provider>, String> {
-        pm_dispatch!(self, list_enabled())
-    }
-
-    pub async fn update(
-        &self,
-        id: &str,
-        request: UpdateProviderRequest,
-    ) -> Result<Option<Provider>, String> {
-        pm_dispatch!(self, update(id, request))
-    }
-
-    pub async fn delete(&self, id: &str) -> Result<bool, String> {
-        pm_dispatch!(self, delete(id))
-    }
-
-    pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Provider>, String> {
-        pm_dispatch!(self, toggle(id, enabled))
-    }
+#[derive(Clone)]
+pub enum ModelEndpointStoreBackend {
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<ModelEndpointStore>),
+    #[cfg(feature = "postgres")]
+    Postgres(Arc<PgModelEndpointStore>),
 }
 
 impl ModelStoreBackend {
-    pub async fn create(&self, request: CreateModelRequest) -> Result<Model, String> {
+    pub async fn create(&self, request: CreateModelRequest) -> Result<Model, AdminError> {
         pm_dispatch!(self, create(request))
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<Model>, String> {
+    pub async fn get(&self, id: &str) -> Result<Option<Model>, AdminError> {
         pm_dispatch!(self, get(id))
     }
 
-    pub async fn list(&self) -> Result<Vec<Model>, String> {
+    pub async fn list(&self) -> Result<Vec<Model>, AdminError> {
         pm_dispatch!(self, list())
     }
 
-    pub async fn list_by_provider(&self, provider_id: &str) -> Result<Vec<Model>, String> {
-        pm_dispatch!(self, list_by_provider(provider_id))
-    }
-
-    pub async fn list_enabled(&self) -> Result<Vec<Model>, String> {
+    pub async fn list_enabled(&self) -> Result<Vec<Model>, AdminError> {
         pm_dispatch!(self, list_enabled())
     }
 
@@ -106,27 +68,83 @@ impl ModelStoreBackend {
         &self,
         id: &str,
         request: UpdateModelRequest,
-    ) -> Result<Option<Model>, String> {
+    ) -> Result<Option<Model>, AdminError> {
         pm_dispatch!(self, update(id, request))
     }
 
-    pub async fn delete(&self, id: &str) -> Result<bool, String> {
-        pm_dispatch!(self, delete(id))
+    /// Concrete model stores already return [`AdminError`] (the delete guard
+    /// distinguishes `Conflict` from store failures), so no mapping here.
+    pub async fn delete(&self, id: &str) -> Result<bool, AdminError> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(s) => s.delete(id).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(s) => s.delete(id).await,
+        }
     }
 
-    pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, String> {
+    pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, AdminError> {
         pm_dispatch!(self, toggle(id, enabled))
     }
 }
 
-/// Connects the provider/model stores based on `DATABASE_URL`'s scheme.
+impl ModelEndpointStoreBackend {
+    /// Concrete endpoint stores already return [`AdminError`] (a missing or
+    /// malformed parent model id is `NotFound`), so no mapping here.
+    pub async fn create(
+        &self,
+        model_id: &str,
+        request: CreateModelEndpointRequest,
+    ) -> Result<ModelEndpoint, AdminError> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(s) => s.create(model_id, request).await,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(s) => s.create(model_id, request).await,
+        }
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<ModelEndpoint>, AdminError> {
+        pm_dispatch!(self, get(id))
+    }
+
+    pub async fn list(&self) -> Result<Vec<ModelEndpoint>, AdminError> {
+        pm_dispatch!(self, list())
+    }
+
+    pub async fn list_by_model(&self, model_id: &str) -> Result<Vec<ModelEndpoint>, AdminError> {
+        pm_dispatch!(self, list_by_model(model_id))
+    }
+
+    pub async fn update(
+        &self,
+        id: &str,
+        request: UpdateModelEndpointRequest,
+    ) -> Result<Option<ModelEndpoint>, AdminError> {
+        pm_dispatch!(self, update(id, request))
+    }
+
+    pub async fn delete(&self, id: &str) -> Result<bool, AdminError> {
+        pm_dispatch!(self, delete(id))
+    }
+
+    pub async fn toggle(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<ModelEndpoint>, AdminError> {
+        pm_dispatch!(self, toggle(id, enabled))
+    }
+}
+
+/// Connects the model/endpoint stores based on `DATABASE_URL`'s scheme.
 /// Returns `None` if `DATABASE_URL` is unset, the scheme is unsupported, or
 /// connecting fails (falling back to the in-memory-only behavior the caller
-/// already has for providers/models: none configured).
-pub async fn connect_provider_model_stores(
+/// already has: no models configured).
+pub async fn connect_model_stores(
     database_url: &str,
     #[allow(unused_variables)] cipher: Option<CipherKey>,
-) -> Option<(ProviderStoreBackend, ModelStoreBackend)> {
+) -> Option<(ModelStoreBackend, ModelEndpointStoreBackend)> {
     #[cfg(feature = "postgres")]
     if database_url.starts_with("postgres") {
         return match sqlx::PgPool::connect(database_url).await {
@@ -135,15 +153,15 @@ pub async fn connect_provider_model_stores(
                     tracing::error!("Failed to run Postgres migrations: {e}");
                     return None;
                 }
-                let provider_store = PgProviderStore::new(pool.clone(), cipher);
-                let model_store = PgModelStore::new(pool);
+                let model_store = PgModelStore::new(pool.clone());
+                let endpoint_store = PgModelEndpointStore::new(pool, cipher);
                 Some((
-                    ProviderStoreBackend::Postgres(Arc::new(provider_store)),
                     ModelStoreBackend::Postgres(Arc::new(model_store)),
+                    ModelEndpointStoreBackend::Postgres(Arc::new(endpoint_store)),
                 ))
             }
             Err(e) => {
-                tracing::warn!("Failed to connect provider/model stores to Postgres: {e}");
+                tracing::warn!("Failed to connect model stores to Postgres: {e}");
                 None
             }
         };
@@ -164,15 +182,15 @@ pub async fn connect_provider_model_stores(
                     tracing::error!("Failed to run SQLite migrations: {e}");
                     return None;
                 }
-                let provider_store = ProviderStore::new(pool.clone(), cipher);
-                let model_store = ModelStore::new(pool);
+                let model_store = ModelStore::new(pool.clone());
+                let endpoint_store = ModelEndpointStore::new(pool, cipher);
                 Some((
-                    ProviderStoreBackend::Sqlite(Arc::new(provider_store)),
                     ModelStoreBackend::Sqlite(Arc::new(model_store)),
+                    ModelEndpointStoreBackend::Sqlite(Arc::new(endpoint_store)),
                 ))
             }
             Err(e) => {
-                tracing::warn!("Failed to connect provider/model stores to SQLite: {e}");
+                tracing::warn!("Failed to connect model stores to SQLite: {e}");
                 None
             }
         };

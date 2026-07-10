@@ -19,3 +19,4 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 axum = { workspace = true }
 once_cell = "1"
+rand = { workspace = true }

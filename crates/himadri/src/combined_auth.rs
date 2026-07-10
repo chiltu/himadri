@@ -16,7 +16,7 @@ use axum::{
     Json,
 };
 use himadri_admin::AuthMiddleware;
-use himadri_auth::OidcDiscovery;
+use himadri_auth::{AdminLogin, OidcDiscovery};
 use himadri_core::AuthContext;
 use himadri_observability::{AuditLog, AuditStatus};
 use tracing::{debug, warn};
@@ -63,6 +63,9 @@ pub struct CombinedAuth {
     api_key: Arc<AuthMiddleware>,
     /// Present when JWT/OIDC auth is enabled.
     jwt: Option<Arc<OidcDiscovery>>,
+    /// Present when the dev/break-glass admin login is enabled
+    /// (`DEV_ADMIN_PASSWORD`); validates locally issued admin JWTs.
+    admin_login: Option<Arc<AdminLogin>>,
     /// Records 401/403 auth failures when present.
     audit: Option<Arc<AuditLog>>,
 }
@@ -71,11 +74,13 @@ impl CombinedAuth {
     pub fn new(
         api_key: Arc<AuthMiddleware>,
         jwt: Option<Arc<OidcDiscovery>>,
+        admin_login: Option<Arc<AdminLogin>>,
         audit: Option<Arc<AuditLog>>,
     ) -> Self {
         Self {
             api_key,
             jwt,
+            admin_login,
             audit,
         }
     }
@@ -105,7 +110,10 @@ impl CombinedAuth {
         next: Next,
     ) -> Result<Response, Response> {
         // Dev-mode bypass mirrors AuthMiddleware: no master key => anonymous.
-        if auth.jwt.is_none() && auth.api_key.is_bypass() {
+        // An enabled dev admin login counts as configured auth: setting
+        // DEV_ADMIN_PASSWORD alone must require a real login, not leave the
+        // gateway anonymous-admin.
+        if auth.jwt.is_none() && auth.admin_login.is_none() && auth.api_key.is_bypass() {
             request
                 .extensions_mut()
                 .insert(Some(AuthContext::anonymous()));
@@ -139,6 +147,21 @@ impl CombinedAuth {
                 ));
             }
         };
+
+        // Locally issued dev-admin tokens first: validation is pure HS256 (no
+        // network), and the namespaced issuer/audience guarantee an OIDC token
+        // can never match. Failures fall through silently to the other paths.
+        if let (Some(admin_login), true) = (&auth.admin_login, looks_like_jwt(&token)) {
+            if let Ok(claims) = admin_login.validate(&token) {
+                let ctx = claims.into_auth_context();
+                // Roles gate deliberately skipped: this principal exists to
+                // restore access when the OIDC provider (the source of the
+                // required roles) is unavailable, and it already carries the
+                // strongest scope (Admin).
+                request.extensions_mut().insert(Some(ctx));
+                return Ok(next.run(request).await);
+            }
+        }
 
         // Try JWT validation first when configured and the token looks like a
         // JWT (three dot-separated segments). Non-JWT tokens fall through to the

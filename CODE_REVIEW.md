@@ -17,6 +17,8 @@ third backend or new store methods appear, and the R16 dispatch macro
 (done) removed the day-to-day drift pain that was its main cost. Left as a
 deliberate deferral.
 
+**Note (2026-07-10):** A high-effort code review of the current working-tree changes identified 10 findings (6 CONFIRMED, 4 PLAUSIBLE) including 2 critical issues (API key leak, credential destruction) and several availability bugs. See `docs/CODE_REVIEW_2026-07-10.md` for full details and recommended fix order.
+
 A few items were resolved by a broader decision than the plan's first
 option, noted here so the choices are visible:
 

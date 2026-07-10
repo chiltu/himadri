@@ -26,7 +26,6 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Table,
@@ -235,10 +234,10 @@ export default function ConfigPage() {
                 <TabsTrigger value="history">History</TabsTrigger>
               </TabsList>
 
-              <TabsContent value="general" className="space-y-4">
-                <Card>
-                  <CardHeader><CardTitle>Routing Strategy</CardTitle></CardHeader>
-                  <CardContent className="grid grid-cols-2 gap-4">
+              <TabsContent value="general" className="space-y-8">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">Routing Strategy</h2>
+                  <div className="grid grid-cols-2 gap-4">
                     <div>
                       <Label>Mode</Label>
                       <select
@@ -257,12 +256,12 @@ export default function ConfigPage() {
                         onChange={(e) => update((c) => { c.strategy.fallback_timeout_ms = Number(e.target.value) || 0; return c })}
                       />
                     </div>
-                  </CardContent>
-                </Card>
+                  </div>
+                </section>
 
-                <Card>
-                  <CardHeader><CardTitle>Rate Limit</CardTitle></CardHeader>
-                  <CardContent className="grid grid-cols-3 gap-4">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">Rate Limit</h2>
+                  <div className="grid grid-cols-3 gap-4">
                     <label className="flex items-center gap-2 text-sm">
                       <input
                         type="checkbox"
@@ -287,12 +286,12 @@ export default function ConfigPage() {
                         onChange={(e) => update((c) => { c.rate_limit.burst_size = Number(e.target.value) || 0; return c })}
                       />
                     </div>
-                  </CardContent>
-                </Card>
+                  </div>
+                </section>
 
-                <Card>
-                  <CardHeader><CardTitle>CORS</CardTitle></CardHeader>
-                  <CardContent className="space-y-4">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">CORS</h2>
+                  <div className="space-y-4">
                     <label className="flex items-center gap-2 text-sm">
                       <input
                         type="checkbox"
@@ -322,12 +321,12 @@ export default function ConfigPage() {
                         onChange={(e) => update((c) => { c.cors.allowed_headers = fromCsv(e.target.value) ?? []; return c })}
                       />
                     </div>
-                  </CardContent>
-                </Card>
+                  </div>
+                </section>
 
-                <Card>
-                  <CardHeader><CardTitle>Admin &amp; Observability</CardTitle></CardHeader>
-                  <CardContent className="grid grid-cols-2 gap-4">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">Admin &amp; Observability</h2>
+                  <div className="grid grid-cols-2 gap-4">
                     <label className="flex items-center gap-2 text-sm">
                       <input
                         type="checkbox"
@@ -360,124 +359,89 @@ export default function ConfigPage() {
                         onChange={(e) => update((c) => { c.observability.tracing.sample_ratio = Number(e.target.value) || 0; return c })}
                       />
                     </div>
-                  </CardContent>
-                </Card>
+                  </div>
+                </section>
               </TabsContent>
 
-              <TabsContent value="targets">
-                <Card>
-                  <CardHeader>
-                    <div className="flex items-center justify-between">
-                      <CardTitle>Routing Targets</CardTitle>
-                      <Button
-                        size="sm"
-                        onClick={() => update((c) => {
-                          c.targets.push({ provider: "", weight: 1, models: undefined, api_key_env: undefined, base_url: undefined })
-                          return c
-                        })}
-                      >
-                        Add Target
-                      </Button>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <Table>
+              <TabsContent value="targets" className="space-y-4">
+                <div>
+                  <h2 className="text-lg font-semibold">Routing Targets</h2>
+                  <p className="text-sm text-muted-foreground mt-1">
+                    Read-only. Each target is one (model, provider endpoint) pair derived from the{" "}
+                    <a href="/dashboard/models" className="underline">Models</a>{" "}
+                    page — the source of truth for routing. Add or weight provider endpoints there;
+                    edits made here would be overwritten by the next model/endpoint change.
+                  </p>
+                </div>
+                <Table>
                       <TableHeader>
                         <TableRow>
                           <TableHead>Provider</TableHead>
                           <TableHead>Weight</TableHead>
-                          <TableHead>Models (CSV)</TableHead>
+                          <TableHead>Models</TableHead>
                           <TableHead>API Key Env</TableHead>
                           <TableHead>Base URL</TableHead>
-                          <TableHead className="text-right">Actions</TableHead>
                         </TableRow>
                       </TableHeader>
                       <TableBody>
                         {config.targets.map((t, i) => (
                           <TableRow key={i}>
-                            <TableCell>
-                              <Input value={t.provider} onChange={(e) => update((c) => { c.targets[i].provider = e.target.value; return c })} />
-                            </TableCell>
-                            <TableCell>
-                              <Input type="number" value={t.weight} onChange={(e) => update((c) => { c.targets[i].weight = Number(e.target.value) || 0; return c })} />
-                            </TableCell>
-                            <TableCell>
-                              <Input value={csv(t.models)} onChange={(e) => update((c) => { c.targets[i].models = fromCsv(e.target.value); return c })} />
-                            </TableCell>
-                            <TableCell>
-                              <Input value={t.api_key_env ?? ""} onChange={(e) => update((c) => { c.targets[i].api_key_env = e.target.value || undefined; return c })} />
-                            </TableCell>
-                            <TableCell>
-                              <Input value={t.base_url ?? ""} onChange={(e) => update((c) => { c.targets[i].base_url = e.target.value || undefined; return c })} />
-                            </TableCell>
-                            <TableCell className="text-right">
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="text-destructive"
-                                onClick={() => update((c) => { c.targets.splice(i, 1); return c })}
-                              >
-                                Remove
-                              </Button>
-                            </TableCell>
+                            <TableCell className="font-medium">{t.provider}</TableCell>
+                            <TableCell className="text-muted-foreground">{t.weight}</TableCell>
+                            <TableCell className="font-mono text-sm">{csv(t.models) || "*"}</TableCell>
+                            <TableCell className="text-muted-foreground">{t.api_key_env ?? "-"}</TableCell>
+                            <TableCell className="text-muted-foreground">{t.base_url ?? "-"}</TableCell>
                           </TableRow>
                         ))}
-                        {config.targets.length === 0 && (
-                          <TableRow>
-                            <TableCell colSpan={6} className="text-center text-muted-foreground py-8">No targets configured</TableCell>
-                          </TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
+                    {config.targets.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={5} className="text-center text-muted-foreground py-8">No targets configured</TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
               </TabsContent>
 
-              <TabsContent value="rbac" className="space-y-4">
-                <Card>
-                  <CardHeader><CardTitle>RBAC</CardTitle></CardHeader>
-                  <CardContent className="space-y-4">
-                    <div className="flex items-center gap-4">
-                      <label className="flex items-center gap-2 text-sm">
-                        <input
-                          type="checkbox"
-                          checked={config.rbac.enabled}
-                          onChange={(e) => update((c) => { c.rbac.enabled = e.target.checked; return c })}
-                        />
-                        Enabled
-                      </label>
-                      <div className="flex-1">
-                        <Label>Default role</Label>
-                        <Input
-                          value={config.rbac.default_role ?? ""}
-                          onChange={(e) => update((c) => { c.rbac.default_role = e.target.value || undefined; return c })}
-                          placeholder="e.g. free"
-                        />
-                      </div>
+              <TabsContent value="rbac" className="space-y-8">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">RBAC</h2>
+                  <div className="flex items-center gap-4">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={config.rbac.enabled}
+                        onChange={(e) => update((c) => { c.rbac.enabled = e.target.checked; return c })}
+                      />
+                      Enabled
+                    </label>
+                    <div className="flex-1">
+                      <Label>Default role</Label>
+                      <Input
+                        value={config.rbac.default_role ?? ""}
+                        onChange={(e) => update((c) => { c.rbac.default_role = e.target.value || undefined; return c })}
+                        placeholder="e.g. free"
+                      />
                     </div>
-                  </CardContent>
-                </Card>
+                  </div>
+                </section>
 
-                <Card>
-                  <CardHeader>
-                    <div className="flex items-center justify-between">
-                      <CardTitle>Role Policies</CardTitle>
-                      <Button
-                        size="sm"
-                        onClick={() => update((c) => {
-                          let name = "new_role"
-                          let n = 1
-                          while (c.rbac.roles[name]) name = `new_role_${n++}`
-                          c.rbac.roles[name] = { models: undefined, providers: undefined }
-                          return c
-                        })}
-                      >
-                        Add Role
-                      </Button>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <Table>
+                <section className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-lg font-semibold">Role Policies</h2>
+                    <Button
+                      size="sm"
+                      onClick={() => update((c) => {
+                        let name = "new_role"
+                        let n = 1
+                        while (c.rbac.roles[name]) name = `new_role_${n++}`
+                        c.rbac.roles[name] = { models: undefined, providers: undefined }
+                        return c
+                      })}
+                    >
+                      Add Role
+                    </Button>
+                  </div>
+                  <Table>
                       <TableHeader>
                         <TableRow>
                           <TableHead>Role</TableHead>
@@ -527,35 +491,31 @@ export default function ConfigPage() {
                             </TableCell>
                           </TableRow>
                         ))}
-                        {roleEntries.length === 0 && (
-                          <TableRow>
-                            <TableCell colSpan={4} className="text-center text-muted-foreground py-8">No roles configured</TableCell>
-                          </TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
+                      {roleEntries.length === 0 && (
+                        <TableRow>
+                          <TableCell colSpan={4} className="text-center text-muted-foreground py-8">No roles configured</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </section>
               </TabsContent>
 
-              <TabsContent value="plugins">
-                <Card>
-                  <CardHeader>
-                    <div className="flex items-center justify-between">
-                      <CardTitle>Plugins</CardTitle>
-                      <Button
-                        size="sm"
-                        onClick={() => update((c) => {
-                          c.plugins.push({ name: "", enabled: false, config: {} } as PluginConfig)
-                          return c
-                        })}
-                      >
-                        Add Plugin
-                      </Button>
-                    </div>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    {config.plugins.map((p, i) => (
+              <TabsContent value="plugins" className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold">Plugins</h2>
+                  <Button
+                    size="sm"
+                    onClick={() => update((c) => {
+                      c.plugins.push({ name: "", enabled: false, config: {} } as PluginConfig)
+                      return c
+                    })}
+                  >
+                    Add Plugin
+                  </Button>
+                </div>
+                <div className="space-y-4">
+                  {config.plugins.map((p, i) => (
                       <div key={i} className="rounded-md border p-3 space-y-2">
                         <div className="flex items-center gap-4">
                           <Input
@@ -598,39 +558,32 @@ export default function ConfigPage() {
                         </div>
                       </div>
                     ))}
-                    {config.plugins.length === 0 && (
-                      <p className="text-center text-muted-foreground py-8 text-sm">No plugins configured</p>
-                    )}
-                  </CardContent>
-                </Card>
+                  {config.plugins.length === 0 && (
+                    <p className="text-center text-muted-foreground py-8 text-sm">No plugins configured</p>
+                  )}
+                </div>
               </TabsContent>
 
-              <TabsContent value="advanced" className="space-y-4">
-                <Card>
-                  <CardHeader><CardTitle>Orgs &amp; Teams (JSON)</CardTitle></CardHeader>
-                  <CardContent>
-                    <p className="text-sm text-muted-foreground mb-2">
-                      Per-org / per-team allow-lists, budgets, rate limits, guardrails and audit config. Edit as raw JSON — validated on save.
-                    </p>
-                    <Textarea className="min-h-64 font-mono" value={orgsJson} onChange={(e) => setOrgsJson(e.target.value)} />
-                  </CardContent>
-                </Card>
-                <Card>
-                  <CardHeader><CardTitle>Advanced Strategy Rules (JSON)</CardTitle></CardHeader>
-                  <CardContent>
-                    <p className="text-sm text-muted-foreground mb-2">
-                      conditional_rules / content_rules / ab_variants / strategy_fallback — only used when strategy mode is conditional, content_based or ab_test.
-                    </p>
-                    <Textarea className="min-h-64 font-mono" value={strategyRulesJson} onChange={(e) => setStrategyRulesJson(e.target.value)} />
-                  </CardContent>
-                </Card>
+              <TabsContent value="advanced" className="space-y-8">
+                <section className="space-y-2">
+                  <h2 className="text-sm font-medium text-muted-foreground">Orgs &amp; Teams (JSON)</h2>
+                  <p className="text-sm text-muted-foreground">
+                    Per-org / per-team allow-lists, budgets, rate limits, guardrails and audit config. Edit as raw JSON — validated on save.
+                  </p>
+                  <Textarea className="min-h-64 font-mono" value={orgsJson} onChange={(e) => setOrgsJson(e.target.value)} />
+                </section>
+                <section className="space-y-2">
+                  <h2 className="text-sm font-medium text-muted-foreground">Advanced Strategy Rules (JSON)</h2>
+                  <p className="text-sm text-muted-foreground">
+                    conditional_rules / content_rules / ab_variants / strategy_fallback — only used when strategy mode is conditional, content_based or ab_test.
+                  </p>
+                  <Textarea className="min-h-64 font-mono" value={strategyRulesJson} onChange={(e) => setStrategyRulesJson(e.target.value)} />
+                </section>
               </TabsContent>
 
-              <TabsContent value="history">
-                <Card>
-                  <CardHeader><CardTitle>Config History</CardTitle></CardHeader>
-                  <CardContent>
-                    <Table>
+              <TabsContent value="history" className="space-y-4">
+                <h2 className="text-lg font-semibold">Config History</h2>
+                <Table>
                       <TableHeader>
                         <TableRow>
                           <TableHead>Version</TableHead>
@@ -652,15 +605,13 @@ export default function ConfigPage() {
                             </TableCell>
                           </TableRow>
                         ))}
-                        {history.length === 0 && (
-                          <TableRow>
-                            <TableCell colSpan={4} className="text-center text-muted-foreground py-8">No history yet</TableCell>
-                          </TableRow>
-                        )}
-                      </TableBody>
-                    </Table>
-                  </CardContent>
-                </Card>
+                    {history.length === 0 && (
+                      <TableRow>
+                        <TableCell colSpan={4} className="text-center text-muted-foreground py-8">No history yet</TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
               </TabsContent>
             </Tabs>
           </div>

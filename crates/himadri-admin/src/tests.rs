@@ -474,9 +474,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(admin.get_key(&key.id).await.is_some());
-        assert!(admin.delete_key(&key.id).await);
-        assert!(admin.get_key(&key.id).await.is_none());
+        assert!(admin.get_key(&key.id).await.unwrap().is_some());
+        assert_eq!(admin.delete_key(&key.id).await, Ok(true));
+        assert!(admin.get_key(&key.id).await.unwrap().is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -554,41 +554,54 @@ mod tests {
         assert!(auth.is_bypass());
     }
 
-    /// The SSRF guard must be enforced at the admin boundary: a provider
-    /// pointing at an internal address is rejected, a public one accepted.
+    /// The SSRF guard must be enforced at the admin boundary: an endpoint whose
+    /// base_url points at an internal address is rejected, a public one accepted.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn create_provider_enforces_ssrf_guard() {
-        use crate::models::CreateProviderRequest;
+    async fn create_endpoint_enforces_ssrf_guard() {
+        use crate::models::{CreateModelEndpointRequest, CreateModelRequest};
         use crate::store::StoreBackend;
 
-        let path = std::env::temp_dir().join(format!("himadri-ssrf-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("himadri-ep-ssrf-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}", path.display());
-        let (provider_store, model_store) =
-            crate::provider_backend::connect_provider_model_stores(&url, None)
+        let (model_store, endpoint_store) =
+            crate::provider_backend::connect_model_stores(&url, None)
                 .await
-                .expect("sqlite provider/model store");
+                .expect("sqlite model store");
         let admin = AdminHandlers::new(StoreBackend::new().await)
-            .with_provider_model_stores(provider_store, model_store);
+            .with_model_stores(model_store, endpoint_store);
 
-        let req = |name: &str, base_url: &str| CreateProviderRequest {
-            name: name.to_string(),
-            enabled: true,
+        let model = admin
+            .create_model(CreateModelRequest {
+                name: "m".to_string(),
+                display_name: None,
+                enabled: true,
+            })
+            .await
+            .expect("model created");
+
+        let ep = |base: &str| CreateModelEndpointRequest {
+            provider_type: "openai".to_string(),
+            base_url: Some(base.to_string()),
             api_key: Some("sk-x".to_string()),
-            base_url: Some(base_url.to_string()),
             weight: 1.0,
+            enabled: true,
         };
 
-        // Cloud metadata endpoint → rejected before the store is touched.
-        assert!(admin
-            .create_provider(req("evil", "http://169.254.169.254/latest/meta-data/"))
-            .await
-            .is_none());
+        // Cloud metadata endpoint → rejected as a typed validation error
+        // (mapped to 400 by the HTTP layer) before the store is touched.
+        assert!(matches!(
+            admin
+                .create_endpoint(&model.id, ep("http://169.254.169.254/latest/meta-data/"))
+                .await,
+            Err(crate::error::AdminError::Validation(_))
+        ));
         // Public endpoint → accepted.
         assert!(admin
-            .create_provider(req("good", "https://api.openai.com/v1"))
+            .create_endpoint(&model.id, ep("https://api.openai.com/v1"))
             .await
-            .is_some());
+            .is_ok());
 
         let _ = std::fs::remove_file(&path);
     }

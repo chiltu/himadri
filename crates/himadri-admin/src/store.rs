@@ -1,3 +1,4 @@
+use crate::error::AdminError;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -131,15 +132,16 @@ pub struct UpdateApiKeyRequest {
 
 /// Dispatch a method to the active backend: the in-memory store is
 /// synchronous and infallible (wrapped in `Ok`), the SQL stores are async and
-/// map their `sqlx::Error` to a `String`. Adding a store method is one line.
+/// convert their `sqlx::Error` into [`AdminError`]. Adding a store method is
+/// one line.
 macro_rules! store_dispatch {
     ($self:expr, $method:ident ( $($arg:expr),* )) => {
         match $self {
             StoreBackend::Memory(store) => Ok(store.$method($($arg),*)),
             #[cfg(feature = "postgres")]
-            StoreBackend::Postgres(store) => store.$method($($arg),*).await.map_err(|e| e.to_string()),
+            StoreBackend::Postgres(store) => store.$method($($arg),*).await.map_err(AdminError::from),
             #[cfg(feature = "sqlite")]
-            StoreBackend::Sqlite(store) => store.$method($($arg),*).await.map_err(|e| e.to_string()),
+            StoreBackend::Sqlite(store) => store.$method($($arg),*).await.map_err(AdminError::from),
         }
     };
 }
@@ -191,15 +193,15 @@ impl StoreBackend {
         StoreBackend::Memory(Arc::new(ApiKeyStore::new()))
     }
 
-    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, String> {
+    pub async fn create(&self, request: CreateApiKeyRequest) -> Result<ApiKey, AdminError> {
         store_dispatch!(self, create(request))
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<ApiKey>, String> {
+    pub async fn get(&self, id: &str) -> Result<Option<ApiKey>, AdminError> {
         store_dispatch!(self, get(id))
     }
 
-    pub async fn list(&self) -> Result<Vec<ApiKey>, String> {
+    pub async fn list(&self) -> Result<Vec<ApiKey>, AdminError> {
         store_dispatch!(self, list())
     }
 
@@ -207,23 +209,23 @@ impl StoreBackend {
         &self,
         id: &str,
         request: UpdateApiKeyRequest,
-    ) -> Result<Option<ApiKey>, String> {
+    ) -> Result<Option<ApiKey>, AdminError> {
         store_dispatch!(self, update(id, request))
     }
 
-    pub async fn delete(&self, id: &str) -> Result<bool, String> {
+    pub async fn delete(&self, id: &str) -> Result<bool, AdminError> {
         store_dispatch!(self, delete(id))
     }
 
-    pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, String> {
+    pub async fn validate(&self, key: &str) -> Result<Option<ApiKey>, AdminError> {
         store_dispatch!(self, validate(key))
     }
 
-    pub async fn revoke(&self, id: &str) -> Result<bool, String> {
+    pub async fn revoke(&self, id: &str) -> Result<bool, AdminError> {
         store_dispatch!(self, revoke(id))
     }
 
-    pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, String> {
+    pub async fn rotate(&self, id: &str) -> Result<Option<ApiKey>, AdminError> {
         store_dispatch!(self, rotate(id))
     }
 

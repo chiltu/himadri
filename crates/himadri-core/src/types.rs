@@ -334,6 +334,13 @@ pub struct ModelObject {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
+    /// Unique routing identity for a DB-configured endpoint (the endpoint id),
+    /// used to key the provider-client registry, circuit breaker, and API-key
+    /// map so two endpoints of the same `provider` type (different creds/URL)
+    /// never collide. `None` for env/config-file targets, which key on
+    /// `provider` instead. `provider` remains the human/label field.
+    #[serde(default)]
+    pub id: Option<String>,
     pub provider: String,
     #[serde(default = "default_weight")]
     pub weight: f64,

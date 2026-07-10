@@ -489,6 +489,7 @@ impl Default for Config {
         Self {
             strategy: StrategyConfig::default(),
             targets: vec![Target {
+                id: None,
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,

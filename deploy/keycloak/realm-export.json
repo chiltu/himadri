@@ -1,0 +1,127 @@
+{
+  "realm": "ai-gateway",
+  "enabled": true,
+  "accessTokenLifespan": 36000,
+  "accessTokenLifespanForImplicitFlow": 900,
+  "actionTokenGeneratedByAdminLifespan": 43200,
+  "actionTokenGeneratedByUserLifespan": 300,
+  "requiredCredentials": [
+    "password"
+  ],
+  "userManagedAccessAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": true,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "minimumQuickLoginWaitSeconds": 60,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 30,
+  "defaultRole": {
+    "name": "default-roles-ai-gateway",
+    "id": "default-role",
+    "composite": true,
+    "composites": {
+      "realm": [
+        "user"
+      ]
+    },
+    "clientRole": false,
+    "containerId": "ai-gateway"
+  },
+  "roles": {
+    "realm": [
+      {
+        "name": "user",
+        "description": "User role for AI Gateway",
+        "composite": false,
+        "clientRole": false,
+        "containerId": "ai-gateway"
+      },
+      {
+        "name": "power-user",
+        "description": "Power User role for AI Gateway",
+        "composite": false,
+        "clientRole": false,
+        "containerId": "ai-gateway"
+      },
+      {
+        "name": "analyst",
+        "description": "Analyst role for AI Gateway",
+        "composite": false,
+        "clientRole": false,
+        "containerId": "ai-gateway"
+      },
+      {
+        "name": "admin",
+        "description": "Admin role for AI Gateway",
+        "composite": false,
+        "clientRole": false,
+        "containerId": "ai-gateway"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "ai-gateway",
+      "name": "AI Gateway",
+      "description": "OAuth 2.0 / OIDC server for AI Gateway",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "redirectUris": [
+        "http://localhost:8080/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:8080"
+      ],
+      "publicClient": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "web-origins",
+        "profile",
+        "email",
+        "roles"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access"
+      ],
+      "access": {
+        "view": true,
+        "configure": true,
+        "manage": true
+      }
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "roles",
+      "description": "OpenID Connect scope for roles",
+      "protocol": "openid-connect",
+      "attributes": {
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "usermodel.realmRoleMapping.rolePrefix": "",
+            "access.token.claim": "false",
+            "id.token.claim": "true",
+            "multivalued": "true",
+            "claim.name": "roles"
+          }
+        }
+      ]
+    }
+  ]
+}

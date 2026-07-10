@@ -31,6 +31,7 @@ fn test_targets() -> Vec<Target> {
             provider: "openai".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -38,6 +39,7 @@ fn test_targets() -> Vec<Target> {
             provider: "anthropic".to_string(),
             weight: 2.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -115,6 +117,7 @@ async fn test_load_balance_respects_weights() {
             provider: "heavy".to_string(),
             weight: 100.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -122,6 +125,7 @@ async fn test_load_balance_respects_weights() {
             provider: "light".to_string(),
             weight: 0.001,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -155,6 +159,7 @@ async fn test_cost_optimized_picks_cheapest() {
             provider: "expensive".to_string(),
             weight: 10.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -162,6 +167,7 @@ async fn test_cost_optimized_picks_cheapest() {
             provider: "cheap".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -195,6 +201,7 @@ async fn test_conditional_matches_model() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -203,6 +210,7 @@ async fn test_conditional_matches_model() {
             provider: "anthropic".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         }),
@@ -226,6 +234,7 @@ async fn test_conditional_fallback_on_no_match() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -234,6 +243,7 @@ async fn test_conditional_fallback_on_no_match() {
             provider: "anthropic".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         }),
@@ -257,6 +267,7 @@ async fn test_conditional_model_prefix() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -286,6 +297,7 @@ async fn test_content_based_prompt_contains() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -333,6 +345,7 @@ async fn test_content_based_prompt_not_contains() {
                 provider: "anthropic".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -381,6 +394,7 @@ async fn test_content_based_prompt_regex() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -428,6 +442,7 @@ async fn test_content_based_fallback() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -437,6 +452,7 @@ async fn test_content_based_fallback() {
             provider: "anthropic".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         }),
@@ -481,6 +497,7 @@ async fn test_content_based_only_checks_user_messages() {
                 provider: "openai".to_string(),
                 weight: 1.0,
                 models: None,
+                id: None,
                 api_key_env: None,
                 base_url: None,
             },
@@ -490,6 +507,7 @@ async fn test_content_based_only_checks_user_messages() {
             provider: "anthropic".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         }),
@@ -548,6 +566,7 @@ async fn test_ab_test_distribution() {
                     provider: "control".to_string(),
                     weight: 80.0,
                     models: None,
+                    id: None,
                     api_key_env: None,
                     base_url: None,
                 },
@@ -558,6 +577,7 @@ async fn test_ab_test_distribution() {
                     provider: "challenger".to_string(),
                     weight: 20.0,
                     models: None,
+                    id: None,
                     api_key_env: None,
                     base_url: None,
                 },
@@ -596,6 +616,7 @@ async fn test_ab_test_equal_weight() {
                     provider: "a".to_string(),
                     weight: 1.0,
                     models: None,
+                    id: None,
                     api_key_env: None,
                     base_url: None,
                 },
@@ -606,6 +627,7 @@ async fn test_ab_test_equal_weight() {
                     provider: "b".to_string(),
                     weight: 1.0,
                     models: None,
+                    id: None,
                     api_key_env: None,
                     base_url: None,
                 },
@@ -745,6 +767,7 @@ async fn test_select_ordered_dedups_identical_endpoints() {
             provider: "openai".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -752,6 +775,7 @@ async fn test_select_ordered_dedups_identical_endpoints() {
             provider: "openai".to_string(),
             weight: 1.0,
             models: None,
+            id: None,
             api_key_env: None,
             base_url: None,
         },
@@ -762,6 +786,39 @@ async fn test_select_ordered_dedups_identical_endpoints() {
         ordered.len(),
         1,
         "identical endpoints should be de-duplicated"
+    );
+}
+
+/// Regression test: two DB endpoints of the same provider type with the same
+/// (preset) base URL but distinct ids carry different credentials/weights and
+/// must both survive dedup, or multi-key failover silently breaks.
+#[tokio::test]
+async fn test_select_ordered_keeps_same_provider_endpoints_with_distinct_ids() {
+    let strategy = Strategy::from_mode(StrategyMode::Fallback);
+    let targets = vec![
+        Target {
+            provider: "openai".to_string(),
+            weight: 5.0,
+            models: None,
+            id: Some("ep1".to_string()),
+            api_key_env: None,
+            base_url: None,
+        },
+        Target {
+            provider: "openai".to_string(),
+            weight: 2.0,
+            models: None,
+            id: Some("ep2".to_string()),
+            api_key_env: None,
+            base_url: None,
+        },
+    ];
+    let req = test_request("gpt-4");
+    let ordered = strategy.select_ordered(&req, &targets).await.unwrap();
+    assert_eq!(
+        ordered.len(),
+        2,
+        "distinct endpoint ids must both stay in the failover order"
     );
 }
 
@@ -787,6 +844,7 @@ fn target(provider: &str) -> Target {
         provider: provider.to_string(),
         weight: 1.0,
         models: None,
+        id: None,
         api_key_env: None,
         base_url: None,
     }

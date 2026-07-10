@@ -2,7 +2,7 @@
 
 import { AuthGuard } from "@/components/auth-guard"
 import { useEffect, useState } from "react"
-import { api, type UsageStats } from "@/lib/api"
+import { api, type UsageStats, type ApiKey } from "@/lib/api"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
   Breadcrumb,
@@ -19,29 +19,35 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+
+const ALL_KEYS = "__all__"
 
 export default function UsagePage() {
   const [stats, setStats] = useState<UsageStats | null>(null)
-  const [keyId, setKeyId] = useState("")
+  const [keys, setKeys] = useState<ApiKey[]>([])
+  const [keyId, setKeyId] = useState(ALL_KEYS)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     api.usageStats().then(setStats).catch((e) => setError(e.message))
+    api.listKeys().then(setKeys).catch((e) => setError(e.message))
   }, [])
 
-  const loadKeyStats = async () => {
-    if (!keyId.trim()) {
-      api.usageStats().then(setStats).catch((e) => setError(e.message))
-      return
-    }
+  const handleFilterChange = async (value: string) => {
+    setKeyId(value)
     try {
-      const data = await api.keyUsageStats(keyId.trim())
+      const data = value === ALL_KEYS ? await api.usageStats() : await api.keyUsageStats(value)
       setStats(data)
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to load key stats")
+      setError(e instanceof Error ? e.message : "Failed to load usage stats")
     }
   }
 
@@ -75,20 +81,20 @@ export default function UsagePage() {
             </div>
           )}
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Filter by API Key</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex gap-4 items-end">
-                <div className="flex-1">
-                  <Label>Key ID</Label>
-                  <Input value={keyId} onChange={(e) => setKeyId(e.target.value)} placeholder="Enter key ID (leave empty for all)" />
-                </div>
-                <Button onClick={loadKeyStats}>Load</Button>
-              </div>
-            </CardContent>
-          </Card>
+          <div className="flex items-center justify-between gap-4">
+            <h1 className="text-lg font-semibold">Usage</h1>
+            <Select value={keyId} onValueChange={handleFilterChange}>
+              <SelectTrigger className="w-[240px]">
+                <SelectValue placeholder="Filter by API key" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL_KEYS}>All API keys</SelectItem>
+                {keys.map((k) => (
+                  <SelectItem key={k.id} value={k.id}>{k.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
 
           {stats && (
             <div className="grid auto-rows-min gap-4 md:grid-cols-4">

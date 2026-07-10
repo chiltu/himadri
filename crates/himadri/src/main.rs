@@ -68,6 +68,40 @@ fn parse_cli_args() -> CliArgs {
     cli
 }
 
+/// True when the process is expected to run with authentication enabled.
+/// Set `REQUIRE_AUTH=1` explicitly, or deploy with `RUST_ENV`/`HIMADRI_ENV`
+/// of `production` / `prod` / `staging`.
+fn auth_is_required() -> bool {
+    env_flag_truthy("REQUIRE_AUTH")
+        || env_is_nondev_deployment(
+            std::env::var("RUST_ENV")
+                .or_else(|_| std::env::var("HIMADRI_ENV"))
+                .ok()
+                .as_deref(),
+        )
+}
+
+fn env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn env_is_nondev_deployment(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("production" | "prod" | "staging")
+    )
+}
+
+fn master_key_configured(config: &Config) -> bool {
+    config
+        .admin
+        .master_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = parse_cli_args();
@@ -85,6 +119,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MASTER_KEY env var overrides config
     if let Ok(key) = std::env::var("MASTER_KEY") {
         config.admin.master_key = Some(key);
+    }
+
+    // Fail closed when operators have marked this as a non-dev deployment.
+    // Without MASTER_KEY (and with no JWT_ISSUER / DEV_ADMIN_PASSWORD), auth
+    // is fully bypassed — every request is anonymous Admin, including
+    // /admin/*. Production keeps requiring MASTER_KEY outright as the
+    // guaranteed root credential, independent of the other mechanisms.
+    if auth_is_required() && !master_key_configured(&config) {
+        eprintln!(
+            "FATAL: MASTER_KEY is required when REQUIRE_AUTH=1 or \
+             RUST_ENV/HIMADRI_ENV is production|prod|staging. \
+             Refusing to start with authentication bypassed."
+        );
+        std::process::exit(1);
     }
 
     himadri_observability::init_tracing(
@@ -117,28 +165,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway = Arc::new(build_gateway(&config).await);
     let (admin, auth) = build_admin(&config).await;
 
-    // Sync routing targets from DB-registered providers/models, so they are
+    // Sync routing targets from DB-registered models/endpoints, so they are
     // active immediately after a restart (previously they stayed inactive
-    // until the first provider/model mutation triggered a rebuild). A DB
-    // with no providers leaves the env/file-configured targets untouched.
-    let db_providers = admin.list_providers().await;
-    if !db_providers.is_empty() {
-        let db_models = admin.list_models().await;
-        gateway
-            .rebuild_targets_from_db(&db_providers, &db_models)
-            .await;
-        info!(
-            "Loaded {} provider(s) and {} model(s) from database into routing targets",
-            db_providers.len(),
-            db_models.len()
-        );
+    // until the first model/endpoint mutation triggered a rebuild). A DB
+    // with no *active* targets (no rows, or only disabled ones) — or one
+    // that can't be read right now — leaves the env/file-configured targets
+    // untouched instead of wiping them.
+    match (admin.list_models().await, admin.list_endpoints().await) {
+        (Ok(db_models), Ok(db_endpoints))
+            if Gateway::db_has_active_targets(&db_models, &db_endpoints) =>
+        {
+            gateway
+                .rebuild_targets_from_db(&db_models, &db_endpoints)
+                .await;
+            info!(
+                "Loaded {} model(s) and {} endpoint(s) from database into routing targets",
+                db_models.len(),
+                db_endpoints.len()
+            );
+        }
+        (Ok(_), Ok(_)) => {}
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!("skipping DB target sync at startup (stores unavailable): {e}");
+        }
     }
 
     // JWT/OIDC (when JWT_ISSUER is set) runs alongside API-key auth.
     let jwt_discovery = init_jwt_discovery().await;
+
+    // Dev/break-glass admin login (DEV_ADMIN_PASSWORD): username+password →
+    // short-lived, locally signed admin JWT. For development without an OIDC
+    // provider, and for regaining admin access when OIDC is down.
+    let admin_login = himadri_auth::AdminLogin::from_env().map(Arc::new);
+    if let Some(login) = &admin_login {
+        tracing::warn!(
+            "Dev admin login enabled for user '{}' (break-glass credential): \
+             tokens are signed with a per-boot secret, so all sessions end on \
+             restart; unset DEV_ADMIN_PASSWORD to disable",
+            login.username()
+        );
+    }
+
     let combined_auth = Arc::new(combined_auth::CombinedAuth::new(
         auth.clone(),
         jwt_discovery,
+        admin_login.clone(),
         Some(gateway.audit_log_arc()),
     ));
 
@@ -146,8 +217,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway: gateway.clone(),
         admin,
         metrics: gateway.metrics(),
+        admin_login,
     };
-    let app = build_router(state, &config, auth, combined_auth);
+    let app = build_router(state, &config, combined_auth);
 
     let addr = cli
         .port
@@ -262,6 +334,9 @@ fn register_providers_from_env(gateway: &Gateway) {
     // OpenAI-compatible vendors: registered when their API-key env var is set.
     // Adding a vendor is one table row (plus its `OpenAiCompatibleConfig`
     // preset). Row = (API-key env var, config factory, display name).
+    // Keep in sync with `himadri_core::KNOWN_PROVIDER_TYPES` and the preset
+    // match in `gateway::providers::build_provider_client` (drift there is
+    // caught by `build_provider_client_agrees_with_known_provider_registry`).
     type ProviderPreset = (&'static str, fn() -> OpenAiCompatibleConfig, &'static str);
     let openai_compatible: &[ProviderPreset] = &[
         (
@@ -430,11 +505,11 @@ async fn build_admin(config: &Config) -> (Arc<AdminHandlers>, Arc<AuthMiddleware
         );
     }
     if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        if let Some((provider_store, model_store)) =
-            himadri_admin::connect_provider_model_stores(&database_url, cipher).await
+        if let Some((model_store, endpoint_store)) =
+            himadri_admin::connect_model_stores(&database_url, cipher).await
         {
-            admin = admin.with_provider_model_stores(provider_store, model_store);
-            info!("Initialized provider and model stores");
+            admin = admin.with_model_stores(model_store, endpoint_store);
+            info!("Initialized model and endpoint stores");
         }
     }
     let admin = Arc::new(admin);
@@ -498,13 +573,15 @@ async fn init_jwt_discovery() -> Option<Arc<himadri_auth::OidcDiscovery>> {
 fn build_router(
     state: AppState,
     config: &Config,
-    auth: Arc<AuthMiddleware>,
     combined_auth: Arc<combined_auth::CombinedAuth>,
 ) -> Router {
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
-        .route("/v1/models", get(list_models));
+        .route("/v1/models", get(list_models))
+        // Unauthenticated by design (it *is* the login); 404s unless
+        // DEV_ADMIN_PASSWORD enables the dev/break-glass admin account.
+        .route("/auth/admin/login", post(dev_admin_login));
 
     let api_routes = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -524,18 +601,25 @@ fn build_router(
         .route("/admin/keys/{id}", delete(delete_key))
         .route("/admin/keys/{id}/revoke", post(revoke_key))
         .route("/admin/keys/{id}/rotate", post(rotate_key))
-        .route("/admin/providers", get(list_providers))
-        .route("/admin/providers", post(create_provider))
-        .route("/admin/providers/{id}", get(get_provider))
-        .route("/admin/providers/{id}", put(update_provider))
-        .route("/admin/providers/{id}", delete(delete_provider))
-        .route("/admin/providers/{id}/toggle", post(toggle_provider))
         .route("/admin/models", get(list_models_api))
         .route("/admin/models", post(create_model))
         .route("/admin/models/{id}", get(get_model))
         .route("/admin/models/{id}", put(update_model))
         .route("/admin/models/{id}", delete(delete_model))
         .route("/admin/models/{id}/toggle", post(toggle_model))
+        .route("/admin/endpoints", get(list_all_model_endpoints))
+        .route(
+            "/admin/models/{id}/endpoints",
+            get(list_model_endpoints).post(create_model_endpoint),
+        )
+        .route(
+            "/admin/endpoints/{id}",
+            get(get_model_endpoint)
+                .put(update_model_endpoint)
+                .delete(delete_model_endpoint),
+        )
+        .route("/admin/endpoints/{id}/toggle", post(toggle_model_endpoint))
+        .route("/admin/known-providers", get(known_providers))
         .route("/admin/dashboard", get(dashboard))
         .route("/admin/usage", get(usage_stats))
         .route("/admin/usage/{key_id}", get(key_usage_stats))
@@ -550,9 +634,15 @@ fn build_router(
         // before the auth layer so it runs *after* it (last `.layer()` is
         // outermost), seeing the AuthContext that layer inserts.
         .layer(middleware::from_fn(require_admin_scope))
+        // Combined auth (not the plain API-key middleware): admin access is
+        // any Admin-scope principal — master key, admin-scoped API key,
+        // dev/break-glass admin JWT, or an OIDC token carrying the admin
+        // role. Its bypass also stays off when DEV_ADMIN_PASSWORD or
+        // JWT_ISSUER is configured, so those setups require a real login
+        // even without MASTER_KEY.
         .layer(middleware::from_fn_with_state(
-            auth.clone(),
-            AuthMiddleware::middleware,
+            combined_auth.clone(),
+            combined_auth::CombinedAuth::middleware,
         ));
 
     // Build CORS layer from config

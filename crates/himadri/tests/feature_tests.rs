@@ -27,6 +27,7 @@ fn target(provider: &str) -> Target {
         provider: provider.to_string(),
         weight: 1.0,
         models: None,
+        id: None,
         api_key_env: None,
         base_url: None,
     }

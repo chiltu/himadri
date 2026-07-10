@@ -79,6 +79,44 @@ impl CipherKey {
     }
 }
 
+/// Encryption-at-rest policy for `ModelEndpoint.api_key`, shared by the
+/// SQLite and Postgres stores so the encrypt-if-nonempty rule and the
+/// decrypt-failure handling can never diverge between backends.
+///
+/// Encrypts a key about to be stored. Without a cipher (or for `None`/empty
+/// values) the input is passed through unchanged.
+pub(crate) fn encrypt_endpoint_api_key(
+    cipher: Option<&CipherKey>,
+    api_key: Option<String>,
+) -> Option<String> {
+    match (cipher, api_key) {
+        (Some(cipher), Some(plaintext)) if !plaintext.is_empty() => {
+            Some(cipher.encrypt(&plaintext))
+        }
+        (_, other) => other,
+    }
+}
+
+/// Decrypts `endpoint.api_key` in place for reads. On failure the field is
+/// cleared (and the failure logged) rather than handing ciphertext to
+/// callers. Writers must treat `api_key: None` as "leave the stored column
+/// alone", so a decrypt failure can never overwrite the stored ciphertext.
+pub(crate) fn decrypt_endpoint(
+    cipher: Option<&CipherKey>,
+    mut endpoint: crate::models::ModelEndpoint,
+) -> crate::models::ModelEndpoint {
+    if let (Some(cipher), Some(value)) = (cipher, &endpoint.api_key) {
+        match cipher.decrypt(value) {
+            Ok(plaintext) => endpoint.api_key = Some(plaintext),
+            Err(e) => {
+                tracing::error!(endpoint = %endpoint.id, "failed to decrypt endpoint api_key: {e}");
+                endpoint.api_key = None;
+            }
+        }
+    }
+    endpoint
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

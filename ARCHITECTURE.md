@@ -23,7 +23,7 @@ persistence details see [`docs/configuration.md`](docs/configuration.md) and
                         ▼                            ▼                            ▼
                  himadri-plugin(s)            himadri-provider              himadri-admin
              budget / cache / logger /    OpenAI, Anthropic, Gemini,   API keys, providers,
-             max_token / rate_limit /      Azure, Bedrock, OpenRouter,  models, usage & request
+             max_token / rate_limit /      Azure, OpenRouter,           models, usage & request
              word_filter                   OpenAI-compatible             logs (in-memory / SQLite
                                                                           / Postgres)
                         │                            │                            │
@@ -51,7 +51,7 @@ in `crates/` is a library crate it composes.
    `word_filter`, `cache` (serves cached responses), `logger`. A separate
    `ResponseGuardrail` trait allows post-hoc response inspection/blocking.
 4. **Routing** (`crates/himadri/src/strategy.rs`, `Gateway::route` in
-   `gateway.rs`) — the `Gateway` holds a set of configured `Target`s (provider
+   `gateway/route.rs`) — the `Gateway` holds a set of configured `Target`s (provider
    + model + weight/priority) and picks one per request according to the
    active routing strategy (e.g. priority, weighted, round-robin — see
    `strategy.rs`), guarded by `himadri-circuitbreaker` so unhealthy targets
@@ -61,7 +61,7 @@ in `crates/` is a library crate it composes.
    the upstream API's format, calls it, and translates the response/stream
    back. OpenAI-shaped vendors (OpenAI, Azure, OpenRouter, Groq, Together,
    Fireworks, …) are all configuration presets of the single
-   `OpenAiCompatibleProvider`; only Anthropic, Gemini and Bedrock have bespoke
+   `OpenAiCompatibleProvider`; only Anthropic and Gemini have bespoke
    implementations. All streaming responses are decoded by the shared SSE
    module (`sse.rs`) and go through `Gateway::route_stream`.
 6. **Post-processing** — usage is recorded (`himadri-admin::UsageStore`),
@@ -80,9 +80,9 @@ target — used for provider endpoints himadri doesn't model explicitly.
 
 | Crate | Responsibility |
 |---|---|
-| `himadri` | Binary: `main.rs` (startup wiring: `build_gateway` / `wire_plugins` / `build_admin` / `build_router`), `handlers.rs` (HTTP handlers), `gateway.rs` (`Gateway` orchestrator), `strategy.rs` (routing) |
+| `himadri` | Binary: `main.rs` (startup wiring: `build_gateway` / `wire_plugins` / `build_admin` / `build_router`), `handlers.rs` (HTTP handlers), `gateway/` (`Gateway` orchestrator, split into route/stream/policy/audit/config/rebuild/providers/proxy modules), `strategy.rs` (routing) |
 | `himadri-core` | Shared types (`Config`, `Target`, `ModelObject`, errors) used across crates |
-| `himadri-provider` | `Provider` trait, the config-driven `OpenAiCompatibleProvider` (with presets for OpenAI, Azure, OpenRouter, Groq, …), bespoke Anthropic/Gemini/Bedrock impls, shared SSE decoder (`sse.rs`) |
+| `himadri-provider` | `Provider` trait, the config-driven `OpenAiCompatibleProvider` (with presets for OpenAI, Azure, OpenRouter, Groq, …), bespoke Anthropic/Gemini impls, shared SSE decoder (`sse.rs`) |
 | `himadri-plugin` | `Plugin` / `ResponseGuardrail` traits, `PluginType`/`Stage`/`PluginError` |
 | `himadri-plugins` | Concrete plugins: budget, cache, logger, max_token, rate_limit, word_filter |
 | `himadri-admin` | Key/provider/model CRUD, usage & request-log stores (in-memory/SQLite/Postgres), auth middleware, embedded DB migrations |

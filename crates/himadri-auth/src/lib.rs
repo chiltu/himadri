@@ -1,7 +1,9 @@
+pub mod admin_login;
 pub mod error;
 pub mod jwt;
 pub mod oidc;
 
+pub use admin_login::{AdminLogin, IssuedAdminToken};
 pub use error::AuthError;
 pub use jwt::JwtClaims;
 pub use oidc::OidcDiscovery;

@@ -295,14 +295,18 @@ impl Strategy {
         ordered
     }
 
-    /// De-duplicate targets by endpoint identity (provider + key env + base
-    /// url) preserving order, so failover never retries the same endpoint.
+    /// De-duplicate targets by endpoint identity (id + provider + key env +
+    /// base url) preserving order, so failover never retries the same
+    /// endpoint. `id` must be part of the key: two DB endpoints of the same
+    /// provider type can share a preset base URL (`None`) while carrying
+    /// different credentials, and both must stay in the failover order.
     fn dedup_targets(targets: Vec<Target>) -> Vec<Target> {
         let mut seen = std::collections::HashSet::new();
         targets
             .into_iter()
             .filter(|t| {
                 seen.insert((
+                    t.id.clone(),
                     t.provider.clone(),
                     t.api_key_env.clone(),
                     t.base_url.clone(),

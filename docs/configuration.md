@@ -120,6 +120,33 @@ JSON file.
 
 See [Zitadel configuration](./zitadel.md) for the full OIDC setup.
 
+### Dev / break-glass admin login
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEV_ADMIN_PASSWORD` | _(unset)_ | **Setting this enables the admin login** (`POST /auth/admin/login`). Use it in development without an OIDC provider, or as a break-glass credential to regain admin access when OIDC is down. Setting it also disables the dev auth bypass. |
+| `DEV_ADMIN_USERNAME` | `admin` | Login name for the admin account. |
+| `DEV_ADMIN_TOKEN_TTL_SECS` | `43200` (12h) | Lifetime of issued login tokens. |
+
+The login exchanges the username+password for a short-lived admin JWT, signed
+HS256 with a **random per-boot secret** — there is no signing key to configure
+or leak, and restarting the gateway revokes every issued token. Failed logins
+are audit-logged (with source IP) and rate-slowed. When disabled, the endpoint
+answers `404`.
+
+```bash
+curl -X POST http://localhost:8080/auth/admin/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"…"}'
+# → {"access_token":"eyJ…","token_type":"Bearer","expires_in":43200}
+```
+
+**The dashboard signs in exclusively through this account** — the old
+master-key login form was removed. The master key remains valid as an API
+bearer token (curl, scripts, `/metrics`), but to use the web dashboard set
+`DEV_ADMIN_PASSWORD`. The dashboard then holds only the short-lived login
+token, never the master key itself.
+
 ### Rate limiting & caching
 
 | Variable | Default | Description |
@@ -312,13 +339,18 @@ Two credential types are accepted on `/v1/*`, in this order:
 2. **API key / master key** — validated against the key store. The `MASTER_KEY`
    acts as a global super-key.
 
-`/admin/*` is protected separately and requires the **master key**.
+`/admin/*` goes through the same combined authentication and additionally
+requires **Admin scope**: the master key, an admin-scoped API key, a
+[dev/break-glass admin login](#dev--break-glass-admin-login) token, or an OIDC
+token carrying an `admin`/`gateway-admin` role.
 
-> ⚠️ **No `MASTER_KEY` and no `JWT_ISSUER` = authentication is fully bypassed.**
-> In that mode every request is treated as an anonymous principal with **Admin**
-> scope. The server logs a `SECURITY:` warning at startup. This is intended for
-> local development only — always set `MASTER_KEY` (and/or `JWT_ISSUER`) in any
-> shared or production deployment.
+> ⚠️ **No `MASTER_KEY`, no `JWT_ISSUER`, and no `DEV_ADMIN_PASSWORD` =
+> authentication is fully bypassed.** In that mode every request is treated as
+> an anonymous principal with **Admin** scope. The server logs a `SECURITY:`
+> warning at startup. This is intended for local development only — configure
+> at least one auth mechanism in any shared or production deployment
+> (production/staging deployments additionally refuse to start without
+> `MASTER_KEY`).
 
 ### Roles & scopes
 

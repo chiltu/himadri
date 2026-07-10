@@ -15,6 +15,7 @@ circuit breaking, response caching, and observability. See the
 | [Zitadel configuration & FAQ](./zitadel.md) | OIDC/JWT setup with Zitadel, role-claim mapping, user onboarding script, troubleshooting FAQ. |
 | [End-to-end testing](./E2E.md) | E2E testing notes, including the real-Zitadel OIDC stack. |
 | [Code review checklist](../CODE_REVIEW.md) | Active source-review checklist (2026-07-05): correctness fixes, dead-code deletions, and dedup refactors, worked one by one. Replaces the earlier refactoring backlog. |
+| [Code review findings (2026-07-10)](./CODE_REVIEW_2026-07-10.md) | High-effort review of current working-tree changes: 10 verified findings (6 CONFIRMED, 4 PLAUSIBLE) including 2 critical issues (API key leak, credential destruction) and several availability bugs with fixes. |
 | [Gap analysis](./GAP_ANALYSIS.md) | Historical feature-parity analysis vs. Bifrost (see the status note at its top — most gaps have since been closed). |
 
 See also, at the repository root: [ARCHITECTURE.md](../ARCHITECTURE.md)

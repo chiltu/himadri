@@ -1,5 +1,6 @@
 pub mod config_store;
 pub mod crypto;
+pub mod error;
 pub mod handlers;
 pub mod middleware;
 pub mod models;
@@ -20,18 +21,19 @@ pub mod postgres_provider_store;
 
 pub use config_store::ConfigHistoryEntry;
 pub use crypto::CipherKey;
+pub use error::AdminError;
 pub use handlers::AdminHandlers;
 pub use himadri_core::{AuthContext, AuthScope};
 pub use middleware::AuthMiddleware;
 pub use models::{
-    CreateModelRequest, CreateProviderRequest, Model, Provider, UpdateModelRequest,
-    UpdateProviderRequest,
+    CreateModelEndpointRequest, CreateModelRequest, Model, ModelEndpoint,
+    UpdateModelEndpointRequest, UpdateModelRequest,
 };
 pub use provider_backend::{
-    connect_provider_model_stores, migrate_to_latest, ModelStoreBackend, ProviderStoreBackend,
+    connect_model_stores, migrate_to_latest, ModelEndpointStoreBackend, ModelStoreBackend,
 };
 #[cfg(feature = "sqlite")]
-pub use provider_store::{ModelStore, ProviderStore};
+pub use provider_store::{ModelEndpointStore, ModelStore};
 pub use request_log::{
     InMemoryRequestLogStore, MaintenanceQuery, RequestLogEntry, RequestLogListResult,
     RequestLogQuery, RequestLogStore,
@@ -49,7 +51,10 @@ pub use usage_store::{
 #[cfg(feature = "postgres")]
 pub use postgres_backends::PostgresRequestLogStore;
 #[cfg(feature = "postgres")]
-pub use postgres_provider_store::{PgModelStore, PgProviderStore};
+pub use postgres_provider_store::{PgModelEndpointStore, PgModelStore};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod store_parity_tests;

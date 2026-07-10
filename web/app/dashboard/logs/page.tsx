@@ -2,7 +2,12 @@
 
 import { AuthGuard } from "@/components/auth-guard"
 import { useEffect, useState, useCallback } from "react"
-import { api, type RequestLogEntry, type RequestLogListResult } from "@/lib/api"
+import {
+  api,
+  type RequestLogEntry,
+  type RequestLogListResult,
+  type Model,
+} from "@/lib/api"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
   Breadcrumb,
@@ -18,7 +23,6 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Table,
   TableBody,
@@ -28,15 +32,24 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Badge } from "@/components/ui/badge"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+
+const ALL = "__all__"
 
 export default function LogsPage() {
   const [logs, setLogs] = useState<RequestLogEntry[]>([])
   const [total, setTotal] = useState(0)
   const [model, setModel] = useState("")
   const [provider, setProvider] = useState("")
+  const [models, setModels] = useState<Model[]>([])
+  const [providers, setProviders] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
 
   const loadLogs = useCallback(() => {
@@ -46,6 +59,14 @@ export default function LogsPage() {
   }, [model, provider])
 
   useEffect(() => { loadLogs() }, [loadLogs])
+
+  useEffect(() => {
+    api.listModels().then(setModels).catch((e) => setError(e.message))
+    api
+      .listAllEndpoints()
+      .then((eps) => setProviders([...new Set(eps.map((e) => e.provider_type))]))
+      .catch((e) => setError(e.message))
+  }, [])
 
   const handleDeleteOld = async () => {
     const days = prompt("Delete logs older than how many days?", "30")
@@ -90,65 +111,72 @@ export default function LogsPage() {
             </div>
           )}
 
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle>Request Logs</CardTitle>
-                <Button variant="destructive" onClick={handleDeleteOld}>Delete Old Logs</Button>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="mb-4 flex gap-4 items-end">
-                <div className="flex-1">
-                  <Label>Model</Label>
-                  <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder="Filter by model" />
-                </div>
-                <div className="flex-1">
-                  <Label>Provider</Label>
-                  <Input value={provider} onChange={(e) => setProvider(e.target.value)} placeholder="Filter by provider" />
-                </div>
-                <Button onClick={loadLogs}>Search</Button>
-              </div>
-
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Time</TableHead>
-                    <TableHead>Trace ID</TableHead>
-                    <TableHead>Model</TableHead>
-                    <TableHead>Provider</TableHead>
-                    <TableHead className="text-right">Tokens</TableHead>
-                    <TableHead>Status</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {logs.map((log) => (
-                    <TableRow key={log.trace_id}>
-                      <TableCell className="text-sm">{new Date(log.created_at).toLocaleString()}</TableCell>
-                      <TableCell className="font-mono text-xs">{log.trace_id.slice(0, 8)}...</TableCell>
-                      <TableCell className="font-mono text-sm">{log.model}</TableCell>
-                      <TableCell>{log.provider}</TableCell>
-                      <TableCell className="text-right">{log.total_tokens.toLocaleString()}</TableCell>
-                      <TableCell>
-                        {log.error_message ? (
-                          <Badge variant="destructive">Error</Badge>
-                        ) : (
-                          <Badge variant="default">OK</Badge>
-                        )}
-                      </TableCell>
-                    </TableRow>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h1 className="text-lg font-semibold">Request Logs</h1>
+            <div className="flex items-center gap-2">
+              <Select value={model || ALL} onValueChange={(v) => setModel(v === ALL ? "" : v)}>
+                <SelectTrigger className="w-[200px]">
+                  <SelectValue placeholder="All models" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL}>All models</SelectItem>
+                  {models.map((m) => (
+                    <SelectItem key={m.id} value={m.name}>{m.name}</SelectItem>
                   ))}
-                  {logs.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={6} className="text-center text-muted-foreground py-8">No logs found</TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
+                </SelectContent>
+              </Select>
+              <Select value={provider || ALL} onValueChange={(v) => setProvider(v === ALL ? "" : v)}>
+                <SelectTrigger className="w-[200px]">
+                  <SelectValue placeholder="All providers" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={ALL}>All providers</SelectItem>
+                  {providers.map((p) => (
+                    <SelectItem key={p} value={p}>{p}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button variant="destructive" onClick={handleDeleteOld}>Delete Old Logs</Button>
+            </div>
+          </div>
 
-              <div className="mt-4 text-sm text-muted-foreground">Total: {total} entries</div>
-            </CardContent>
-          </Card>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Time</TableHead>
+                <TableHead>Trace ID</TableHead>
+                <TableHead>Model</TableHead>
+                <TableHead>Provider</TableHead>
+                <TableHead className="text-right">Tokens</TableHead>
+                <TableHead>Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {logs.map((log) => (
+                <TableRow key={log.trace_id}>
+                  <TableCell className="text-sm">{new Date(log.created_at).toLocaleString()}</TableCell>
+                  <TableCell className="font-mono text-xs">{log.trace_id.slice(0, 8)}...</TableCell>
+                  <TableCell className="font-mono text-sm">{log.model}</TableCell>
+                  <TableCell>{log.provider}</TableCell>
+                  <TableCell className="text-right">{log.total_tokens.toLocaleString()}</TableCell>
+                  <TableCell>
+                    {log.error_message ? (
+                      <Badge variant="destructive">Error</Badge>
+                    ) : (
+                      <Badge variant="default">OK</Badge>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {logs.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={6} className="text-center text-muted-foreground py-8">No logs found</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+
+          <div className="text-sm text-muted-foreground">Total: {total} entries</div>
         </div>
       </SidebarInset>
     </SidebarProvider>
