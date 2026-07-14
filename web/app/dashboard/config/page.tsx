@@ -4,11 +4,14 @@ import { AuthGuard } from "@/components/auth-guard"
 import { useEffect, useState, useCallback } from "react"
 import {
   api,
+  DEFAULT_PII_GUARDRAIL_CONFIG,
   type GatewayConfig,
   type Target,
-  type PluginConfig,
   type RolePolicy,
   type ConfigHistoryEntry,
+  type PiiMode,
+  type PiiStrategy,
+  type PiiResponseMode,
 } from "@/lib/api"
 import { AppSidebar } from "@/components/app-sidebar"
 import {
@@ -35,7 +38,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
@@ -50,6 +52,10 @@ const STRATEGY_MODES = [
   "content_based",
   "ab_test",
 ] as const
+
+const PII_MODES: PiiMode[] = ["redact", "block", "observe"]
+const PII_STRATEGIES: PiiStrategy[] = ["replace", "mask", "hash", "encrypt", "remove"]
+const PII_RESPONSE_MODES: PiiResponseMode[] = ["off", "observe", "redact", "block"]
 
 function csv(v?: string[] | null): string {
   return v?.join(", ") ?? ""
@@ -71,6 +77,8 @@ export default function ConfigPage() {
 
   const loadConfig = useCallback(() => {
     api.getConfig().then((c) => {
+      // Older gateways may not serve the guardrails section yet.
+      c.guardrails ??= { pii: { ...DEFAULT_PII_GUARDRAIL_CONFIG } }
       setConfig(c)
       setOrgsJson(JSON.stringify(c.orgs, null, 2))
       setStrategyRulesJson(
@@ -227,9 +235,8 @@ export default function ConfigPage() {
             <Tabs defaultValue="general">
               <TabsList>
                 <TabsTrigger value="general">General</TabsTrigger>
-                <TabsTrigger value="targets">Targets</TabsTrigger>
+                <TabsTrigger value="guardrails">Guardrails</TabsTrigger>
                 <TabsTrigger value="rbac">RBAC</TabsTrigger>
-                <TabsTrigger value="plugins">Plugins</TabsTrigger>
                 <TabsTrigger value="advanced">Advanced</TabsTrigger>
                 <TabsTrigger value="history">History</TabsTrigger>
               </TabsList>
@@ -237,6 +244,10 @@ export default function ConfigPage() {
               <TabsContent value="general" className="space-y-8">
                 <section className="space-y-3">
                   <h2 className="text-sm font-medium text-muted-foreground">Routing Strategy</h2>
+                  <p className="text-sm text-muted-foreground">
+                    Routing targets (model × provider endpoint) are managed on the{" "}
+                    <a href="/dashboard/models" className="underline">Models</a> page.
+                  </p>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <Label>Mode</Label>
@@ -291,6 +302,9 @@ export default function ConfigPage() {
 
                 <section className="space-y-3">
                   <h2 className="text-sm font-medium text-muted-foreground">CORS</h2>
+                  <p className="text-sm text-amber-600">
+                    Applied at startup — saving persists these values, but a gateway restart is required for them to take effect.
+                  </p>
                   <div className="space-y-4">
                     <label className="flex items-center gap-2 text-sm">
                       <input
@@ -325,16 +339,11 @@ export default function ConfigPage() {
                 </section>
 
                 <section className="space-y-3">
-                  <h2 className="text-sm font-medium text-muted-foreground">Admin &amp; Observability</h2>
+                  <h2 className="text-sm font-medium text-muted-foreground">Observability</h2>
+                  <p className="text-sm text-amber-600">
+                    Applied at startup — saving persists these values, but a gateway restart is required for them to take effect.
+                  </p>
                   <div className="grid grid-cols-2 gap-4">
-                    <label className="flex items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={config.admin.enabled}
-                        onChange={(e) => update((c) => { c.admin.enabled = e.target.checked; return c })}
-                      />
-                      Admin API enabled
-                    </label>
                     <label className="flex items-center gap-2 text-sm">
                       <input
                         type="checkbox"
@@ -363,43 +372,112 @@ export default function ConfigPage() {
                 </section>
               </TabsContent>
 
-              <TabsContent value="targets" className="space-y-4">
-                <div>
-                  <h2 className="text-lg font-semibold">Routing Targets</h2>
-                  <p className="text-sm text-muted-foreground mt-1">
-                    Read-only. Each target is one (model, provider endpoint) pair derived from the{" "}
-                    <a href="/dashboard/models" className="underline">Models</a>{" "}
-                    page — the source of truth for routing. Add or weight provider endpoints there;
-                    edits made here would be overwritten by the next model/endpoint change.
+              <TabsContent value="guardrails" className="space-y-8">
+                <section className="space-y-3">
+                  <h2 className="text-sm font-medium text-muted-foreground">PII Guardrail (global default)</h2>
+                  <p className="text-sm text-muted-foreground">
+                    Scans request content before it is forwarded to any LLM provider.
+                    Applies hot on save. Per-org/team overrides live in the{" "}
+                    <code>guardrails.pii</code> section of Orgs &amp; Teams (Advanced tab)
+                    and replace these settings wholesale for that scope.
                   </p>
-                </div>
-                <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead>Provider</TableHead>
-                          <TableHead>Weight</TableHead>
-                          <TableHead>Models</TableHead>
-                          <TableHead>API Key Env</TableHead>
-                          <TableHead>Base URL</TableHead>
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {config.targets.map((t, i) => (
-                          <TableRow key={i}>
-                            <TableCell className="font-medium">{t.provider}</TableCell>
-                            <TableCell className="text-muted-foreground">{t.weight}</TableCell>
-                            <TableCell className="font-mono text-sm">{csv(t.models) || "*"}</TableCell>
-                            <TableCell className="text-muted-foreground">{t.api_key_env ?? "-"}</TableCell>
-                            <TableCell className="text-muted-foreground">{t.base_url ?? "-"}</TableCell>
-                          </TableRow>
-                        ))}
-                    {config.targets.length === 0 && (
-                      <TableRow>
-                        <TableCell colSpan={5} className="text-center text-muted-foreground py-8">No targets configured</TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </Table>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={config.guardrails.pii.enabled}
+                      onChange={(e) => update((c) => { c.guardrails.pii.enabled = e.target.checked; return c })}
+                    />
+                    Enabled
+                  </label>
+                  <div className="grid grid-cols-3 gap-4">
+                    <div>
+                      <Label>Mode</Label>
+                      <select
+                        value={config.guardrails.pii.mode}
+                        onChange={(e) => update((c) => { c.guardrails.pii.mode = e.target.value as PiiMode; return c })}
+                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors"
+                      >
+                        {PII_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        redact rewrites spans; block rejects with 400; observe only records metrics.
+                      </p>
+                    </div>
+                    <div>
+                      <Label>Strategy</Label>
+                      <select
+                        value={config.guardrails.pii.strategy}
+                        onChange={(e) => update((c) => { c.guardrails.pii.strategy = e.target.value as PiiStrategy; return c })}
+                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors"
+                      >
+                        {PII_STRATEGIES.map((s) => <option key={s} value={s}>{s}</option>)}
+                      </select>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        hash/encrypt need GUARDRAILS_HASH_SALT / GUARDRAILS_ENCRYPTION_KEY set on the gateway.
+                      </p>
+                    </div>
+                    <div>
+                      <Label>Min confidence (0–1)</Label>
+                      <Input
+                        type="number"
+                        step="0.05"
+                        min="0"
+                        max="1"
+                        value={config.guardrails.pii.min_confidence}
+                        onChange={(e) => update((c) => { c.guardrails.pii.min_confidence = Number(e.target.value) || 0; return c })}
+                      />
+                    </div>
+                    <div>
+                      <Label>Response mode</Label>
+                      <select
+                        value={config.guardrails.pii.response_mode}
+                        onChange={(e) => update((c) => { c.guardrails.pii.response_mode = e.target.value as PiiResponseMode; return c })}
+                        className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors"
+                      >
+                        {PII_RESPONSE_MODES.map((m) => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Scans model output. Non-streaming only; streams are checked post-hoc at stream end.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <Label>Entity types (CSV, empty = all)</Label>
+                      <Input
+                        placeholder="EMAIL_ADDRESS, US_SSN, CREDIT_CARD"
+                        value={csv(config.guardrails.pii.entities)}
+                        onChange={(e) => update((c) => { c.guardrails.pii.entities = fromCsv(e.target.value) ?? null; return c })}
+                      />
+                    </div>
+                    <div>
+                      <Label>Scanned roles (CSV)</Label>
+                      <Input
+                        placeholder="user, system, tool"
+                        value={csv(config.guardrails.pii.apply_to)}
+                        onChange={(e) => update((c) => { c.guardrails.pii.apply_to = fromCsv(e.target.value) ?? []; return c })}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-6">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={config.guardrails.pii.scan_tool_arguments}
+                        onChange={(e) => update((c) => { c.guardrails.pii.scan_tool_arguments = e.target.checked; return c })}
+                      />
+                      Scan tool-call arguments
+                    </label>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={config.guardrails.pii.fail_open}
+                        onChange={(e) => update((c) => { c.guardrails.pii.fail_open = e.target.checked; return c })}
+                      />
+                      Fail open (forward unscanned on engine errors)
+                    </label>
+                  </div>
+                </section>
               </TabsContent>
 
               <TabsContent value="rbac" className="space-y-8">
@@ -499,69 +577,6 @@ export default function ConfigPage() {
                     </TableBody>
                   </Table>
                 </section>
-              </TabsContent>
-
-              <TabsContent value="plugins" className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">Plugins</h2>
-                  <Button
-                    size="sm"
-                    onClick={() => update((c) => {
-                      c.plugins.push({ name: "", enabled: false, config: {} } as PluginConfig)
-                      return c
-                    })}
-                  >
-                    Add Plugin
-                  </Button>
-                </div>
-                <div className="space-y-4">
-                  {config.plugins.map((p, i) => (
-                      <div key={i} className="rounded-md border p-3 space-y-2">
-                        <div className="flex items-center gap-4">
-                          <Input
-                            className="flex-1"
-                            value={p.name}
-                            onChange={(e) => update((c) => { c.plugins[i].name = e.target.value; return c })}
-                            placeholder="plugin name"
-                          />
-                          <label className="flex items-center gap-2 text-sm whitespace-nowrap">
-                            <input
-                              type="checkbox"
-                              checked={p.enabled}
-                              onChange={(e) => update((c) => { c.plugins[i].enabled = e.target.checked; return c })}
-                            />
-                            Enabled
-                          </label>
-                          <Badge variant="secondary">{p.enabled ? "on" : "off"}</Badge>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-destructive"
-                            onClick={() => update((c) => { c.plugins.splice(i, 1); return c })}
-                          >
-                            Remove
-                          </Button>
-                        </div>
-                        <div>
-                          <Label>Config (JSON)</Label>
-                          <Textarea
-                            value={JSON.stringify(p.config ?? {}, null, 2)}
-                            onChange={(e) => {
-                              try {
-                                const parsed = JSON.parse(e.target.value)
-                                update((c) => { c.plugins[i].config = parsed; return c })
-                              } catch {
-                                // ignore invalid JSON while typing
-                              }
-                            }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  {config.plugins.length === 0 && (
-                    <p className="text-center text-muted-foreground py-8 text-sm">No plugins configured</p>
-                  )}
-                </div>
               </TabsContent>
 
               <TabsContent value="advanced" className="space-y-8">

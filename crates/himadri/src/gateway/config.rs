@@ -31,7 +31,11 @@ impl ConfigHistory {
 impl Gateway {
     /// Validate and apply a config to the live gateway (strategy, targets,
     /// limiter/circuit-breaker state) without touching version history.
-    async fn apply_config(&self, config: Config) -> Result<(), GatewayError> {
+    async fn apply_config(&self, mut config: Config) -> Result<(), GatewayError> {
+        // Reloads/rollbacks may carry configs using deprecated fields
+        // (e.g. `content_filter.block_pii`); normalize them exactly like
+        // file loads do.
+        config.apply_guardrail_deprecations();
         config.validate()?;
         // Hold all 3 write locks simultaneously to prevent inconsistent reads.
         // Lock order: strategy → config → targets (see the docs on `Gateway`).
@@ -44,7 +48,12 @@ impl Gateway {
         drop(strategy);
         drop(cfg);
         drop(targets);
-        // Clear stale rate limiter and circuit breaker state
+        // Retune the limiter defaults so rate-limit edits hot-apply, then
+        // clear stale rate limiter and circuit breaker state.
+        self.rate_limiter.set_defaults(
+            config.rate_limit.requests_per_second,
+            config.rate_limit.burst_size,
+        );
         self.rate_limiter.clear();
         self.circuit_breakers.clear();
         Ok(())
@@ -150,5 +159,20 @@ mod config_history_tests {
     async fn rollback_unknown_version_errors() {
         let gw = gateway();
         assert!(gw.rollback_config(999).await.is_err());
+    }
+
+    /// Rate-limit edits must hot-apply: a reload retunes the limiter defaults
+    /// without a restart.
+    #[tokio::test]
+    async fn reload_retunes_rate_limiter() {
+        let gw = gateway();
+        let mut cfg = Config::default();
+        cfg.rate_limit.requests_per_second = 0;
+        cfg.rate_limit.burst_size = 2;
+        gw.reload_config(cfg).await.unwrap();
+
+        assert!(gw.rate_limiter.check_global());
+        assert!(gw.rate_limiter.check_global());
+        assert!(!gw.rate_limiter.check_global());
     }
 }

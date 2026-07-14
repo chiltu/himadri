@@ -39,6 +39,10 @@ impl Gateway {
     /// Run the shared request prologue: rate-limit / budget / guardrail /
     /// RBAC checks followed by the before-request plugins. Any new guard
     /// added here applies to both `route` and `route_stream`.
+    ///
+    /// Before-request plugins may rewrite `ctx.request` (e.g. PII
+    /// redaction); callers must treat the returned context's request as the
+    /// request of record for provider dispatch, caching, and audit.
     pub(super) async fn prepare_request(
         &self,
         request: &ChatCompletionRequest,
@@ -280,61 +284,108 @@ impl Gateway {
         remote_ip: Option<String>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         // Guards + before-request plugins (shared with route_stream).
-        let mut ctx = self.prepare_request(&request, auth, remote_ip).await?;
+        let mut ctx = match self.prepare_request(&request, auth, remote_ip.clone()).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                // Audit the rejection before returning. Create a minimal context for the audit entry.
+                let mut audit_ctx = himadri_plugin::PluginContext::from_request(&request, auth);
+                audit_ctx.remote_ip = remote_ip;
+                self.log_audit(&AuditContext {
+                    request: &request,
+                    auth,
+                    ctx: &audit_ctx,
+                    result: &Err(himadri_provider::ProviderError::Internal(
+                        "Request rejected by guardrail".to_string(),
+                    )),
+                    latency_ms: 0,
+                    guardrail_actions: &["reject".to_string()],
+                })
+                .await;
+                return Err(e);
+            }
+        };
+
+        // The pipeline's copy is the request of record from here on:
+        // before-request plugins may rewrite it (e.g. PII redaction), and
+        // provider dispatch, the response cache, and the audit log must all
+        // see what the pipeline produced — not the raw client request.
+        let request = ctx.request.clone();
 
         // Serve from response cache on an exact-match hit (non-streaming only).
+        // Response guardrails still run on cached responses.
+        let mut cached_response = None;
         if !request.stream {
             if let Some(cache) = &self.response_cache {
-                if let Some(cached) = cache.get(&request).await {
+                let key = himadri_plugins::ResponseCachePlugin::cache_key(
+                    &request,
+                    auth.and_then(|a| a.org_id.as_deref()),
+                    auth.and_then(|a| a.team_id.as_deref()),
+                );
+                if let Some(cached) = cache.get(&key).await {
                     debug!("Response cache hit for model {}", request.model);
                     self.metrics.cache_hits_total.inc();
-                    return Ok(cached);
+                    cached_response = Some(cached);
+                } else {
+                    self.metrics.cache_misses_total.inc();
                 }
-                self.metrics.cache_misses_total.inc();
             }
         }
 
-        let ordered = self.select_targets(&request, auth).await?;
+        // If we have a cached response, use it directly; otherwise fetch from provider.
+        let (target, result, latency_ms) = if let Some(cached) = cached_response.take() {
+            let target = Target {
+                id: None,
+                provider: "cache".to_string(),
+                weight: 1.0,
+                models: None,
+                api_key_env: None,
+                base_url: None,
+            };
+            (target, Ok(cached), 0u64)
+        } else {
+            let ordered = self.select_targets(&request, auth).await?;
 
-        // Try targets in priority order, falling back on retryable failures or
-        // open circuit breakers.
-        let request_ref = &request;
-        let (target, result, latency) = self
-            .with_failover(&ordered, true, |provider, api_key| async move {
-                provider.complete(request_ref, &api_key).await
-            })
-            .await
-            .ok_or_else(|| GatewayError::Internal("No targets configured".to_string()))?;
-        let latency_ms = latency.as_millis() as u64;
+            // Try targets in priority order, falling back on retryable failures or
+            // open circuit breakers.
+            let request_ref = &request;
+            let (target, result, latency) = self
+                .with_failover(&ordered, true, |provider, api_key| async move {
+                    provider.complete(request_ref, &api_key).await
+                })
+                .await
+                .ok_or_else(|| GatewayError::Internal("No targets configured".to_string()))?;
+            let latency_ms = latency.as_millis() as u64;
 
-        // Flatten infrastructure failures into ProviderError, preserving the
-        // messages for the audit log. Unavailability-shaped failures (open
-        // circuit, missing/unresolvable provider or key) flatten to a 503-
-        // status Api error so the client sees "unavailable", not a 500.
-        let result = result.map_err(|e| match e {
-            AttemptError::Provider(e) => e,
-            AttemptError::CircuitOpen(p) => himadri_provider::ProviderError::Api {
-                status: 503,
-                message: format!("Circuit breaker open for provider {}", p),
-            },
-            AttemptError::ProviderNotFound(p) => himadri_provider::ProviderError::Api {
-                status: 503,
-                message: format!("Provider not found: {}", p),
-            },
-            AttemptError::ApiKey(e) => himadri_provider::ProviderError::Api {
-                status: 503,
-                message: e.to_string(),
-            },
-            AttemptError::NoTargets => {
-                himadri_provider::ProviderError::Internal("No targets attempted".to_string())
-            }
-        });
+            // Flatten infrastructure failures into ProviderError, preserving the
+            // messages for the audit log. Unavailability-shaped failures (open
+            // circuit, missing/unresolvable provider or key) flatten to a 503-
+            // status Api error so the client sees "unavailable", not a 500.
+            let result = result.map_err(|e| match e {
+                AttemptError::Provider(e) => e,
+                AttemptError::CircuitOpen(p) => himadri_provider::ProviderError::Api {
+                    status: 503,
+                    message: format!("Circuit breaker open for provider {}", p),
+                },
+                AttemptError::ProviderNotFound(p) => himadri_provider::ProviderError::Api {
+                    status: 503,
+                    message: format!("Provider not found: {}", p),
+                },
+                AttemptError::ApiKey(e) => himadri_provider::ProviderError::Api {
+                    status: 503,
+                    message: e.to_string(),
+                },
+                AttemptError::NoTargets => {
+                    himadri_provider::ProviderError::Internal("No targets attempted".to_string())
+                }
+            });
+            (target, result, latency_ms)
+        };
 
         // Run after-request plugins against the same context the
         // before-request plugins saw: request_id stays stable across the
         // request lifecycle and before-plugin metadata is visible here.
         ctx.set_provider(target.provider.clone());
-        ctx.set_latency(latency);
+        ctx.set_latency(std::time::Duration::from_millis(latency_ms));
         if let Ok(ref response) = result {
             if let Some(usage) = &response.usage {
                 ctx.set_tokens(usage.total_tokens);
@@ -427,7 +478,12 @@ impl Gateway {
         // Populate the response cache on a successful, non-streaming completion.
         if !request.stream {
             if let (Some(cache), Ok(response)) = (&self.response_cache, &result) {
-                cache.insert(&request, response.clone()).await;
+                let key = himadri_plugins::ResponseCachePlugin::cache_key(
+                    &request,
+                    auth.and_then(|a| a.org_id.as_deref()),
+                    auth.and_then(|a| a.team_id.as_deref()),
+                );
+                cache.insert(key, response.clone()).await;
             }
         }
 

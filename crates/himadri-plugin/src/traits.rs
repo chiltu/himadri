@@ -35,6 +35,10 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Run the plugin. Before-request plugins may rewrite `ctx.request`
+    /// (e.g. inline PII redaction) — the gateway forwards the pipeline's
+    /// copy of the request to providers, so mutations here are what the
+    /// upstream, the response cache, and the audit log see.
     async fn execute(&self, ctx: &mut PluginContext) -> Result<(), PluginError>;
 }
 

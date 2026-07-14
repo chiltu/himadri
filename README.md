@@ -80,8 +80,11 @@ in [`web/`](web/).
 - **Spend budgets**: cumulative USD caps per principal, computed from token
   usage and configured per-million-token pricing; global and per-principal
   caps compose.
-- Guardrails: word-filter blocklists, `max_tokens` caps, allowed/blocked model
-  lists, and a `ResponseGuardrail` trait for post-hoc response inspection.
+- Guardrails: **inline PII redaction/blocking** (emails, SSNs, credit
+  cards, API keys, … rewritten before content reaches any provider, with
+  per-org/team policies), word-filter blocklists, `max_tokens` caps,
+  allowed/blocked model lists, and a `ResponseGuardrail` trait for
+  post-hoc response inspection.
 - **Response caching**: in-process TTL cache with bounded size and
   hit/miss metrics.
 
@@ -244,9 +247,11 @@ failing are skipped until they recover. See
 | Response cache | `CACHE_TTL_SECS` (+ `CACHE_MAX_ENTRIES`) | [Caching](docs/configuration.md#caching) |
 | Word filter | `WORD_FILTER_BLOCKLIST` | [Guardrails](docs/configuration.md#environment-variable-reference) |
 | Max-tokens cap | `MAX_TOKENS_LIMIT` | ″ |
+| PII redaction/blocking | `GUARDRAILS_PII_MODE` and/or `guardrails.pii` config sections | [PII guardrail](docs/configuration.md#pii-guardrail-guardrailspii) |
 
-These are implemented as ordered plugins (`rate_limit`, `budget`, `cache`,
-`max_token`, `word_filter`, `logger`) running at defined pipeline stages;
+These are implemented as ordered plugins (`pii_guardrail`, `rate_limit`,
+`budget`, `cache`, `max_token`, `word_filter`, `logger`) running at defined
+pipeline stages;
 custom behavior can be added via the `Plugin` and `ResponseGuardrail` traits
 in `himadri-plugin`.
 

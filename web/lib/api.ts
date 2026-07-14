@@ -322,10 +322,50 @@ export interface OrgTokenBudget {
 
 export interface ContentFilterConfig {
   enabled: boolean;
+  /** Deprecated: use PiiGuardrailConfig (guardrails.pii) with mode "block". */
   block_pii: boolean;
   block_toxicity: boolean;
   custom_patterns: string[];
 }
+
+export type PiiMode = "redact" | "block" | "observe";
+export type PiiStrategy = "replace" | "mask" | "hash" | "encrypt" | "remove";
+export type PiiResponseMode = "off" | "observe" | "redact" | "block";
+
+/** PII detection/redaction settings (global default on GatewayConfig.guardrails,
+ * per-scope override on org/team guardrails.pii — a present override replaces
+ * the global settings wholesale, including enabled=false to opt out). */
+export interface PiiGuardrailConfig {
+  enabled: boolean;
+  mode: PiiMode;
+  strategy: PiiStrategy;
+  /** Entity types to act on (e.g. EMAIL_ADDRESS, US_SSN); null/absent = all. */
+  entities?: string[] | null;
+  min_confidence: number;
+  /** Message roles scanned (user/system/assistant/tool). */
+  apply_to: string[];
+  scan_tool_arguments: boolean;
+  fail_open: boolean;
+  /** Model-output scanning; enforced on non-streaming responses
+   * (streams: post-hoc at end-of-stream only). */
+  response_mode: PiiResponseMode;
+}
+
+export interface GuardrailsConfig {
+  pii: PiiGuardrailConfig;
+}
+
+export const DEFAULT_PII_GUARDRAIL_CONFIG: PiiGuardrailConfig = {
+  enabled: false,
+  mode: "redact",
+  strategy: "replace",
+  entities: null,
+  min_confidence: 0.6,
+  apply_to: ["user", "system", "tool"],
+  scan_tool_arguments: false,
+  fail_open: false,
+  response_mode: "off",
+};
 
 export interface AuditConfig {
   enabled: boolean;
@@ -340,6 +380,8 @@ export interface OrgGuardrailConfig {
   blocked_words: string[];
   max_tokens_per_request?: number;
   content_filter?: ContentFilterConfig | null;
+  /** Org/team-scope PII override; replaces the global guardrails.pii wholesale. */
+  pii?: PiiGuardrailConfig | null;
   audit: AuditConfig;
 }
 
@@ -372,7 +414,6 @@ export interface CorsConfig {
 }
 
 export interface AdminConfig {
-  enabled: boolean;
   master_key?: string;
 }
 
@@ -391,7 +432,6 @@ export interface MetricsConfig {
 export interface GatewayConfig {
   strategy: StrategyConfig;
   targets: Target[];
-  plugins: PluginConfig[];
   observability: {
     tracing: TracingConfig;
     metrics: MetricsConfig;
@@ -401,6 +441,7 @@ export interface GatewayConfig {
   orgs: Record<string, OrgConfig>;
   cors: CorsConfig;
   rbac: RbacConfig;
+  guardrails: GuardrailsConfig;
 }
 
 export interface Target {
@@ -409,12 +450,6 @@ export interface Target {
   models?: string[];
   api_key_env?: string;
   base_url?: string;
-}
-
-export interface PluginConfig {
-  name: string;
-  enabled: boolean;
-  config?: Record<string, unknown>;
 }
 
 export interface ConfigHistoryEntry {

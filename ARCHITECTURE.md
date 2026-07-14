@@ -22,9 +22,9 @@ persistence details see [`docs/configuration.md`](docs/configuration.md) and
                         ┌────────────────────────────┼────────────────────────────┐
                         ▼                            ▼                            ▼
                  himadri-plugin(s)            himadri-provider              himadri-admin
-             budget / cache / logger /    OpenAI, Anthropic, Gemini,   API keys, providers,
-             max_token / rate_limit /      Azure, OpenRouter,           models, usage & request
-             word_filter                   OpenAI-compatible             logs (in-memory / SQLite
+             pii_guardrail / budget /     OpenAI, Anthropic, Gemini,   API keys, providers,
+             cache / logger / max_token    Azure, OpenRouter,           models, usage & request
+             rate_limit / word_filter      OpenAI-compatible             logs (in-memory / SQLite
                                                                           / Postgres)
                         │                            │                            │
                         ▼                            ▼                            ▼
@@ -47,8 +47,13 @@ in `crates/` is a library crate it composes.
    `MASTER_KEY`/`JWT_ISSUER` is set, auth is bypassed entirely (dev only).
 3. **Plugin pipeline** (`himadri-plugin` trait, impls in `himadri-plugins`) —
    ordered `Plugin`s run at defined `Stage`s (e.g. pre-request, post-response)
-   and can short-circuit a request: `rate_limit`, `budget`, `max_token`,
-   `word_filter`, `cache` (serves cached responses), `logger`. A separate
+   and can short-circuit a request: `pii_guardrail` (inline PII
+   redaction/blocking via `redact-core`, resolved per org/team against the
+   live config — see `docs/SPEC_GUARDRAILS.md`), `rate_limit`, `budget`,
+   `max_token`, `word_filter`, `cache` (serves cached responses), `logger`.
+   Before-request plugins may rewrite `ctx.request`; the gateway forwards
+   the pipeline's copy to providers, so redactions are what the upstream,
+   the response cache, and the audit log see. A separate
    `ResponseGuardrail` trait allows post-hoc response inspection/blocking.
 4. **Routing** (`crates/himadri/src/strategy.rs`, `Gateway::route` in
    `gateway/route.rs`) — the `Gateway` holds a set of configured `Target`s (provider
@@ -84,7 +89,7 @@ target — used for provider endpoints himadri doesn't model explicitly.
 | `himadri-core` | Shared types (`Config`, `Target`, `ModelObject`, errors) used across crates |
 | `himadri-provider` | `Provider` trait, the config-driven `OpenAiCompatibleProvider` (with presets for OpenAI, Azure, OpenRouter, Groq, …), bespoke Anthropic/Gemini impls, shared SSE decoder (`sse.rs`) |
 | `himadri-plugin` | `Plugin` / `ResponseGuardrail` traits, `PluginType`/`Stage`/`PluginError` |
-| `himadri-plugins` | Concrete plugins: budget, cache, logger, max_token, rate_limit, word_filter |
+| `himadri-plugins` | Concrete plugins: budget, cache, logger, max_token, pii_guardrail (+ `pii_engine`, feature `guardrails`), rate_limit, word_filter |
 | `himadri-admin` | Key/provider/model CRUD, usage & request-log stores (in-memory/SQLite/Postgres), auth middleware, embedded DB migrations |
 | `himadri-auth` | JWT/OIDC/OAuth2 primitives (Zitadel-oriented; see `docs/zitadel.md`) |
 | `himadri-ratelimit` | Rate-limiting primitives (used by the `rate_limit` plugin) |

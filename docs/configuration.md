@@ -162,6 +162,16 @@ token, never the master key itself.
 |---|---|---|
 | `WORD_FILTER_BLOCKLIST` | _(unset)_ | Comma-separated words; requests containing any of them are rejected with `400`. Unset disables the word filter. |
 | `MAX_TOKENS_LIMIT` | _(unset)_ | Reject requests whose `max_tokens` exceeds this cap. Unset disables the cap. |
+| `GUARDRAILS_PII_MODE` | _(unset)_ | Global default for the PII guardrail: `redact` (rewrite spans inline before provider dispatch), `block` (reject with `400`), or `observe` (metrics only). Unset → no global default; config-file `guardrails.pii` sections still apply. |
+| `GUARDRAILS_PII_STRATEGY` | `replace` | How redacted spans are rewritten: `replace` (`[EMAIL_ADDRESS]`), `mask`, `hash`, `encrypt`, `remove`. |
+| `GUARDRAILS_PII_ENTITIES` | _(all)_ | Comma-separated entity types to act on (e.g. `EMAIL_ADDRESS,US_SSN,CREDIT_CARD`). |
+| `GUARDRAILS_PII_MIN_CONFIDENCE` | `0.6` | Detections below this confidence are ignored. |
+| `GUARDRAILS_PII_SCAN_TOOL_ARGS` | `false` | Also scan tool-call argument strings. |
+| `GUARDRAILS_PII_FAIL_OPEN` | `false` | On engine errors, forward unscanned instead of failing the request (response side: allow instead of withholding). |
+| `GUARDRAILS_PII_RESPONSE_MODE` | `off` | Global default for scanning **model output**: `observe`, `redact`, or `block`. Non-streaming only; for streams the check is post-hoc at stream end. |
+| `GUARDRAILS_HASH_SALT` | _(unset)_ | Salt for the `hash` strategy. Env-only secret — never part of the config file. |
+| `GUARDRAILS_ENCRYPTION_KEY` | _(unset)_ | Key for the `encrypt` strategy (required to use it). Env-only secret. |
+| `GUARDRAILS_INLINE_LIMIT_BYTES` | `16384` | Scans larger than this run on the blocking thread pool. |
 | `AUDIT_LOG_DIR` | _(unset)_ | Directory for JSONL audit logs (one file per day). Unset → audit events go to tracing output. |
 | `AUDIT_CAPTURE_CONTENT` | `false` | Include prompt/response content in audit events (always redacted). Off by default so user content never reaches logs/telemetry. |
 | `METRICS_TOKEN` | _(unset)_ | Dedicated bearer token for `GET /metrics`. Falls back to `MASTER_KEY`; if neither is set (dev mode), metrics are unauthenticated. |
@@ -515,6 +525,63 @@ principals carrying a matching `team_id`.
 
 > **Note:** these checks run on the typed inference endpoints. The transparent
 > `/v1/*` proxy fallback does **not** currently apply org guardrails.
+
+### PII guardrail (`guardrails.pii`)
+
+The PII guardrail detects and redacts/blocks PII (emails, SSNs, credit
+cards, API keys, …) in request messages **before they are forwarded to any
+provider** (see [SPEC_GUARDRAILS.md](SPEC_GUARDRAILS.md)). The redacted
+request is the request of record: the provider, response cache, and audit
+log all see redacted content.
+
+A global default lives at the top level of the config file and hot-applies
+on `/admin/config` reloads:
+
+```json
+{
+  "guardrails": {
+    "pii": {
+      "enabled": true,
+      "mode": "redact",
+      "strategy": "replace",
+      "entities": null,
+      "min_confidence": 0.6,
+      "apply_to": ["user", "system", "tool"],
+      "scan_tool_arguments": false,
+      "fail_open": false,
+      "response_mode": "off"
+    }
+  }
+}
+```
+
+Orgs and teams may carry their own `guardrails.pii` section. A present
+section **replaces the global settings wholesale** for that scope —
+including `"enabled": false` to opt a scope out of a global policy. A
+team's section beats its org's; an org's beats the global one; the global
+config-file section beats the `GUARDRAILS_PII_*` env defaults.
+
+Secrets for the `hash`/`encrypt` strategies are env-only
+(`GUARDRAILS_HASH_SALT`, `GUARDRAILS_ENCRYPTION_KEY`) and deliberately not
+part of the config file: `GET /admin/config` serializes the config
+verbatim.
+
+The legacy `content_filter.block_pii` flag is deprecated; configs still
+using it are mapped to `pii: { enabled: true, mode: "block" }` on load
+(with a warning) when no explicit `pii` section is present.
+
+Setting `response_mode` (per scope, same override rules) additionally
+scans **model output**: `redact` rewrites the response before the client
+sees it, `block` withholds it with a `400`, `observe` records metrics
+only. On engine errors the response side fails closed by withholding the
+response (unless `fail_open`).
+
+> **Scope:** request content is scanned on `/v1/chat/completions` and
+> `/v1/completions`. Response scanning is enforced on **non-streaming**
+> responses; for streams it runs on the buffered text at end-of-stream
+> only — chunks already delivered cannot be recalled, so stream actions
+> are logged/metered, not enforced. `/v1/embeddings` inputs and the
+> `/v1/*` proxy are not scanned.
 
 ---
 

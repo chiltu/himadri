@@ -28,21 +28,14 @@ impl ResponseCachePlugin {
     }
 
     /// Look up a previously cached response for this request, if any.
-    pub async fn get(
-        &self,
-        request: &himadri_core::ChatCompletionRequest,
-    ) -> Option<himadri_core::ChatCompletionResponse> {
-        let key = Self::cache_key(request);
-        self.cache.get(&key).await.map(|c| c.response)
+    /// Caller must include org_id and team_id in the cache key.
+    pub async fn get(&self, key: &str) -> Option<himadri_core::ChatCompletionResponse> {
+        self.cache.get(key).await.map(|c| c.response)
     }
 
     /// Store a response for this request.
-    pub async fn insert(
-        &self,
-        request: &himadri_core::ChatCompletionRequest,
-        response: himadri_core::ChatCompletionResponse,
-    ) {
-        let key = Self::cache_key(request);
+    /// Caller must include org_id and team_id in the cache key.
+    pub async fn insert(&self, key: String, response: himadri_core::ChatCompletionResponse) {
         self.cache
             .insert(
                 key,
@@ -55,13 +48,18 @@ impl ResponseCachePlugin {
     }
 
     /// Hash a canonical JSON form of every request field that affects the
-    /// completion. Serializing one JSON document (instead of concatenating
-    /// raw field bytes) makes the key unambiguous — `model "gpt-4o"` +
-    /// prompt `"hello"` can no longer collide with `model "gpt-4"` +
-    /// prompt `"ohello"` — and includes message *roles*, so a system prompt
-    /// and a user message with identical text hash differently.
-    pub fn cache_key(request: &himadri_core::ChatCompletionRequest) -> String {
+    /// completion, plus org/team scope. Serializing one JSON document makes
+    /// the key unambiguous and includes message *roles*, so a system prompt
+    /// and a user message with identical text hash differently. Org/team
+    /// isolation prevents cached responses from being served cross-scope.
+    pub fn cache_key(
+        request: &himadri_core::ChatCompletionRequest,
+        org_id: Option<&str>,
+        team_id: Option<&str>,
+    ) -> String {
         let canonical = serde_json::json!({
+            "org_id": org_id,
+            "team_id": team_id,
             "model": request.model,
             "messages": request.messages,
             "temperature": request.temperature,
@@ -104,8 +102,7 @@ impl Plugin for ResponseCachePlugin {
             return Ok(());
         }
 
-        let key = Self::cache_key(&ctx.request);
-
+        let key = Self::cache_key(&ctx.request, ctx.org_id().as_deref(), ctx.team_id().as_deref());
         if let Some(cached) = self.cache.get(&key).await {
             ctx.set_metadata("cached".to_string(), serde_json::Value::Bool(true));
             ctx.set_metadata(
@@ -157,12 +154,16 @@ mod tests {
     async fn miss_then_hit_roundtrip() {
         let cache = ResponseCachePlugin::new(100, Duration::from_secs(60));
         let req = request("gpt-4", "hello");
+        let key = ResponseCachePlugin::cache_key(&req, None, None);
 
-        assert!(cache.get(&req).await.is_none(), "cold cache should miss");
+        assert!(cache.get(&key).await.is_none(), "cold cache should miss");
 
-        cache.insert(&req, response("hi there")).await;
+        cache.insert(key.clone(), response("hi there")).await;
 
-        let hit = cache.get(&req).await.expect("warm cache should hit");
+        let hit = cache
+            .get(&key)
+            .await
+            .expect("warm cache should hit");
         assert_eq!(hit.choices[0].message.content.as_deref(), Some("hi there"));
     }
 
@@ -172,8 +173,8 @@ mod tests {
         let a = request("gpt-4o", "hello");
         let b = request("gpt-4", "ohello");
         assert_ne!(
-            ResponseCachePlugin::cache_key(&a),
-            ResponseCachePlugin::cache_key(&b)
+            ResponseCachePlugin::cache_key(&a, None, None),
+            ResponseCachePlugin::cache_key(&b, None, None)
         );
     }
 
@@ -184,16 +185,16 @@ mod tests {
         let mut system = request("gpt-4", "be terse");
         system.messages[0].role = Role::System;
         assert_ne!(
-            ResponseCachePlugin::cache_key(&user),
-            ResponseCachePlugin::cache_key(&system)
+            ResponseCachePlugin::cache_key(&user, None, None),
+            ResponseCachePlugin::cache_key(&system, None, None)
         );
 
         // max_tokens / top_p materially change the completion.
         let mut capped = request("gpt-4", "be terse");
         capped.max_tokens = Some(5);
         assert_ne!(
-            ResponseCachePlugin::cache_key(&user),
-            ResponseCachePlugin::cache_key(&capped)
+            ResponseCachePlugin::cache_key(&user, None, None),
+            ResponseCachePlugin::cache_key(&capped, None, None)
         );
     }
 
@@ -209,30 +210,35 @@ mod tests {
             serde_json::json!({"type": "json_object"}),
         );
         assert_ne!(
-            ResponseCachePlugin::cache_key(&plain),
-            ResponseCachePlugin::cache_key(&json_mode)
+            ResponseCachePlugin::cache_key(&plain, None, None),
+            ResponseCachePlugin::cache_key(&json_mode, None, None)
         );
 
         let mut with_user = request("gpt-4", "give me json");
         with_user.user = Some("tenant-a".to_string());
         assert_ne!(
-            ResponseCachePlugin::cache_key(&plain),
-            ResponseCachePlugin::cache_key(&with_user)
+            ResponseCachePlugin::cache_key(&plain, None, None),
+            ResponseCachePlugin::cache_key(&with_user, None, None)
         );
     }
 
     #[tokio::test]
     async fn different_prompts_do_not_collide() {
         let cache = ResponseCachePlugin::new(100, Duration::from_secs(60));
-        cache
-            .insert(&request("gpt-4", "first"), response("A"))
-            .await;
-        cache
-            .insert(&request("gpt-4", "second"), response("B"))
-            .await;
+        let req_first = request("gpt-4", "first");
+        let req_second = request("gpt-4", "second");
+        let key_first = ResponseCachePlugin::cache_key(&req_first, None, None);
+        let key_second = ResponseCachePlugin::cache_key(&req_second, None, None);
+
+        cache.insert(key_first.clone(), response("A")).await;
+        cache.insert(key_second.clone(), response("B")).await;
 
         assert_eq!(
-            cache.get(&request("gpt-4", "first")).await.unwrap().choices[0]
+            cache
+                .get(&key_first)
+                .await
+                .unwrap()
+                .choices[0]
                 .message
                 .content
                 .as_deref(),
@@ -240,7 +246,7 @@ mod tests {
         );
         assert_eq!(
             cache
-                .get(&request("gpt-4", "second"))
+                .get(&key_second)
                 .await
                 .unwrap()
                 .choices[0]

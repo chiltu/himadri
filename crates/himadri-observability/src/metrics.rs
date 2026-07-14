@@ -1,6 +1,6 @@
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -17,6 +17,10 @@ pub struct Metrics {
     pub active_connections: IntGauge,
     pub cache_hits_total: IntCounter,
     pub cache_misses_total: IntCounter,
+    pub guardrail_pii_detections_total: IntCounterVec,
+    pub guardrail_blocked_total: IntCounterVec,
+    pub guardrail_scan_duration: HistogramVec,
+    pub guardrail_engine_errors_total: IntCounter,
 }
 
 impl Metrics {
@@ -97,7 +101,41 @@ impl Metrics {
         ))
         .expect("static metric definition is valid");
 
-        let collectors: [Box<dyn prometheus::core::Collector>; 11] = [
+        let guardrail_pii_detections_total = IntCounterVec::new(
+            Opts::new(
+                "himadri_guardrails_pii_detections_total",
+                "PII entities detected by guardrails (types/counts only, never values)",
+            ),
+            &["entity_type", "direction", "action"],
+        )
+        .expect("static metric definition is valid");
+
+        let guardrail_blocked_total = IntCounterVec::new(
+            Opts::new(
+                "himadri_guardrails_requests_blocked_total",
+                "Requests/responses blocked by PII guardrails",
+            ),
+            &["direction"],
+        )
+        .expect("static metric definition is valid");
+
+        let guardrail_scan_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "himadri_guardrails_scan_duration_seconds",
+                "PII guardrail scan duration in seconds",
+            )
+            .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]),
+            &["direction"],
+        )
+        .expect("static metric definition is valid");
+
+        let guardrail_engine_errors_total = IntCounter::with_opts(Opts::new(
+            "himadri_guardrails_engine_errors_total",
+            "PII guardrail engine failures",
+        ))
+        .expect("static metric definition is valid");
+
+        let collectors: [Box<dyn prometheus::core::Collector>; 15] = [
             Box::new(requests_total.clone()),
             Box::new(request_duration.clone()),
             Box::new(tokens_input_total.clone()),
@@ -109,6 +147,10 @@ impl Metrics {
             Box::new(active_connections.clone()),
             Box::new(cache_hits_total.clone()),
             Box::new(cache_misses_total.clone()),
+            Box::new(guardrail_pii_detections_total.clone()),
+            Box::new(guardrail_blocked_total.clone()),
+            Box::new(guardrail_scan_duration.clone()),
+            Box::new(guardrail_engine_errors_total.clone()),
         ];
         // The registry is created fresh above, so registration can only fail
         // on a duplicate metric name within this constructor itself.
@@ -131,6 +173,10 @@ impl Metrics {
             active_connections,
             cache_hits_total,
             cache_misses_total,
+            guardrail_pii_detections_total,
+            guardrail_blocked_total,
+            guardrail_scan_duration,
+            guardrail_engine_errors_total,
         }
     }
 

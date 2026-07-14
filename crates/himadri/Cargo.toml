@@ -11,8 +11,13 @@ path = "src/main.rs"
 name = "gateway_bench"
 harness = false
 
+[[bench]]
+name = "guardrails_bench"
+harness = false
+required-features = ["guardrails"]
+
 [features]
-default = ["sqlite"]
+default = ["sqlite", "guardrails"]
 sqlite = [
     "dep:sqlx",
     "sqlx/sqlite",
@@ -23,12 +28,14 @@ postgres = [
     "sqlx/postgres",
     "himadri-admin/postgres",
 ]
+# PII guardrails (redact-core engine); runtime opt-in via GUARDRAILS_PII_MODE.
+guardrails = ["himadri-plugins/guardrails"]
 
 [dependencies]
 himadri-core = { path = "../himadri-core" }
 himadri-provider = { path = "../himadri-provider" }
 himadri-plugin = { path = "../himadri-plugin" }
-himadri-plugins = { path = "../himadri-plugins" }
+himadri-plugins = { path = "../himadri-plugins", default-features = false }
 himadri-admin = { path = "../himadri-admin", default-features = false }
 himadri-auth = { path = "../himadri-auth" }
 himadri-observability = { path = "../himadri-observability" }
@@ -66,7 +73,7 @@ chrono = { workspace = true }
 himadri-core = { path = "../himadri-core" }
 himadri-provider = { path = "../himadri-provider" }
 himadri-plugin = { path = "../himadri-plugin" }
-himadri-plugins = { path = "../himadri-plugins" }
+himadri-plugins = { path = "../himadri-plugins", default-features = false }
 himadri-admin = { path = "../himadri-admin", features = ["postgres"] }
 himadri-observability = { path = "../himadri-observability" }
 himadri-ratelimit = { path = "../himadri-ratelimit" }

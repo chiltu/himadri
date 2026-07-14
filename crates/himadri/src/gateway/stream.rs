@@ -33,6 +33,12 @@ impl Gateway {
         // Guards + before-request plugins (shared with route).
         let ctx = self.prepare_request(&request, auth, remote_ip).await?;
 
+        // The pipeline's copy is the request of record from here on:
+        // before-request plugins may rewrite it (e.g. PII redaction), and
+        // provider dispatch and the audit log must see what the pipeline
+        // produced — not the raw client request.
+        let request = ctx.request.clone();
+
         let ordered = self.select_targets(&request, auth).await?;
 
         // Try targets in priority order until one opens a stream. Failover for

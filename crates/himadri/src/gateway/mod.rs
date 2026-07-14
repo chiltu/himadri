@@ -63,7 +63,10 @@ fn routing_key(target: &Target) -> &str {
 /// follow this order; violating it can deadlock concurrent admin calls
 /// (e.g. a config reload racing a provider mutation).
 pub struct Gateway {
-    config: RwLock<Config>,
+    /// Arc-shared so long-lived collaborators (e.g. the PII guardrail
+    /// plugin) can resolve per-org settings against the *live* config —
+    /// admin reloads apply to them without re-wiring.
+    config: Arc<RwLock<Config>>,
     providers: DashMap<String, Arc<dyn Provider>>,
     plugin_manager: Arc<PluginManager>,
     strategy: RwLock<Strategy>,
@@ -110,7 +113,7 @@ impl Gateway {
         history.record(config.clone(), None);
 
         Self {
-            config: RwLock::new(config.clone()),
+            config: Arc::new(RwLock::new(config.clone())),
             providers: DashMap::new(),
             plugin_manager,
             strategy: RwLock::new(strategy),
@@ -154,6 +157,13 @@ impl Gateway {
 
     pub fn set_plugin_manager(&mut self, manager: PluginManager) {
         self.plugin_manager = Arc::new(manager);
+    }
+
+    /// Handle onto the live config, for collaborators that must observe
+    /// admin reloads (e.g. the PII guardrail plugin's per-org settings).
+    /// Read-only by convention: all writes go through `apply_config`.
+    pub fn config_handle(&self) -> Arc<RwLock<Config>> {
+        self.config.clone()
     }
 
     pub fn list_providers(&self) -> Vec<String> {

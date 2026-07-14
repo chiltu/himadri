@@ -242,9 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Build the gateway core: register env-configured providers, wire the
 /// plugin pipeline, and attach the request-log store and response cache.
 async fn build_gateway(config: &Config) -> Gateway {
-    let mut gateway = Gateway::new(config.clone(), Arc::new(Metrics::new()));
+    let metrics = Arc::new(Metrics::new());
+    let mut gateway = Gateway::new(config.clone(), metrics.clone());
     register_providers_from_env(&gateway);
-    gateway.set_plugin_manager(wire_plugins());
+    let plugins = wire_plugins(config, gateway.config_handle(), &metrics);
+    gateway.set_plugin_manager(plugins);
 
     // Persist request logs to Postgres when configured; otherwise they remain
     // in-memory and are lost on restart.
@@ -379,10 +381,108 @@ fn register_providers_from_env(gateway: &Gateway) {
     }
 }
 
-/// Assemble the plugin pipeline (word filter, max-token, request logger,
-/// and the env-configured budget and rate-limit plugins).
-fn wire_plugins() -> himadri_plugin::PluginManager {
+/// Whether any scope of `config` turns the PII guardrail on. Presence of
+/// an org/team `pii` section counts even when currently disabled: the
+/// operator clearly intends to manage guardrails via config, so an engine
+/// build failure must be fatal, not silent.
+#[cfg(feature = "guardrails")]
+fn config_mentions_pii(config: &Config) -> bool {
+    config.guardrails.pii.enabled
+        || config.orgs.values().any(|org| {
+            org.guardrails.pii.is_some()
+                || org
+                    .teams
+                    .values()
+                    .any(|team| team.guardrails.pii.is_some())
+        })
+}
+
+fn config_mentions_pii_response(config: &Config) -> bool {
+    use himadri_core::PiiResponseModeConfig;
+    config.guardrails.pii.response_mode != PiiResponseModeConfig::Off
+        || config.orgs.values().any(|org| {
+            org.guardrails
+                .pii
+                .as_ref()
+                .map_or(false, |pii| pii.response_mode != PiiResponseModeConfig::Off)
+                || org
+                    .teams
+                    .values()
+                    .any(|team| {
+                        team.guardrails
+                            .pii
+                            .as_ref()
+                            .map_or(false, |pii| pii.response_mode != PiiResponseModeConfig::Off)
+                    })
+        })
+}
+
+/// Assemble the plugin pipeline (PII guardrail, word filter, max-token,
+/// request logger, and the env-configured budget and rate-limit plugins).
+#[allow(unused_variables)] // config/handle/metrics unused without the guardrails feature
+fn wire_plugins(
+    config: &Config,
+    config_handle: Arc<tokio::sync::RwLock<Config>>,
+    metrics: &Arc<Metrics>,
+) -> himadri_plugin::PluginManager {
     let mut plugin_manager = himadri_plugin::PluginManager::new();
+
+    // PII guardrail: always registered (feature-gated) and resolved per
+    // request against the live config, so orgs can be onboarded/opted out
+    // via /admin/config reloads without a restart. Runtime activation is
+    // GUARDRAILS_PII_MODE (global default) and/or `guardrails.pii` config
+    // sections; with neither, the plugin no-ops per request. Registered
+    // first so every downstream plugin (word filter, logger, budget) and
+    // the response cache see redacted content.
+    #[cfg(feature = "guardrails")]
+    {
+        let defaults = himadri_plugins::PiiGuardrailSettings::from_env();
+        let response_defaults = himadri_plugins::PiiResponseSettings::from_env();
+        // Fail closed if guardrails (request or response) are configured.
+        let configured = defaults.is_some()
+            || response_defaults.is_some()
+            || config_mentions_pii(config)
+            || config_mentions_pii_response(config);
+        match himadri_plugins::RedactCoreEngine::new(himadri_plugins::EngineSecrets::from_env()) {
+            Ok(engine) => {
+                match &defaults {
+                    Some(settings) => info!(
+                        "Registered PII guardrail (global default mode: {:?}, strategy: {:?})",
+                        settings.mode, settings.options.strategy
+                    ),
+                    None => info!(
+                        "Registered PII guardrail (no global default; config-driven per org/team)"
+                    ),
+                }
+                let engine: std::sync::Arc<dyn himadri_plugins::PiiEngine> = engine;
+                plugin_manager.register(himadri_plugins::PiiGuardrailPlugin::with_config(
+                    engine.clone(),
+                    defaults,
+                    config_handle.clone(),
+                    Some(metrics.clone()),
+                ));
+                // Response-side scanning (mode from `response_mode` config
+                // fields / GUARDRAILS_PII_RESPONSE_MODE). Same engine, same
+                // per-scope resolution. Off by default.
+                plugin_manager.register_response_guardrail(
+                    himadri_plugins::PiiResponseGuardrail::with_config(
+                        engine,
+                        himadri_plugins::PiiResponseSettings::from_env(),
+                        config_handle,
+                        Some(metrics.clone()),
+                    ),
+                );
+            }
+            // Refuse to start rather than silently run without a guardrail
+            // the operator explicitly configured (fail-closed, SPEC §6.3).
+            Err(e) if configured => {
+                panic!("PII guardrail configured but engine failed to build: {e}")
+            }
+            Err(e) => tracing::error!(
+                "PII guardrail engine failed to build; guardrails unavailable: {e}"
+            ),
+        }
+    }
 
     // Word filter is opt-in: WORD_FILTER_BLOCKLIST is a comma-separated
     // list of blocked words. (A hardcoded default blocklist used to reject
