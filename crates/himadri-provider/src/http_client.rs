@@ -154,6 +154,10 @@ impl ProviderHttpClient {
     }
 
     fn build_client_from_config(config: &TransportConfig) -> Client {
+        // propagation seam: to inject the current trace context into upstream
+        // provider calls, add a middleware here (or at each request) that writes
+        // the W3C `traceparent`/`tracestate` headers from the active
+        // OpenTelemetry context via the globally-installed propagator.
         let mut builder = Client::builder()
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(config.pool_idle_timeout)

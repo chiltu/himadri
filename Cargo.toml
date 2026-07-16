@@ -23,6 +23,17 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry (traces only). Pinned to one coherent 0.32 release train;
+# tracing-opentelemetry 0.33 targets the opentelemetry 0.32 API. TLS is
+# rustls-only (see opentelemetry-otlp features) to match the openssl-free tree.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "grpc-tonic",
+    "tls-roots",
+] }
+tracing-opentelemetry = "0.33"
 thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"

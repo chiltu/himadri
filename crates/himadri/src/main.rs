@@ -146,11 +146,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    himadri_observability::init_tracing(
-        &config.observability.tracing.service_name,
-        config.observability.tracing.endpoint.as_deref(),
-        config.observability.tracing.sample_ratio,
-    );
+    // Held for the process lifetime; flushed on graceful shutdown below.
+    let tracing_guard = himadri_observability::init_tracing(&config.observability.tracing);
 
     info!("Starting himadri v{}", env!("CARGO_PKG_VERSION"));
 
@@ -273,7 +270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
-    himadri_observability::shutdown_tracing();
+    // Force-flush buffered spans (no-op when tracing is disabled).
+    tracing_guard.shutdown();
     Ok(())
 }
 
@@ -639,6 +637,11 @@ fn build_router(
         .merge(public_routes)
         .merge(api_routes)
         .merge(admin_routes)
+        // propagation seam: to continue an upstream caller's distributed trace,
+        // add a layer here that extracts the W3C `traceparent` from the inbound
+        // request headers via the global propagator and sets it as the parent
+        // OpenTelemetry context for the request span. The propagator and a
+        // parent-aware sampler are already installed (see himadri-observability).
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer)
         .with_state(state)

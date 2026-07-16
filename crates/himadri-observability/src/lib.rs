@@ -6,4 +6,4 @@ pub mod tracing_setup;
 pub use audit::{AuditEvent, AuditLog, AuditMessage, AuditStatus};
 pub use metrics::Metrics;
 pub use redact::Redactor;
-pub use tracing_setup::{init_tracing, shutdown_tracing};
+pub use tracing_setup::{init_tracing, TracingGuard};

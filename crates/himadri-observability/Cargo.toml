@@ -13,3 +13,12 @@ prometheus = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
 regex = "1"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+[dev-dependencies]
+# In-memory span exporter for hermetic trace-capture tests (no live collector).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -177,6 +177,11 @@ token, never the master key itself.
 | `AUDIT_CAPTURE_CONTENT` | `false` | Include prompt/response content in audit events (always redacted). Off by default so user content never reaches logs/telemetry. |
 | `METRICS_TOKEN` | _(unset)_ | Dedicated bearer token for `GET /metrics`. Falls back to `MASTER_KEY`; if neither is set (dev mode), metrics are unauthenticated. |
 
+> **Distributed tracing.** Spans can be exported over OTLP/gRPC to an
+> OpenTelemetry Collector via the `observability.tracing` block in the JSON
+> config file. See **[OpenTelemetry Tracing](opentelemetry.md)** for the full
+> setup, endpoint/TLS resolution, sampling, and a collector example.
+
 ### Budget
 
 | Variable | Default | Description |
@@ -245,9 +250,16 @@ Set `GATEWAY_CONFIG=/path/to/config.json`. Full schema with defaults:
   ],
   "plugins": [],
   "observability": {
-    "service_name": "himadri",
-    "sample_ratio": 1.0,
-    "metrics_path": "/metrics"
+    "tracing": {
+      "enabled": false,
+      "service_name": "himadri",
+      "endpoint": null,
+      "sample_ratio": 1.0
+    },
+    "metrics": {
+      "enabled": true,
+      "path": "/metrics"
+    }
   },
   "rate_limit": {
     "enabled": false,
