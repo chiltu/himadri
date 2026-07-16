@@ -14,8 +14,7 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use himadri_core::{
-    Config, ContentPart, MessageContent, PiiGuardrailConfig, PiiModeConfig, PiiStrategyConfig,
-    Role,
+    Config, ContentPart, MessageContent, PiiGuardrailConfig, PiiModeConfig, PiiStrategyConfig, Role,
 };
 
 /// The org/team PII section governing this request, if any: the most specific
@@ -29,9 +28,9 @@ fn scoped_pii_section<'a>(cfg: &'a Config, ctx: &PluginContext) -> Option<&'a Pi
         .find_map(|scope| scope.guardrails.pii.as_ref())
 }
 use himadri_observability::Metrics;
-use tokio::sync::RwLock;
 use himadri_plugin::context::PluginContext;
 use himadri_plugin::traits::{Plugin, PluginError, PluginType, RejectKind, Stage};
+use tokio::sync::RwLock;
 
 use crate::pii_engine::{PiiEngine, RedactOptions, RedactStrategy};
 
@@ -164,7 +163,10 @@ fn options_from_env() -> RedactOptions {
     if let Ok(v) = std::env::var("GUARDRAILS_PII_STRATEGY") {
         match RedactStrategy::parse(&v) {
             Some(s) => options.strategy = s,
-            None => warn!("GUARDRAILS_PII_STRATEGY '{}' not recognized; using replace", v),
+            None => warn!(
+                "GUARDRAILS_PII_STRATEGY '{}' not recognized; using replace",
+                v
+            ),
         }
     }
     if let Ok(v) = std::env::var("GUARDRAILS_PII_ENTITIES") {
@@ -434,10 +436,11 @@ impl Plugin for PiiGuardrailPlugin {
             return Ok(());
         }
 
-        let timer = self
-            .metrics
-            .as_ref()
-            .map(|m| m.guardrail_scan_duration.with_label_values(&["request"]).start_timer());
+        let timer = self.metrics.as_ref().map(|m| {
+            m.guardrail_scan_duration
+                .with_label_values(&["request"])
+                .start_timer()
+        });
 
         let total_bytes: usize = texts.iter().map(String::len).sum();
         let mode = settings.mode;
@@ -627,8 +630,7 @@ impl PiiResponseGuardrail {
 
     async fn effective_settings(&self, ctx: &PluginContext) -> Option<PiiResponseSettings> {
         fn active(cfg: &PiiGuardrailConfig) -> Option<PiiResponseSettings> {
-            (cfg.enabled
-                && cfg.response_mode != himadri_core::PiiResponseModeConfig::Off)
+            (cfg.enabled && cfg.response_mode != himadri_core::PiiResponseModeConfig::Off)
                 .then(|| PiiResponseSettings::from_config(cfg))
         }
 
@@ -687,7 +689,9 @@ impl himadri_plugin::traits::ResponseGuardrail for PiiResponseGuardrail {
                 }
             })
             .await
-            .map_err(|e| PluginError::Internal(format!("PII response guardrail task failed: {e}")))?
+            .map_err(|e| {
+                PluginError::Internal(format!("PII response guardrail task failed: {e}"))
+            })?
         } else if mode == PiiResponseMode::Redact {
             self.engine
                 .redact(response, &settings.options)
@@ -822,9 +826,16 @@ mod tests {
     #[tokio::test]
     async fn redact_mode_rewrites_content() {
         let mut ctx = ctx_with_user_text("the SECRET plan");
-        plugin(PiiMode::Redact, false).execute(&mut ctx).await.unwrap();
+        plugin(PiiMode::Redact, false)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
         assert_eq!(
-            ctx.request.messages[0].content.as_ref().unwrap().flat_text(),
+            ctx.request.messages[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .flat_text(),
             "the [X] plan"
         );
         let meta = ctx.get_metadata("guardrails.pii").unwrap();
@@ -852,9 +863,16 @@ mod tests {
     #[tokio::test]
     async fn observe_mode_leaves_content_untouched() {
         let mut ctx = ctx_with_user_text("the SECRET plan");
-        plugin(PiiMode::Observe, false).execute(&mut ctx).await.unwrap();
+        plugin(PiiMode::Observe, false)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
         assert_eq!(
-            ctx.request.messages[0].content.as_ref().unwrap().flat_text(),
+            ctx.request.messages[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .flat_text(),
             "the SECRET plan"
         );
         assert!(ctx.get_metadata("guardrails.pii").is_some());
@@ -863,7 +881,10 @@ mod tests {
     #[tokio::test]
     async fn clean_request_records_nothing() {
         let mut ctx = ctx_with_user_text("nothing to see");
-        plugin(PiiMode::Redact, false).execute(&mut ctx).await.unwrap();
+        plugin(PiiMode::Redact, false)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
         assert!(ctx.get_metadata("guardrails.pii").is_none());
     }
 
@@ -879,9 +900,16 @@ mod tests {
             ..Default::default()
         };
         let mut ctx = PluginContext::from_request(&request, None);
-        plugin(PiiMode::Redact, false).execute(&mut ctx).await.unwrap();
+        plugin(PiiMode::Redact, false)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
         assert_eq!(
-            ctx.request.messages[0].content.as_ref().unwrap().flat_text(),
+            ctx.request.messages[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .flat_text(),
             "the SECRET plan"
         );
     }
@@ -905,9 +933,16 @@ mod tests {
             ..Default::default()
         };
         let mut ctx = PluginContext::from_request(&request, None);
-        plugin(PiiMode::Redact, false).execute(&mut ctx).await.unwrap();
+        plugin(PiiMode::Redact, false)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
         assert_eq!(
-            ctx.request.messages[0].content.as_ref().unwrap().flat_text(),
+            ctx.request.messages[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .flat_text(),
             "keep thisa [X] here"
         );
     }
@@ -950,7 +985,10 @@ mod tests {
         }
     }
 
-    fn org_with_pii(pii: Option<PiiGuardrailConfig>, team_pii: Option<PiiGuardrailConfig>) -> OrgConfig {
+    fn org_with_pii(
+        pii: Option<PiiGuardrailConfig>,
+        team_pii: Option<PiiGuardrailConfig>,
+    ) -> OrgConfig {
         let mut org = OrgConfig::default();
         org.guardrails.pii = pii;
         if let Some(team_pii) = team_pii {
@@ -1178,12 +1216,18 @@ mod tests {
         let ctx = ctx_with_user_text("hi");
         let guardrail = response_guardrail(PiiResponseMode::Observe, false);
         assert_eq!(
-            guardrail.check_response(&ctx, "the SECRET plan").await.unwrap(),
+            guardrail
+                .check_response(&ctx, "the SECRET plan")
+                .await
+                .unwrap(),
             ResponseAction::Allow
         );
         let guardrail = response_guardrail(PiiResponseMode::Redact, false);
         assert_eq!(
-            guardrail.check_response(&ctx, "all clean here").await.unwrap(),
+            guardrail
+                .check_response(&ctx, "all clean here")
+                .await
+                .unwrap(),
             ResponseAction::Allow
         );
     }
@@ -1238,14 +1282,20 @@ mod tests {
         // acme's responses are redacted.
         let ctx = ctx_for_scope(Some("acme"), None, "hi");
         assert_eq!(
-            guardrail.check_response(&ctx, "the SECRET plan").await.unwrap(),
+            guardrail
+                .check_response(&ctx, "the SECRET plan")
+                .await
+                .unwrap(),
             ResponseAction::Redact("the [X] plan".to_string())
         );
 
         // Other orgs: global has response_mode off — allowed through.
         let ctx = ctx_for_scope(Some("globex"), None, "hi");
         assert_eq!(
-            guardrail.check_response(&ctx, "the SECRET plan").await.unwrap(),
+            guardrail
+                .check_response(&ctx, "the SECRET plan")
+                .await
+                .unwrap(),
             ResponseAction::Allow
         );
     }
@@ -1254,10 +1304,11 @@ mod tests {
     async fn large_input_takes_spawn_blocking_path() {
         let big = format!("{} SECRET", "x".repeat(32 * 1024));
         let mut ctx = ctx_with_user_text(&big);
-        plugin(PiiMode::Redact, false).execute(&mut ctx).await.unwrap();
-        assert!(ctx
-            .request
-            .messages[0]
+        plugin(PiiMode::Redact, false)
+            .execute(&mut ctx)
+            .await
+            .unwrap();
+        assert!(ctx.request.messages[0]
             .content
             .as_ref()
             .unwrap()

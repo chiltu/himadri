@@ -1,13 +1,18 @@
 //! Postgres-backed equivalent of [`crate::provider_store::ModelStore`] /
-//! [`crate::provider_store::ModelEndpointStore`]. Kept as a mirror-image
-//! implementation (same method set, same encryption-at-rest behavior) so
-//! `ModelStoreBackend`/`ModelEndpointStoreBackend` in
-//! [`crate::provider_backend`] can dispatch to whichever backend
-//! `DATABASE_URL` selects.
+//! [`crate::provider_store::ModelEndpointStore`]. Implements the
+//! [`ModelStore`](crate::model_store::ModelStore) and
+//! [`ModelEndpointStore`](crate::model_store::ModelEndpointStore) traits
+//! so callers dispatch generically through the trait seam instead of
+//! matching on a backend enum.
 
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::crypto::CipherKey;
+use crate::error::AdminError;
+use crate::model_store::{
+    ModelEndpointStore as ModelEndpointStoreTrait, ModelStore as ModelStoreTrait,
+};
 use crate::models::{
     CreateModelEndpointRequest, CreateModelRequest, Model, ModelEndpoint,
     UpdateModelEndpointRequest, UpdateModelRequest,
@@ -21,10 +26,11 @@ impl PgModelStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn create(&self, request: CreateModelRequest) -> Result<Model, sqlx::Error> {
-        // Models are first-party and route via `model_endpoints`; no provider
-        // validation.
+#[async_trait]
+impl ModelStoreTrait for PgModelStore {
+    async fn create(&self, request: CreateModelRequest) -> Result<Model, AdminError> {
         let id = Uuid::new_v4();
         let now = chrono::Utc::now();
 
@@ -50,9 +56,7 @@ impl PgModelStore {
         })
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<Model>, sqlx::Error> {
-        // A malformed UUID can't match any row: "not found", not an error —
-        // the SQLite backend binds the raw string and reports the same.
+    async fn get(&self, id: &str) -> Result<Option<Model>, AdminError> {
         let Ok(uuid) = Uuid::parse_str(id) else {
             return Ok(None);
         };
@@ -65,7 +69,7 @@ impl PgModelStore {
         Ok(row.map(|r| r.into()))
     }
 
-    pub async fn list(&self) -> Result<Vec<Model>, sqlx::Error> {
+    async fn list(&self) -> Result<Vec<Model>, AdminError> {
         let rows = sqlx::query_as::<_, ModelRow>(
             "SELECT id, name, display_name, enabled, created_at, updated_at FROM models ORDER BY name",
         )
@@ -74,7 +78,7 @@ impl PgModelStore {
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
-    pub async fn list_enabled(&self) -> Result<Vec<Model>, sqlx::Error> {
+    async fn list_enabled(&self) -> Result<Vec<Model>, AdminError> {
         let rows = sqlx::query_as::<_, ModelRow>(
             "SELECT id, name, display_name, enabled, created_at, updated_at FROM models WHERE enabled = true ORDER BY name",
         )
@@ -83,11 +87,11 @@ impl PgModelStore {
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
-    pub async fn update(
+    async fn update(
         &self,
         id: &str,
         request: UpdateModelRequest,
-    ) -> Result<Option<Model>, sqlx::Error> {
+    ) -> Result<Option<Model>, AdminError> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
         let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
 
@@ -108,10 +112,7 @@ impl PgModelStore {
         self.get(id).await
     }
 
-    /// See the SQLite counterpart on why this returns [`AdminError`]: the
-    /// enabled-model guard must surface as `Conflict` (409), not a store
-    /// failure. A malformed UUID can't match any row, so it's "not found".
-    pub async fn delete(&self, id: &str) -> Result<bool, crate::error::AdminError> {
+    async fn delete(&self, id: &str) -> Result<bool, AdminError> {
         let Ok(uuid) = Uuid::parse_str(id) else {
             return Ok(false);
         };
@@ -121,7 +122,7 @@ impl PgModelStore {
         };
 
         if model.enabled {
-            return Err(crate::error::AdminError::Conflict(format!(
+            return Err(AdminError::Conflict(format!(
                 "Cannot delete model '{}' (id: {}): model is enabled. Disable it first before deletion.",
                 model.name, model.id
             )));
@@ -134,7 +135,7 @@ impl PgModelStore {
         Ok(r.rows_affected() > 0)
     }
 
-    pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, sqlx::Error> {
+    async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, AdminError> {
         let Ok(uuid) = Uuid::parse_str(id) else {
             return Ok(None);
         };
@@ -167,23 +168,24 @@ impl PgModelEndpointStore {
     fn decrypt_endpoint(&self, endpoint: ModelEndpoint) -> ModelEndpoint {
         crate::crypto::decrypt_endpoint(self.cipher.as_ref(), endpoint)
     }
+}
 
-    pub async fn create(
+#[async_trait]
+impl ModelEndpointStoreTrait for PgModelEndpointStore {
+    async fn create(
         &self,
         model_id: &str,
         mut request: CreateModelEndpointRequest,
-    ) -> Result<ModelEndpoint, crate::error::AdminError> {
-        // A malformed or unknown model id is "not found" (404), the same
-        // contract as the SQLite store's parent-exists check.
+    ) -> Result<ModelEndpoint, AdminError> {
         let Ok(model_uuid) = Uuid::parse_str(model_id) else {
-            return Err(crate::error::AdminError::NotFound);
+            return Err(AdminError::NotFound);
         };
         let model_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM models WHERE id = $1")
             .bind(model_uuid)
             .fetch_optional(&self.pool)
             .await?;
         if model_exists.is_none() {
-            return Err(crate::error::AdminError::NotFound);
+            return Err(AdminError::NotFound);
         }
 
         let plaintext_key = request.api_key.clone();
@@ -219,7 +221,7 @@ impl PgModelEndpointStore {
         })
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<ModelEndpoint>, sqlx::Error> {
+    async fn get(&self, id: &str) -> Result<Option<ModelEndpoint>, AdminError> {
         let Ok(uuid) = Uuid::parse_str(id) else {
             return Ok(None);
         };
@@ -232,7 +234,7 @@ impl PgModelEndpointStore {
         Ok(row.map(|r| self.decrypt_endpoint(r.into())))
     }
 
-    pub async fn list(&self) -> Result<Vec<ModelEndpoint>, sqlx::Error> {
+    async fn list(&self) -> Result<Vec<ModelEndpoint>, AdminError> {
         let rows = sqlx::query_as::<_, ModelEndpointRow>(
             "SELECT id, model_id, provider_type, base_url, api_key, weight, enabled, created_at, updated_at FROM model_endpoints ORDER BY created_at",
         )
@@ -244,7 +246,7 @@ impl PgModelEndpointStore {
             .collect())
     }
 
-    pub async fn list_by_model(&self, model_id: &str) -> Result<Vec<ModelEndpoint>, sqlx::Error> {
+    async fn list_by_model(&self, model_id: &str) -> Result<Vec<ModelEndpoint>, AdminError> {
         let Ok(model_uuid) = Uuid::parse_str(model_id) else {
             return Ok(vec![]);
         };
@@ -260,25 +262,18 @@ impl PgModelEndpointStore {
             .collect())
     }
 
-    pub async fn update(
+    async fn update(
         &self,
         id: &str,
         request: UpdateModelEndpointRequest,
-    ) -> Result<Option<ModelEndpoint>, sqlx::Error> {
+    ) -> Result<Option<ModelEndpoint>, AdminError> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
         let uuid = Uuid::parse_str(id).map_err(|_| sqlx::Error::RowNotFound)?;
 
-        // One definition of the merge, shared with the other backend and with
-        // the admin API's pre-write validation.
         let (provider_type, base_url) = request.effective_routing_pair(&current);
         let weight = request.weight.unwrap_or(current.weight);
         let enabled = request.enabled.unwrap_or(current.enabled);
 
-        // `api_key: None` means leave the column alone. Never rewrite from
-        // `current.api_key`: on decrypt failure `get` sets that field to None,
-        // and re-storing it would permanently wipe the ciphertext.
-        // `api_key: Some(x)` is an intentional set (`Some(key)`) or clear
-        // (`None`).
         match request.api_key {
             Some(new_key) => {
                 let stored_api_key = self.encrypt_api_key(new_key);
@@ -311,7 +306,7 @@ impl PgModelEndpointStore {
         self.get(id).await
     }
 
-    pub async fn delete(&self, id: &str) -> Result<bool, sqlx::Error> {
+    async fn delete(&self, id: &str) -> Result<bool, AdminError> {
         let Ok(uuid) = Uuid::parse_str(id) else {
             return Ok(false);
         };
@@ -322,11 +317,7 @@ impl PgModelEndpointStore {
         Ok(r.rows_affected() > 0)
     }
 
-    pub async fn toggle(
-        &self,
-        id: &str,
-        enabled: bool,
-    ) -> Result<Option<ModelEndpoint>, sqlx::Error> {
+    async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<ModelEndpoint>, AdminError> {
         let Ok(uuid) = Uuid::parse_str(id) else {
             return Ok(None);
         };

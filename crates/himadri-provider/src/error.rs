@@ -172,7 +172,9 @@ impl From<ProviderError> for himadri_core::GatewayError {
             ProviderError::Unsupported(msg) => {
                 G::BadRequest(format!("operation not supported: {}", msg))
             }
-            ProviderError::UnknownType(msg) => G::BadRequest(format!("unknown provider type: {}", msg)),
+            ProviderError::UnknownType(msg) => {
+                G::BadRequest(format!("unknown provider type: {}", msg))
+            }
             ProviderError::MissingBaseUrl(msg) => {
                 G::BadRequest(format!("missing base_url for provider: {}", msg))
             }

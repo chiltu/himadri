@@ -454,7 +454,10 @@ mod tests {
         let err = gw
             .check_org_guardrails(Some(&a), &cfg, &request("m", "hi", Some(501)))
             .expect_err("team max_tokens cap must reject");
-        assert!(err.to_string().contains("team guardrail limit"), "got: {err}");
+        assert!(
+            err.to_string().contains("team guardrail limit"),
+            "got: {err}"
+        );
 
         // A principal on the org without the team is untouched by team rules.
         assert!(gw

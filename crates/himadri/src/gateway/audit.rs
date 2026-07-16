@@ -1,61 +1,219 @@
 //! Audit events and per-request accounting (metrics, usage, request log).
-//! `record_request_outcome` is shared by the non-streaming path and the
-//! streaming recorder so their semantics can never drift.
+//! The [`RequestAuditor`] trait provides a single seam that both the
+//! non-streaming and streaming paths call, replacing the previous pattern
+//! of calling several free functions / `impl Gateway` methods inline.
 
-use himadri_core::{AuthContext, ChatCompletionRequest, ChatCompletionResponse};
-use himadri_observability::{AuditEvent, AuditMessage, AuditStatus, Metrics};
+use std::sync::Arc;
 
-use super::Gateway;
+use himadri_admin::{RequestLogEntry, RequestLogStore, UsageRecord, UsageStore};
+use himadri_core::{AuthContext, ChatCompletionRequest, ChatCompletionResponse, Usage};
+use himadri_observability::{AuditEvent, AuditLog, AuditMessage, AuditStatus, Metrics};
 
-pub(super) struct AuditContext<'a> {
-    pub(super) request: &'a ChatCompletionRequest,
-    pub(super) auth: Option<&'a AuthContext>,
-    pub(super) ctx: &'a himadri_plugin::PluginContext,
-    pub(super) result: &'a Result<ChatCompletionResponse, himadri_provider::ProviderError>,
+/// Full outcome of one request, used by the non-streaming path.
+pub(super) struct RequestEvent {
+    pub(super) auth: Option<AuthContext>,
+    pub(super) request_id: String,
+    pub(super) provider: String,
+    pub(super) model: String,
+    pub(super) messages: Vec<AuditMessage>,
+    pub(super) response_text: Option<String>,
     pub(super) latency_ms: u64,
-    pub(super) guardrail_actions: &'a [String],
+    pub(super) tokens_prompt: u32,
+    pub(super) tokens_completion: u32,
+    pub(super) tokens_total: u32,
+    pub(super) status: AuditStatus,
+    pub(super) error: Option<String>,
+    pub(super) guardrail_actions: Vec<String>,
+    pub(super) stream: bool,
+    pub(super) api_key_id: Option<String>,
 }
 
-impl Gateway {
-    pub(super) async fn log_audit(&self, audit: &AuditContext<'_>) {
-        let messages = audit_messages(audit.request);
+/// Accounting-only data, used by the streaming path's `Drop`-based recorder
+/// (which fires at stream end and cannot hold audit-event data).
+pub(super) struct AccountOutcome {
+    pub(super) provider: String,
+    pub(super) model: String,
+    pub(super) api_key_id: Option<String>,
+    pub(super) usage: Option<Usage>,
+    pub(super) error: Option<String>,
+    pub(super) latency_ms: u64,
+}
 
-        let (status, error, response_text, tokens) = match audit.result {
-            Ok(response) => {
-                let text = extract_response_text(response);
-                let tokens = response
-                    .usage
-                    .as_ref()
-                    .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens));
-                (AuditStatus::Success, None, text, tokens)
-            }
-            Err(e) => (AuditStatus::Error, Some(e.to_string()), None, None),
-        };
+/// The audit + accounting seam. Both the non-streaming path (`route`) and
+/// the streaming path (`StreamUsageRecorder`) call through this trait
+/// instead of importing free functions or accessing `Gateway` fields.
+pub(super) trait RequestAuditor: Send + Sync {
+    /// Full audit event + metrics + usage + request log. Called once per
+    /// non-streaming request after the response is received or the error
+    /// is finalised.
+    fn record_full(&self, event: RequestEvent);
 
-        let event = AuditEvent {
-            request_id: audit.ctx.request_id.clone(),
+    /// Accounting-only (metrics + usage + request log), no audit event.
+    /// Called from the streaming path's `Drop`-based recorder which has
+    /// no access to request/auth/messages data at fire time.
+    fn record_accounting(&self, outcome: AccountOutcome);
+}
+
+/// Production auditor that writes to all four stores.
+pub(super) struct LiveRequestAuditor {
+    pub(super) audit_log: Arc<AuditLog>,
+    pub(super) metrics: Arc<Metrics>,
+    pub(super) usage_store: Arc<UsageStore>,
+    pub(super) request_log: Arc<dyn RequestLogStore>,
+}
+
+fn record_usage(
+    usage_store: &UsageStore,
+    metrics: &Metrics,
+    request_log: &dyn RequestLogStore,
+    provider: &str,
+    model: &str,
+    api_key_id: Option<&str>,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+    latency_ms: u64,
+    error: Option<&str>,
+) {
+    let labels = [provider, model];
+
+    metrics.requests_total.with_label_values(&labels).inc();
+    metrics
+        .request_duration
+        .observe(latency_ms as f64 / 1000.0);
+
+    if error.is_none() {
+        metrics
+            .tokens_input_total
+            .with_label_values(&labels)
+            .inc_by(prompt_tokens as u64);
+        metrics
+            .tokens_output_total
+            .with_label_values(&labels)
+            .inc_by(completion_tokens as u64);
+
+        let cost = usage_store.calculate_cost(model, prompt_tokens, completion_tokens);
+        if cost > 0.0 {
+            metrics
+                .cost_usd_total
+                .with_label_values(&labels)
+                .inc_by((cost * 1_000_000.0) as u64);
+        }
+
+        usage_store.record(UsageRecord {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            api_key_id: api_key_id.map(str::to_string),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cost_usd: cost,
+            latency_ms,
+            created_at: chrono::Utc::now(),
+            success: true,
+            error_message: None,
+        });
+    } else {
+        metrics
+            .provider_errors
+            .with_label_values(&labels)
+            .inc();
+
+        usage_store.record(UsageRecord {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            api_key_id: api_key_id.map(str::to_string),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cost_usd: 0.0,
+            latency_ms,
+            created_at: chrono::Utc::now(),
+            success: false,
+            error_message: error.map(str::to_string),
+        });
+    }
+
+    let _ = request_log.write(RequestLogEntry {
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        stage: "completed".to_string(),
+        model: model.to_string(),
+        provider: provider.to_string(),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        error_message: error.map(str::to_string),
+        created_at: chrono::Utc::now(),
+    });
+}
+
+impl RequestAuditor for LiveRequestAuditor {
+    fn record_full(&self, event: RequestEvent) {
+        // ── Audit log ──────────────────────────────────────────────
+        let audit_event = AuditEvent {
+            request_id: event.request_id,
             timestamp: chrono::Utc::now(),
-            org_id: audit.auth.and_then(|a| a.org_id.clone()),
-            team_id: audit.auth.and_then(|a| a.team_id.clone()),
-            user_id: audit.auth.and_then(|a| a.user_id.clone()),
-            key_id: audit.auth.and_then(|a| a.key_id.clone()),
-            model: audit.request.model.clone(),
-            provider: audit.ctx.provider.clone(),
-            messages,
-            response: response_text,
-            latency_ms: audit.latency_ms,
-            tokens_prompt: tokens.map(|t| t.0),
-            tokens_completion: tokens.map(|t| t.1),
-            tokens_total: tokens.map(|t| t.2),
-            status,
-            error,
-            guardrail_actions: audit.guardrail_actions.to_vec(),
-            stream: audit.request.stream,
+            org_id: event.auth.as_ref().and_then(|a| a.org_id.clone()),
+            team_id: event.auth.as_ref().and_then(|a| a.team_id.clone()),
+            user_id: event.auth.as_ref().and_then(|a| a.user_id.clone()),
+            key_id: event.api_key_id.clone(),
+            model: event.model.clone(),
+            provider: Some(event.provider.clone()),
+            messages: event.messages,
+            response: event.response_text,
+            latency_ms: event.latency_ms,
+            tokens_prompt: Some(event.tokens_prompt),
+            tokens_completion: Some(event.tokens_completion),
+            tokens_total: Some(event.tokens_total),
+            status: event.status,
+            error: event.error.clone(),
+            guardrail_actions: event.guardrail_actions,
+            stream: event.stream,
         };
+        self.audit_log.log(audit_event);
 
-        self.audit_log.log(event);
+        // ── Metrics + usage + request log ──────────────────────────
+        record_usage(
+            &self.usage_store,
+            &self.metrics,
+            self.request_log.as_ref(),
+            &event.provider,
+            &event.model,
+            event.api_key_id.as_deref(),
+            event.tokens_prompt,
+            event.tokens_completion,
+            event.tokens_total,
+            event.latency_ms,
+            event.error.as_deref(),
+        );
+    }
+
+    fn record_accounting(&self, outcome: AccountOutcome) {
+        let (prompt, completion, total) = outcome
+            .usage
+            .as_ref()
+            .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens))
+            .unwrap_or((0, 0, 0));
+
+        record_usage(
+            &self.usage_store,
+            &self.metrics,
+            self.request_log.as_ref(),
+            &outcome.provider,
+            &outcome.model,
+            outcome.api_key_id.as_deref(),
+            prompt,
+            completion,
+            total,
+            outcome.latency_ms,
+            outcome.error.as_deref(),
+        );
     }
 }
+
+// ── Pure helpers (no Gateway / store access) ────────────────────────
 
 /// Flatten a request's messages into audit form.
 pub(super) fn audit_messages(request: &ChatCompletionRequest) -> Vec<AuditMessage> {
@@ -93,92 +251,79 @@ pub(super) fn redact_response_text(response: &mut ChatCompletionResponse, redact
     }
 }
 
-/// One request's final accounting, shared by the non-streaming path
-/// (`route`) and the streaming recorder so metrics/usage/request-log
-/// semantics can never drift between the two.
-pub(super) struct RequestOutcome<'a> {
-    pub(super) metrics: &'a Metrics,
-    pub(super) usage_store: &'a himadri_admin::UsageStore,
-    pub(super) request_log: &'a dyn himadri_admin::RequestLogStore,
-    pub(super) provider: &'a str,
-    pub(super) model: &'a str,
-    pub(super) api_key_id: Option<&'a str>,
-    pub(super) usage: Option<himadri_core::Usage>,
-    pub(super) error: Option<String>,
-    pub(super) latency_ms: u64,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use himadri_admin::InMemoryRequestLogStore;
+    use himadri_core::Usage;
+    use himadri_observability::Metrics;
 
-pub(super) fn record_request_outcome(outcome: &RequestOutcome<'_>) {
-    let labels = [outcome.provider, outcome.model];
-    let (prompt_tokens, completion_tokens, total_tokens) = outcome
-        .usage
-        .as_ref()
-        .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens))
-        .unwrap_or((0, 0, 0));
-
-    outcome
-        .metrics
-        .requests_total
-        .with_label_values(&labels)
-        .inc();
-    outcome
-        .metrics
-        .request_duration
-        .observe(outcome.latency_ms as f64 / 1000.0);
-    if outcome.error.is_none() {
-        outcome
-            .metrics
-            .tokens_input_total
-            .with_label_values(&labels)
-            .inc_by(prompt_tokens as u64);
-        outcome
-            .metrics
-            .tokens_output_total
-            .with_label_values(&labels)
-            .inc_by(completion_tokens as u64);
-    } else {
-        outcome
-            .metrics
-            .provider_errors
-            .with_label_values(&labels)
-            .inc();
+    fn auditor() -> LiveRequestAuditor {
+        LiveRequestAuditor {
+            audit_log: Arc::new(AuditLog::new(None, false)),
+            metrics: Arc::new(Metrics::new()),
+            usage_store: Arc::new(UsageStore::new()),
+            request_log: Arc::new(InMemoryRequestLogStore::new()),
+        }
     }
 
-    let cost = outcome
-        .usage_store
-        .calculate_cost(outcome.model, prompt_tokens, completion_tokens);
-    if cost > 0.0 {
-        outcome
-            .metrics
-            .cost_usd_total
-            .with_label_values(&labels)
-            .inc_by((cost * 1_000_000.0) as u64); // micro-USD for precision
+    #[tokio::test]
+    async fn record_accounting_success() {
+        let a = auditor();
+        a.record_accounting(AccountOutcome {
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            api_key_id: Some("key-1".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                total_tokens: 30,
+            }),
+            error: None,
+            latency_ms: 100,
+        });
+        let stats = a.usage_store.get_key_stats("key-1");
+        assert_eq!(stats.total_tokens, 30);
+        assert_eq!(stats.total_requests, 1);
     }
 
-    outcome.usage_store.record(himadri_admin::UsageRecord {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        api_key_id: outcome.api_key_id.map(str::to_string),
-        model: outcome.model.to_string(),
-        provider: outcome.provider.to_string(),
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        cost_usd: cost,
-        latency_ms: outcome.latency_ms,
-        created_at: chrono::Utc::now(),
-        success: outcome.error.is_none(),
-        error_message: outcome.error.clone(),
-    });
+    #[tokio::test]
+    async fn record_accounting_error() {
+        let a = auditor();
+        a.record_accounting(AccountOutcome {
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            api_key_id: None,
+            usage: None,
+            error: Some("timeout".to_string()),
+            latency_ms: 5000,
+        });
+        let dashboard = a.usage_store.get_dashboard(0);
+        assert_eq!(dashboard.total_requests, 1);
+        assert!(dashboard.error_rate > 0.0);
+    }
 
-    let _ = outcome.request_log.write(himadri_admin::RequestLogEntry {
-        trace_id: uuid::Uuid::new_v4().to_string(),
-        stage: "completed".to_string(),
-        model: outcome.model.to_string(),
-        provider: outcome.provider.to_string(),
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        error_message: outcome.error.clone(),
-        created_at: chrono::Utc::now(),
-    });
+    #[tokio::test]
+    async fn record_full_includes_audit_event() {
+        let a = auditor();
+        a.record_full(RequestEvent {
+            auth: None,
+            request_id: "req-1".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            messages: vec![],
+            response_text: None,
+            latency_ms: 50,
+            tokens_prompt: 5,
+            tokens_completion: 10,
+            tokens_total: 15,
+            status: AuditStatus::Success,
+            error: None,
+            guardrail_actions: vec![],
+            stream: false,
+            api_key_id: Some("key-1".to_string()),
+        });
+        let stats = a.usage_store.get_key_stats("key-1");
+        assert_eq!(stats.total_tokens, 15);
+    }
 }

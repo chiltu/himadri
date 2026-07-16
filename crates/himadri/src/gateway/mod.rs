@@ -33,6 +33,8 @@ use tokio::sync::RwLock;
 use himadri_circuitbreaker::CircuitBreakerTrait;
 use himadri_core::{Config, GatewayError, Target};
 use himadri_observability::{AuditLog, Metrics};
+
+use self::audit::{LiveRequestAuditor, RequestAuditor};
 use himadri_plugin::PluginManager;
 use himadri_provider::traits::Provider;
 use himadri_provider::ProviderRegistry;
@@ -91,6 +93,7 @@ pub struct Gateway {
     request_log: Arc<dyn himadri_admin::RequestLogStore>,
     response_cache: Option<Arc<himadri_plugins::ResponseCachePlugin>>,
     config_history: RwLock<ConfigHistory>,
+    request_auditor: Arc<dyn RequestAuditor>,
 }
 
 impl Gateway {
@@ -120,6 +123,13 @@ impl Gateway {
         let mut history = ConfigHistory::default();
         history.record(config.clone(), None);
 
+        let request_auditor: Arc<dyn RequestAuditor> = Arc::new(LiveRequestAuditor {
+            audit_log: audit_log.clone(),
+            metrics: metrics.clone(),
+            usage_store: usage_store.clone(),
+            request_log: request_log.clone(),
+        });
+
         Self {
             config: Arc::new(RwLock::new(config.clone())),
             providers: DashMap::new(),
@@ -136,6 +146,7 @@ impl Gateway {
             request_log,
             response_cache: None,
             config_history: RwLock::new(history),
+            request_auditor,
         }
     }
 

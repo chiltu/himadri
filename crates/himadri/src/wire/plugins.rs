@@ -146,9 +146,9 @@ pub fn build(
             Err(e) if configured => {
                 panic!("PII guardrail configured but engine failed to build: {e}")
             }
-            Err(e) => tracing::error!(
-                "PII guardrail engine failed to build; guardrails unavailable: {e}"
-            ),
+            Err(e) => {
+                tracing::error!("PII guardrail engine failed to build; guardrails unavailable: {e}")
+            }
         }
     }
 
@@ -244,10 +244,7 @@ fn config_mentions_pii(config: &Config) -> bool {
     config.guardrails.pii.enabled
         || config.orgs.values().any(|org| {
             org.guardrails.pii.is_some()
-                || org
-                    .teams
-                    .values()
-                    .any(|team| team.guardrails.pii.is_some())
+                || org.teams.values().any(|team| team.guardrails.pii.is_some())
         })
 }
 

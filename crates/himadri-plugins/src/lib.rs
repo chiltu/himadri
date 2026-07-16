@@ -15,10 +15,6 @@ pub use budget::{
 pub use cache::ResponseCachePlugin;
 pub use logger::RequestLoggerPlugin;
 pub use max_token::MaxTokenPlugin;
-pub use rate_limit::{
-    get_request_count, reset_store as reset_rl_store, reset_store_key as reset_rl_store_key,
-    RateLimitConfig, RateLimitPlugin,
-};
 #[cfg(feature = "guardrails")]
 pub use pii_engine::{
     EngineSecrets, PiiEngine, PiiError, RedactCoreEngine, RedactOptions, RedactStrategy,
@@ -27,5 +23,9 @@ pub use pii_engine::{
 pub use pii_guardrail::{
     PiiGuardrailPlugin, PiiGuardrailSettings, PiiMode, PiiResponseGuardrail, PiiResponseMode,
     PiiResponseSettings,
+};
+pub use rate_limit::{
+    get_request_count, reset_store as reset_rl_store, reset_store_key as reset_rl_store_key,
+    RateLimitConfig, RateLimitPlugin,
 };
 pub use word_filter::WordFilterPlugin;

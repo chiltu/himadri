@@ -200,10 +200,7 @@ fn pii_settings(mode: PiiMode) -> PiiGuardrailSettings {
 }
 
 /// Gateway with one capturing target and the PII guardrail in the pipeline.
-fn gateway_with_pii(
-    providers: &[Arc<CapturingProvider>],
-    mode: PiiMode,
-) -> himadri::Gateway {
+fn gateway_with_pii(providers: &[Arc<CapturingProvider>], mode: PiiMode) -> himadri::Gateway {
     let config = Config {
         targets: providers.iter().map(|p| target(p.name())).collect(),
         // Fallback tries targets in order; with one target it behaves like
@@ -267,7 +264,10 @@ async fn block_mode_rejects_before_provider_dispatch() {
     match err {
         GatewayError::BadRequest(reason) => {
             assert!(reason.contains("US_SSN"), "reason: {reason}");
-            assert!(!reason.contains("123-45-6789"), "reason leaks value: {reason}");
+            assert!(
+                !reason.contains("123-45-6789"),
+                "reason leaks value: {reason}"
+            );
         }
         other => panic!("expected BadRequest, got {other:?}"),
     }
@@ -530,7 +530,10 @@ async fn admin_reload_enables_guardrails_live() {
     // Admin enables the global policy via reload.
     let mut enabled = config;
     enabled.guardrails.pii = pii_section(true, PiiModeConfig::Redact);
-    gateway.reload_config(enabled).await.expect("reload applies");
+    gateway
+        .reload_config(enabled)
+        .await
+        .expect("reload applies");
 
     gateway
         .route(request_with_text(PII_PROMPT), None, None)
@@ -590,9 +593,7 @@ async fn deprecated_block_pii_still_blocks_via_shim() {
 
 const PII_RESPONSE: &str = "Sure — reach Jane at jane@corp.org or SSN 123-45-6789.";
 
-fn config_with_response_mode(
-    mode: himadri_core::PiiResponseModeConfig,
-) -> Config {
+fn config_with_response_mode(mode: himadri_core::PiiResponseModeConfig) -> Config {
     let mut config = Config {
         targets: vec![target("cap")],
         ..Default::default()
@@ -643,7 +644,10 @@ async fn response_block_withholds_model_output() {
     match err {
         GatewayError::BadRequest(reason) => {
             assert!(reason.contains("US_SSN"), "reason: {reason}");
-            assert!(!reason.contains("123-45-6789"), "reason leaks value: {reason}");
+            assert!(
+                !reason.contains("123-45-6789"),
+                "reason leaks value: {reason}"
+            );
         }
         other => panic!("expected BadRequest, got {other:?}"),
     }

@@ -1259,9 +1259,14 @@ mod endpoint_provider_validation_tests {
 
         assert!(create(&state, &model_id, "openai", None).await.is_ok());
         assert!(
-            create(&state, &model_id, "my-vllm", Some("https://vllm.example/v1"))
-                .await
-                .is_ok(),
+            create(
+                &state,
+                &model_id,
+                "my-vllm",
+                Some("https://vllm.example/v1")
+            )
+            .await
+            .is_ok(),
             "a custom vendor with an explicit base_url is routable"
         );
     }
@@ -1273,9 +1278,14 @@ mod endpoint_provider_validation_tests {
     #[tokio::test]
     async fn update_rejects_clearing_the_base_url_a_custom_vendor_depends_on() {
         let (state, model_id) = state_with_model().await;
-        let ep = create(&state, &model_id, "my-vllm", Some("https://vllm.example/v1"))
-            .await
-            .expect("custom vendor with base_url should create");
+        let ep = create(
+            &state,
+            &model_id,
+            "my-vllm",
+            Some("https://vllm.example/v1"),
+        )
+        .await
+        .expect("custom vendor with base_url should create");
 
         let err = update_model_endpoint(
             State(state.clone()),
@@ -1298,9 +1308,14 @@ mod endpoint_provider_validation_tests {
     #[tokio::test]
     async fn update_accepts_switching_type_when_the_stored_base_url_still_serves_it() {
         let (state, model_id) = state_with_model().await;
-        let ep = create(&state, &model_id, "openai", Some("https://proxy.example/v1"))
-            .await
-            .expect("openai with a base_url override should create");
+        let ep = create(
+            &state,
+            &model_id,
+            "openai",
+            Some("https://proxy.example/v1"),
+        )
+        .await
+        .expect("openai with a base_url override should create");
 
         let updated = update_model_endpoint(
             State(state.clone()),
@@ -1360,7 +1375,10 @@ mod endpoint_provider_validation_tests {
         // the gateway is still on its config/env targets.
         let (state, _) = state_with_model().await;
         let before = snapshot(&state.gateway.config_handle().read().await.targets);
-        assert!(!before.is_empty(), "default config must supply an env target");
+        assert!(
+            !before.is_empty(),
+            "default config must supply an env target"
+        );
         assert!(
             !state.gateway.db_owns_routing().await,
             "precondition: env/config owns routing"

@@ -87,7 +87,10 @@ impl Gateway {
                 // The admin API rejects these at creation, so reaching this arm
                 // means the row predates that check or was written directly.
                 let base_url = endpoint.base_url.as_deref();
-                let client = match self.provider_registry.build(&endpoint.provider_type, base_url) {
+                let client = match self
+                    .provider_registry
+                    .build(&endpoint.provider_type, base_url)
+                {
                     Ok(client) => client,
                     Err(e) => {
                         warn!(
@@ -241,10 +244,12 @@ mod lock_order_tests {
             _base_url: Option<&str>,
         ) -> Result<Arc<dyn himadri_provider::Provider>, himadri_provider::ProviderError> {
             if provider_type == "stub-ok" {
-                Ok(Arc::new(himadri_provider::OpenAiCompatibleProvider::bearer(
-                    "stub-ok",
-                    "https://stub.example/v1",
-                )))
+                Ok(Arc::new(
+                    himadri_provider::OpenAiCompatibleProvider::bearer(
+                        "stub-ok",
+                        "https://stub.example/v1",
+                    ),
+                ))
             } else {
                 Err(himadri_provider::ProviderError::UnknownType(
                     provider_type.to_string(),
@@ -288,7 +293,10 @@ mod lock_order_tests {
     async fn rebuild_drops_clients_of_endpoints_that_no_longer_route() {
         let gw = Gateway::new(Config::default(), Arc::new(Metrics::new()));
         gw.register_provider(Arc::new(
-            himadri_provider::OpenAiCompatibleProvider::bearer("env-openai", "https://api.example/v1"),
+            himadri_provider::OpenAiCompatibleProvider::bearer(
+                "env-openai",
+                "https://api.example/v1",
+            ),
         ));
 
         let m = model("m1", "x");
@@ -304,7 +312,8 @@ mod lock_order_tests {
         assert!(gw.get_provider("ep2").is_some());
 
         // ep2 is deleted; ep1 survives.
-        gw.rebuild_targets_from_db(&[m], &[ep1], OnEmpty::Apply).await;
+        gw.rebuild_targets_from_db(&[m], &[ep1], OnEmpty::Apply)
+            .await;
 
         assert!(
             gw.get_provider("ep1").is_some(),
@@ -331,7 +340,8 @@ mod lock_order_tests {
 
         let m = model("m1", "nvidia/nemotron:free");
         let ep = endpoint("ep1", "m1", "openrouter", None, 1.0);
-        gw.rebuild_targets_from_db(&[m], &[ep], OnEmpty::Apply).await;
+        gw.rebuild_targets_from_db(&[m], &[ep], OnEmpty::Apply)
+            .await;
 
         // Client is registered under the endpoint id, and the decrypted key was
         // stashed (also keyed by endpoint id) for get_api_key.
@@ -466,7 +476,8 @@ mod lock_order_tests {
         let m = model("m1", "lonely-model");
         let mut disabled = endpoint("e1", "m1", "openai", Some("https://api.openai.com/v1"), 1.0);
         disabled.enabled = false;
-        gw.rebuild_targets_from_db(&[m], &[disabled], OnEmpty::Apply).await;
+        gw.rebuild_targets_from_db(&[m], &[disabled], OnEmpty::Apply)
+            .await;
 
         assert!(gw.targets.read().await.is_empty());
         let req = ChatCompletionRequest {
@@ -526,7 +537,8 @@ mod lock_order_tests {
                     endpoint("e2", "m2", "anthropic", None, 1.0),
                 ];
                 for _ in 0..500 {
-                    gw.rebuild_targets_from_db(&models, &endpoints, OnEmpty::Apply).await;
+                    gw.rebuild_targets_from_db(&models, &endpoints, OnEmpty::Apply)
+                        .await;
                 }
             })
         };
@@ -549,8 +561,12 @@ mod lock_order_tests {
         let m = model("m1", "gpt-4o");
         let ep1 = endpoint("ep1", "m1", "openai", None, 1.0);
         let ep2 = endpoint("ep2", "m1", "openai", None, 1.0);
-        gw.rebuild_targets_from_db(std::slice::from_ref(&m), &[ep1.clone(), ep2], OnEmpty::Apply)
-            .await;
+        gw.rebuild_targets_from_db(
+            std::slice::from_ref(&m),
+            &[ep1.clone(), ep2],
+            OnEmpty::Apply,
+        )
+        .await;
 
         // Simulate accumulated breaker state for both endpoints.
         for id in ["ep1", "ep2"] {
@@ -560,7 +576,8 @@ mod lock_order_tests {
         }
 
         // ep2 is deleted; rebuild with only ep1.
-        gw.rebuild_targets_from_db(&[m], &[ep1], OnEmpty::Apply).await;
+        gw.rebuild_targets_from_db(&[m], &[ep1], OnEmpty::Apply)
+            .await;
 
         let target = Target {
             id: Some("ep1".to_string()),
@@ -600,13 +617,12 @@ mod lock_order_tests {
         let m = model("m1", "x");
         let good = endpoint("ep-good", "m1", "stub-ok", None, 1.0);
         let outcome = gw
-            .rebuild_targets_from_db(
-                std::slice::from_ref(&m),
-                &[good],
-                OnEmpty::KeepPrevious,
-            )
+            .rebuild_targets_from_db(std::slice::from_ref(&m), &[good], OnEmpty::KeepPrevious)
             .await;
-        assert!(outcome.applied, "a nonzero rebuild must apply under KeepPrevious");
+        assert!(
+            outcome.applied,
+            "a nonzero rebuild must apply under KeepPrevious"
+        );
         assert_eq!(outcome.targets_built, 1);
 
         let live_target = Target {
@@ -664,16 +680,19 @@ mod lock_order_tests {
         disabled_model.enabled = false;
 
         for (models, endpoints) in [
-            (vec![m.clone()], vec![disabled_ep]),         // endpoint disabled
-            (vec![disabled_model], vec![ep]),             // model disabled
-            (vec![m], vec![]),                            // no endpoint rows
-            (vec![], vec![]),                             // empty DB
+            (vec![m.clone()], vec![disabled_ep]), // endpoint disabled
+            (vec![disabled_model], vec![ep]),     // model disabled
+            (vec![m], vec![]),                    // no endpoint rows
+            (vec![], vec![]),                     // empty DB
         ] {
             let outcome = gw
                 .rebuild_targets_from_db(&models, &endpoints, OnEmpty::KeepPrevious)
                 .await;
             assert!(!outcome.applied);
-            assert!(outcome.skipped.is_empty(), "disabled rows are filtered, not skipped");
+            assert!(
+                outcome.skipped.is_empty(),
+                "disabled rows are filtered, not skipped"
+            );
             assert_eq!(
                 gw.targets.read().await.len(),
                 config_targets,

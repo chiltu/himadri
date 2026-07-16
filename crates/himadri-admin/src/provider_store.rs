@@ -1,6 +1,11 @@
+use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::crypto::CipherKey;
+use crate::error::AdminError;
+use crate::model_store::{
+    ModelEndpointStore as ModelEndpointStoreTrait, ModelStore as ModelStoreTrait,
+};
 use crate::models::{
     CreateModelEndpointRequest, CreateModelRequest, Model, ModelEndpoint,
     UpdateModelEndpointRequest, UpdateModelRequest,
@@ -15,11 +20,11 @@ impl ModelStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+}
 
-    pub async fn create(&self, request: CreateModelRequest) -> Result<Model, sqlx::Error> {
-        // Models are first-party and route via `model_endpoints`. No provider
-        // validation — a model may start with zero endpoints (inactive) and get
-        // providers attached later.
+#[async_trait]
+impl ModelStoreTrait for ModelStore {
+    async fn create(&self, request: CreateModelRequest) -> Result<Model, AdminError> {
         let model = Model::new(request);
         sqlx::query(
             "INSERT INTO models (id, name, display_name, enabled, created_at, updated_at)
@@ -36,7 +41,7 @@ impl ModelStore {
         Ok(model)
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<Model>, sqlx::Error> {
+    async fn get(&self, id: &str) -> Result<Option<Model>, AdminError> {
         let row = sqlx::query_as::<_, ModelRow>(
             "SELECT id, name, display_name, enabled, created_at, updated_at FROM models WHERE id = ?",
         )
@@ -46,7 +51,7 @@ impl ModelStore {
         Ok(row.map(|r| r.into()))
     }
 
-    pub async fn list(&self) -> Result<Vec<Model>, sqlx::Error> {
+    async fn list(&self) -> Result<Vec<Model>, AdminError> {
         let rows = sqlx::query_as::<_, ModelRow>(
             "SELECT id, name, display_name, enabled, created_at, updated_at FROM models ORDER BY name",
         )
@@ -55,7 +60,7 @@ impl ModelStore {
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
-    pub async fn list_enabled(&self) -> Result<Vec<Model>, sqlx::Error> {
+    async fn list_enabled(&self) -> Result<Vec<Model>, AdminError> {
         let rows = sqlx::query_as::<_, ModelRow>(
             "SELECT id, name, display_name, enabled, created_at, updated_at FROM models WHERE enabled = 1 ORDER BY name",
         )
@@ -64,11 +69,11 @@ impl ModelStore {
         Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
-    pub async fn update(
+    async fn update(
         &self,
         id: &str,
         request: UpdateModelRequest,
-    ) -> Result<Option<Model>, sqlx::Error> {
+    ) -> Result<Option<Model>, AdminError> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
 
         let name = request.name.unwrap_or(current.name);
@@ -89,11 +94,7 @@ impl ModelStore {
         self.get(id).await
     }
 
-    /// Returns [`AdminError`] directly (not `sqlx::Error`) because the
-    /// enabled-model guard is a state conflict, not a store failure — the
-    /// HTTP layer must map it to 409, never 500.
-    pub async fn delete(&self, id: &str) -> Result<bool, crate::error::AdminError> {
-        // Check if model exists and is enabled (active deployment)
+    async fn delete(&self, id: &str) -> Result<bool, AdminError> {
         let model = self.get(id).await?;
         let model = match model {
             Some(m) => m,
@@ -101,14 +102,12 @@ impl ModelStore {
         };
 
         if model.enabled {
-            return Err(crate::error::AdminError::Conflict(format!(
+            return Err(AdminError::Conflict(format!(
                 "Cannot delete model '{}' (id: {}): model is enabled. Disable it first before deletion.",
                 model.name, model.id
             )));
         }
 
-        // model_endpoints has no DB-level FK here (see migration 004), so cascade
-        // the delete in application code to avoid orphaned endpoints.
         sqlx::query("DELETE FROM model_endpoints WHERE model_id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -120,7 +119,7 @@ impl ModelStore {
         Ok(r.rows_affected() > 0)
     }
 
-    pub async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, sqlx::Error> {
+    async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<Model>, AdminError> {
         sqlx::query("UPDATE models SET enabled = ?, updated_at = ? WHERE id = ?")
             .bind(enabled)
             .bind(chrono::Utc::now().to_rfc3339())
@@ -150,21 +149,21 @@ impl ModelEndpointStore {
     fn decrypt_endpoint(&self, endpoint: ModelEndpoint) -> ModelEndpoint {
         crate::crypto::decrypt_endpoint(self.cipher.as_ref(), endpoint)
     }
+}
 
-    pub async fn create(
+#[async_trait]
+impl ModelEndpointStoreTrait for ModelEndpointStore {
+    async fn create(
         &self,
         model_id: &str,
         mut request: CreateModelEndpointRequest,
-    ) -> Result<ModelEndpoint, crate::error::AdminError> {
-        // Validate the parent model exists (no FK on this backend — see
-        // migration 004). A missing parent is "not found" (404), the same
-        // contract as the Postgres store.
+    ) -> Result<ModelEndpoint, AdminError> {
         let model_exists: Option<(String,)> = sqlx::query_as("SELECT id FROM models WHERE id = ?")
             .bind(model_id)
             .fetch_optional(&self.pool)
             .await?;
         if model_exists.is_none() {
-            return Err(crate::error::AdminError::NotFound);
+            return Err(AdminError::NotFound);
         }
 
         let plaintext_key = request.api_key.clone();
@@ -189,7 +188,7 @@ impl ModelEndpointStore {
         Ok(endpoint)
     }
 
-    pub async fn get(&self, id: &str) -> Result<Option<ModelEndpoint>, sqlx::Error> {
+    async fn get(&self, id: &str) -> Result<Option<ModelEndpoint>, AdminError> {
         let row = sqlx::query_as::<_, ModelEndpointRow>(
             "SELECT id, model_id, provider_type, base_url, api_key, weight, enabled, created_at, updated_at FROM model_endpoints WHERE id = ?",
         )
@@ -199,7 +198,7 @@ impl ModelEndpointStore {
         Ok(row.map(|r| self.decrypt_endpoint(r.into())))
     }
 
-    pub async fn list(&self) -> Result<Vec<ModelEndpoint>, sqlx::Error> {
+    async fn list(&self) -> Result<Vec<ModelEndpoint>, AdminError> {
         let rows = sqlx::query_as::<_, ModelEndpointRow>(
             "SELECT id, model_id, provider_type, base_url, api_key, weight, enabled, created_at, updated_at FROM model_endpoints ORDER BY created_at",
         )
@@ -211,7 +210,7 @@ impl ModelEndpointStore {
             .collect())
     }
 
-    pub async fn list_by_model(&self, model_id: &str) -> Result<Vec<ModelEndpoint>, sqlx::Error> {
+    async fn list_by_model(&self, model_id: &str) -> Result<Vec<ModelEndpoint>, AdminError> {
         let rows = sqlx::query_as::<_, ModelEndpointRow>(
             "SELECT id, model_id, provider_type, base_url, api_key, weight, enabled, created_at, updated_at FROM model_endpoints WHERE model_id = ? ORDER BY created_at",
         )
@@ -224,25 +223,18 @@ impl ModelEndpointStore {
             .collect())
     }
 
-    pub async fn update(
+    async fn update(
         &self,
         id: &str,
         request: UpdateModelEndpointRequest,
-    ) -> Result<Option<ModelEndpoint>, sqlx::Error> {
+    ) -> Result<Option<ModelEndpoint>, AdminError> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
 
-        // One definition of the merge, shared with the other backend and with
-        // the admin API's pre-write validation.
         let (provider_type, base_url) = request.effective_routing_pair(&current);
         let weight = request.weight.unwrap_or(current.weight);
         let enabled = request.enabled.unwrap_or(current.enabled);
         let now = chrono::Utc::now().to_rfc3339();
 
-        // `api_key: None` means leave the column alone. Never rewrite from
-        // `current.api_key`: on decrypt failure `get` sets that field to None,
-        // and re-storing it would permanently wipe the ciphertext.
-        // `api_key: Some(x)` is an intentional set (`Some(key)`) or clear
-        // (`None`).
         match request.api_key {
             Some(new_key) => {
                 let stored_api_key = self.encrypt_api_key(new_key);
@@ -277,7 +269,7 @@ impl ModelEndpointStore {
         self.get(id).await
     }
 
-    pub async fn delete(&self, id: &str) -> Result<bool, sqlx::Error> {
+    async fn delete(&self, id: &str) -> Result<bool, AdminError> {
         let r = sqlx::query("DELETE FROM model_endpoints WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -285,11 +277,7 @@ impl ModelEndpointStore {
         Ok(r.rows_affected() > 0)
     }
 
-    pub async fn toggle(
-        &self,
-        id: &str,
-        enabled: bool,
-    ) -> Result<Option<ModelEndpoint>, sqlx::Error> {
+    async fn toggle(&self, id: &str, enabled: bool) -> Result<Option<ModelEndpoint>, AdminError> {
         sqlx::query("UPDATE model_endpoints SET enabled = ?, updated_at = ? WHERE id = ?")
             .bind(enabled)
             .bind(chrono::Utc::now().to_rfc3339())

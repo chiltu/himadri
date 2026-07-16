@@ -102,7 +102,11 @@ impl Plugin for ResponseCachePlugin {
             return Ok(());
         }
 
-        let key = Self::cache_key(&ctx.request, ctx.org_id().as_deref(), ctx.team_id().as_deref());
+        let key = Self::cache_key(
+            &ctx.request,
+            ctx.org_id().as_deref(),
+            ctx.team_id().as_deref(),
+        );
         if let Some(cached) = self.cache.get(&key).await {
             ctx.set_metadata("cached".to_string(), serde_json::Value::Bool(true));
             ctx.set_metadata(
@@ -160,10 +164,7 @@ mod tests {
 
         cache.insert(key.clone(), response("hi there")).await;
 
-        let hit = cache
-            .get(&key)
-            .await
-            .expect("warm cache should hit");
+        let hit = cache.get(&key).await.expect("warm cache should hit");
         assert_eq!(hit.choices[0].message.content.as_deref(), Some("hi there"));
     }
 
@@ -234,22 +235,14 @@ mod tests {
         cache.insert(key_second.clone(), response("B")).await;
 
         assert_eq!(
-            cache
-                .get(&key_first)
-                .await
-                .unwrap()
-                .choices[0]
+            cache.get(&key_first).await.unwrap().choices[0]
                 .message
                 .content
                 .as_deref(),
             Some("A")
         );
         assert_eq!(
-            cache
-                .get(&key_second)
-                .await
-                .unwrap()
-                .choices[0]
+            cache.get(&key_second).await.unwrap().choices[0]
                 .message
                 .content
                 .as_deref(),

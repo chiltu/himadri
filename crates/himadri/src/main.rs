@@ -281,10 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// about provider env config that isn't feeding routing. One line every boot,
 /// so "which mode am I in" always has a visible answer instead of being
 /// inferred from side effects.
-fn log_provider_routing_mode(
-    source: himadri::wire::mode::ProviderSource,
-    db_routing_active: bool,
-) {
+fn log_provider_routing_mode(source: himadri::wire::mode::ProviderSource, db_routing_active: bool) {
     use himadri::wire::mode::{inert_provider_env_vars_from_env, ProviderSource};
 
     match source {
@@ -374,7 +371,6 @@ async fn build_gateway(
         }
     }
 
-
     gateway
 }
 
@@ -444,8 +440,6 @@ fn register_providers_from_env(gateway: &Gateway) {
         gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(config)));
     }
 }
-
-
 
 /// Connect the API-key store and admin handlers (with provider/model stores
 /// when DATABASE_URL is set), plus the master-key auth middleware.

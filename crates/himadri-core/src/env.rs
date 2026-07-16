@@ -48,13 +48,19 @@ mod tests {
     fn flag_truthiness_accepts_one_true_yes_only() {
         for truthy in ["1", "true", "TRUE", " Yes ", "yes"] {
             assert!(
-                matches!(truthy.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+                matches!(
+                    truthy.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                ),
                 "{truthy} should be truthy"
             );
         }
         for falsy in ["0", "false", "no", "", "2", "on"] {
             assert!(
-                !matches!(falsy.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+                !matches!(
+                    falsy.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes"
+                ),
                 "{falsy} should not be truthy"
             );
         }

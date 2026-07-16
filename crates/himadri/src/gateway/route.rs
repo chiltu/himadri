@@ -11,15 +11,13 @@ use himadri_circuitbreaker::{CircuitBreaker, CircuitBreakerConfig};
 use himadri_core::{
     AuthContext, ChatCompletionRequest, ChatCompletionResponse, GatewayError, Target,
 };
+use himadri_observability::AuditStatus;
 use himadri_plugin::traits::ResponseAction;
 use himadri_provider::traits::Provider;
 
 use crate::strategy::Strategy;
 
-use super::audit::{
-    extract_response_text, record_request_outcome, redact_response_text, AuditContext,
-    RequestOutcome,
-};
+use super::audit::{audit_messages, extract_response_text, redact_response_text, RequestEvent};
 use super::{routing_key, target_serves_model, Gateway};
 
 /// Why a failover attempt produced no result. Infrastructure failures are
@@ -284,23 +282,30 @@ impl Gateway {
         remote_ip: Option<String>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         // Guards + before-request plugins (shared with route_stream).
-        let mut ctx = match self.prepare_request(&request, auth, remote_ip.clone()).await {
+        let mut ctx = match self
+            .prepare_request(&request, auth, remote_ip.clone())
+            .await
+        {
             Ok(ctx) => ctx,
             Err(e) => {
-                // Audit the rejection before returning. Create a minimal context for the audit entry.
-                let mut audit_ctx = himadri_plugin::PluginContext::from_request(&request, auth);
-                audit_ctx.remote_ip = remote_ip;
-                self.log_audit(&AuditContext {
-                    request: &request,
-                    auth,
-                    ctx: &audit_ctx,
-                    result: &Err(himadri_provider::ProviderError::Internal(
-                        "Request rejected by guardrail".to_string(),
-                    )),
+                let audit_ctx = himadri_plugin::PluginContext::from_request(&request, auth);
+                self.request_auditor.record_full(RequestEvent {
+                    auth: auth.cloned(),
+                    request_id: audit_ctx.request_id.clone(),
+                    provider: String::new(),
+                    model: request.model.clone(),
+                    messages: audit_messages(&request),
+                    response_text: None,
                     latency_ms: 0,
-                    guardrail_actions: &["reject".to_string()],
-                })
-                .await;
+                    tokens_prompt: 0,
+                    tokens_completion: 0,
+                    tokens_total: 0,
+                    status: AuditStatus::Error,
+                    error: Some(e.to_string()),
+                    guardrail_actions: vec!["reject".to_string()],
+                    stream: request.stream,
+                    api_key_id: auth.and_then(|a| a.key_id.clone()),
+                });
                 return Err(e);
             }
         };
@@ -409,19 +414,24 @@ impl Gateway {
                     Ok(ResponseAction::Reject(reason)) => {
                         guardrail_actions.push(format!("reject: {}", reason));
                         warn!("Response guardrail rejected: {}", reason);
-                        let err_result = Err(himadri_provider::ProviderError::Internal(format!(
-                            "Guardrail rejected: {}",
-                            reason
-                        )));
-                        self.log_audit(&AuditContext {
-                            request: &request,
-                            auth,
-                            ctx: &ctx,
-                            result: &err_result,
+                        let err_msg = format!("Guardrail rejected: {}", reason);
+                        self.request_auditor.record_full(RequestEvent {
+                            auth: auth.cloned(),
+                            request_id: ctx.request_id.clone(),
+                            provider: target.provider.clone(),
+                            model: request.model.clone(),
+                            messages: audit_messages(&request),
+                            response_text: None,
                             latency_ms,
-                            guardrail_actions: &guardrail_actions,
-                        })
-                        .await;
+                            tokens_prompt: 0,
+                            tokens_completion: 0,
+                            tokens_total: 0,
+                            status: AuditStatus::Error,
+                            error: Some(err_msg.clone()),
+                            guardrail_actions: guardrail_actions.clone(),
+                            stream: request.stream,
+                            api_key_id: auth.and_then(|a| a.key_id.clone()),
+                        });
                         return Err(GatewayError::BadRequest(format!(
                             "Response blocked by guardrail: {}",
                             reason
@@ -432,16 +442,28 @@ impl Gateway {
                         warn!("Response guardrail redacted content");
                         let mut redacted_response = response.clone();
                         redact_response_text(&mut redacted_response, &redacted);
-                        let redacted_result = Ok(redacted_response.clone());
-                        self.log_audit(&AuditContext {
-                            request: &request,
-                            auth,
-                            ctx: &ctx,
-                            result: &redacted_result,
+                        let (prompt, completion, total) = response
+                            .usage
+                            .as_ref()
+                            .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens))
+                            .unwrap_or((0, 0, 0));
+                        self.request_auditor.record_full(RequestEvent {
+                            auth: auth.cloned(),
+                            request_id: ctx.request_id.clone(),
+                            provider: target.provider.clone(),
+                            model: request.model.clone(),
+                            messages: audit_messages(&request),
+                            response_text: extract_response_text(&redacted_response),
                             latency_ms,
-                            guardrail_actions: &guardrail_actions,
-                        })
-                        .await;
+                            tokens_prompt: prompt,
+                            tokens_completion: completion,
+                            tokens_total: total,
+                            status: AuditStatus::Success,
+                            error: None,
+                            guardrail_actions: guardrail_actions.clone(),
+                            stream: request.stream,
+                            api_key_id: auth.and_then(|a| a.key_id.clone()),
+                        });
                         return Ok(redacted_response);
                     }
                     Err(e) => {
@@ -452,27 +474,47 @@ impl Gateway {
             }
         }
 
-        self.log_audit(&AuditContext {
-            request: &request,
-            auth,
-            ctx: &ctx,
-            result: &result,
+        let (status, response_text, prompt, completion, total, error) = match &result {
+            Ok(response) => {
+                let (p, c, t) = response
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens))
+                    .unwrap_or((0, 0, 0));
+                (
+                    AuditStatus::Success,
+                    extract_response_text(response),
+                    p,
+                    c,
+                    t,
+                    None,
+                )
+            }
+            Err(e) => (
+                AuditStatus::Error,
+                None,
+                0,
+                0,
+                0,
+                Some(e.to_string()),
+            ),
+        };
+        self.request_auditor.record_full(RequestEvent {
+            auth: auth.cloned(),
+            request_id: ctx.request_id.clone(),
+            provider: target.provider.clone(),
+            model: request.model.clone(),
+            messages: audit_messages(&request),
+            response_text,
             latency_ms,
-            guardrail_actions: &guardrail_actions,
-        })
-        .await;
-
-        // Metrics + usage + request log, shared with the streaming path.
-        record_request_outcome(&RequestOutcome {
-            metrics: &self.metrics,
-            usage_store: &self.usage_store,
-            request_log: self.request_log.as_ref(),
-            provider: &target.provider,
-            model: &request.model,
-            api_key_id: auth.and_then(|a| a.key_id.as_deref()),
-            usage: result.as_ref().ok().and_then(|r| r.usage.clone()),
-            error: result.as_ref().err().map(|e| e.to_string()),
-            latency_ms,
+            tokens_prompt: prompt,
+            tokens_completion: completion,
+            tokens_total: total,
+            status,
+            error,
+            guardrail_actions,
+            stream: request.stream,
+            api_key_id: auth.and_then(|a| a.key_id.clone()),
         });
 
         // Populate the response cache on a successful, non-streaming completion.

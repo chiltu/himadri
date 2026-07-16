@@ -10,12 +10,12 @@ use futures::{Stream, StreamExt};
 use tracing::{instrument, warn};
 
 use himadri_core::{AuthContext, ChatCompletionRequest, GatewayError, StreamChunk};
-use himadri_observability::{AuditEvent, AuditStatus, Metrics};
+use himadri_observability::{AuditEvent, AuditStatus};
 use himadri_plugin::traits::ResponseAction;
 use himadri_plugin::PluginManager;
 use himadri_provider::traits::BoxStream;
 
-use super::audit::{audit_messages, record_request_outcome, RequestOutcome};
+use super::audit::{audit_messages, AccountOutcome, RequestAuditor};
 use super::route::AttemptError;
 use super::Gateway;
 
@@ -94,9 +94,7 @@ impl Gateway {
         // recorder fires at stream end (or client disconnect, via Drop),
         // covering the usage/metrics recording that `route` does inline.
         let recorder = StreamUsageRecorder {
-            metrics: self.metrics.clone(),
-            usage_store: self.usage_store.clone(),
-            request_log: self.request_log.clone(),
+            auditor: self.request_auditor.clone(),
             provider: target.provider.clone(),
             model: request.model.clone(),
             api_key_id: auth.and_then(|a| a.key_id.clone()),
@@ -126,9 +124,7 @@ impl Gateway {
 /// usage, Anthropic `message_delta`). Recording happens once, at stream end
 /// or — via `Drop` — when the client disconnects mid-stream.
 struct StreamUsageRecorder {
-    metrics: Arc<Metrics>,
-    usage_store: Arc<himadri_admin::UsageStore>,
-    request_log: Arc<dyn himadri_admin::RequestLogStore>,
+    auditor: Arc<dyn RequestAuditor>,
     provider: String,
     model: String,
     api_key_id: Option<String>,
@@ -155,13 +151,10 @@ impl StreamUsageRecorder {
         }
         self.recorded = true;
 
-        record_request_outcome(&RequestOutcome {
-            metrics: &self.metrics,
-            usage_store: &self.usage_store,
-            request_log: self.request_log.as_ref(),
-            provider: &self.provider,
-            model: &self.model,
-            api_key_id: self.api_key_id.as_deref(),
+        self.auditor.record_accounting(AccountOutcome {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            api_key_id: self.api_key_id.clone(),
             usage: self.usage.clone(),
             error: self.error.clone(),
             latency_ms: self.started.elapsed().as_millis() as u64,
@@ -274,7 +267,6 @@ where
 mod stream_usage_tests {
     use super::*;
     use futures::stream;
-    use himadri_observability::Metrics;
 
     fn chunk(content: &str, usage: Option<himadri_core::Usage>) -> StreamChunk {
         StreamChunk {
@@ -296,14 +288,25 @@ mod stream_usage_tests {
         }
     }
 
+    fn auditor(
+        usage_store: &Arc<himadri_admin::UsageStore>,
+        request_log: &Arc<himadri_admin::InMemoryRequestLogStore>,
+    ) -> Arc<dyn RequestAuditor> {
+        use himadri_observability::AuditLog;
+        Arc::new(super::super::audit::LiveRequestAuditor {
+            audit_log: Arc::new(AuditLog::new(None, false)),
+            metrics: Arc::new(himadri_observability::Metrics::new()),
+            usage_store: usage_store.clone(),
+            request_log: request_log.clone() as Arc<dyn himadri_admin::RequestLogStore>,
+        })
+    }
+
     fn recorder(
         usage_store: &Arc<himadri_admin::UsageStore>,
         request_log: &Arc<himadri_admin::InMemoryRequestLogStore>,
     ) -> StreamUsageRecorder {
         StreamUsageRecorder {
-            metrics: Arc::new(Metrics::new()),
-            usage_store: usage_store.clone(),
-            request_log: request_log.clone() as Arc<dyn himadri_admin::RequestLogStore>,
+            auditor: auditor(usage_store, request_log),
             provider: "openai".to_string(),
             model: "gpt-4o".to_string(),
             api_key_id: Some("key-1".to_string()),

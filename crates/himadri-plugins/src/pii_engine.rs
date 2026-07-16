@@ -112,7 +112,11 @@ const SECRET_PATTERNS: &[(&str, &str, f32)] = &[
     // OpenAI-style secrets — including this gateway's own `sk-…` keys — are
     // the most likely credential to appear in prompts.
     ("GW_API_KEY", r"sk-[a-zA-Z0-9_-]{16,}", 0.9),
-    ("GW_BEARER_TOKEN", r"(?i)bearer\s+[a-zA-Z0-9._~+/=-]{16,}", 0.9),
+    (
+        "GW_BEARER_TOKEN",
+        r"(?i)bearer\s+[a-zA-Z0-9._~+/=-]{16,}",
+        0.9,
+    ),
 ];
 
 /// Secrets used by the hash/encrypt strategies. Sourced from env at wiring
@@ -244,7 +248,9 @@ impl PiiEngine for RedactCoreEngine {
 
         let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
         for e in &entities {
-            *counts.entry(e.entity_type.as_str().to_string()).or_insert(0) += 1;
+            *counts
+                .entry(e.entity_type.as_str().to_string())
+                .or_insert(0) += 1;
         }
 
         let config = self.anonymizer_config(opts)?;
@@ -319,7 +325,11 @@ mod tests {
                 &RedactOptions::default(),
             )
             .unwrap();
-        assert!(!out.text.contains("sk-abcdefghij0123456789"), "{}", out.text);
+        assert!(
+            !out.text.contains("sk-abcdefghij0123456789"),
+            "{}",
+            out.text
+        );
         assert!(!out.text.contains("AKIAIOSFODNN7EXAMPLE"), "{}", out.text);
         let types: Vec<&str> = out.replaced.iter().map(|(t, _)| t.as_str()).collect();
         assert!(types.contains(&"GW_API_KEY"), "{:?}", types);

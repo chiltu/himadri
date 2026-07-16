@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod error;
 pub mod handlers;
 pub mod middleware;
+pub mod model_store;
 pub mod models;
 pub mod provider_backend;
 pub mod request_log;
