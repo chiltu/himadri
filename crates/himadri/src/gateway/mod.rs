@@ -11,17 +11,20 @@
 //!   streaming and non-streaming paths
 //! - [`config`] — config apply/reload/rollback and version history
 //! - [`rebuild`] — rebuilding routing targets from DB models/endpoints
-//! - [`providers`] — the provider-client factory for DB endpoints
 //! - [`proxy`] — the catch-all `/v1/*` passthrough proxy
+//!
+//! Provider clients for DB endpoints are built by the injected
+//! [`ProviderRegistry`]; see [`crate::wire::providers`] for what gets registered.
 
 mod audit;
 mod config;
 mod policy;
-mod providers;
 mod proxy;
 mod rebuild;
 mod route;
 mod stream;
+
+pub use rebuild::{OnEmpty, RebuildOutcome, SkippedEndpoint};
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -32,6 +35,7 @@ use himadri_core::{Config, GatewayError, Target};
 use himadri_observability::{AuditLog, Metrics};
 use himadri_plugin::PluginManager;
 use himadri_provider::traits::Provider;
+use himadri_provider::ProviderRegistry;
 use himadri_ratelimit::RateLimiter;
 
 use crate::strategy::Strategy;
@@ -68,6 +72,10 @@ pub struct Gateway {
     /// admin reloads apply to them without re-wiring.
     config: Arc<RwLock<Config>>,
     providers: DashMap<String, Arc<dyn Provider>>,
+    /// Builds a provider client from an endpoint's `provider_type`/`base_url`.
+    /// Also answers whether a type is routable at all, which the admin API asks
+    /// before persisting an endpoint.
+    provider_registry: Arc<dyn ProviderRegistry>,
     plugin_manager: Arc<PluginManager>,
     strategy: RwLock<Strategy>,
     circuit_breakers: DashMap<String, Arc<dyn CircuitBreakerTrait>>,
@@ -115,6 +123,7 @@ impl Gateway {
         Self {
             config: Arc::new(RwLock::new(config.clone())),
             providers: DashMap::new(),
+            provider_registry: crate::wire::build_provider_registry(),
             plugin_manager,
             strategy: RwLock::new(strategy),
             circuit_breakers: DashMap::new(),
@@ -134,6 +143,30 @@ impl Gateway {
     /// are served from cache on a hit and populated on a successful miss.
     pub fn set_response_cache(&mut self, cache: Arc<himadri_plugins::ResponseCachePlugin>) {
         self.response_cache = Some(cache);
+    }
+
+    /// Replace the provider registry. Defaults to every provider registered by
+    /// [`crate::wire::build_provider_registry`]; tests use this to inject a stub
+    /// that builds without reaching for real vendor presets.
+    pub fn set_provider_registry(&mut self, registry: Arc<dyn ProviderRegistry>) {
+        self.provider_registry = registry;
+    }
+
+    /// The provider registry, for callers that need to validate a
+    /// `provider_type`/`base_url` pair before persisting it.
+    pub fn provider_registry(&self) -> &Arc<dyn ProviderRegistry> {
+        &self.provider_registry
+    }
+
+    /// Whether the live routing targets came from the database.
+    ///
+    /// Every DB-derived target carries its endpoint id; env/config targets
+    /// never do — the same distinction [`routing_key`] uses to key clients,
+    /// breakers and API keys. This is what makes an *empty* rebuild
+    /// interpretable: only the side that currently owns routing can
+    /// legitimately empty it (see [`OnEmpty`]).
+    pub async fn db_owns_routing(&self) -> bool {
+        self.targets.read().await.iter().any(|t| t.id.is_some())
     }
 
     /// Replace the request-log store. Defaults to an in-memory store (lost on

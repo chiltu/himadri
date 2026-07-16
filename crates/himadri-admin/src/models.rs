@@ -82,6 +82,27 @@ pub struct UpdateModelEndpointRequest {
     pub enabled: Option<bool>,
 }
 
+impl UpdateModelEndpointRequest {
+    /// The `(provider_type, base_url)` pair this update produces against
+    /// `current` — the one definition of the merge.
+    ///
+    /// Both store backends persist this pair and the admin API validates it
+    /// before the write, so all three must agree on the `Option<Option<_>>`
+    /// semantics (`None` leaves the field alone, `Some(None)` clears it). When
+    /// each derived the merge itself, a change to one silently validated a
+    /// different pair than the one written.
+    pub fn effective_routing_pair(&self, current: &ModelEndpoint) -> (String, Option<String>) {
+        (
+            self.provider_type
+                .clone()
+                .unwrap_or_else(|| current.provider_type.clone()),
+            self.base_url
+                .clone()
+                .unwrap_or_else(|| current.base_url.clone()),
+        )
+    }
+}
+
 impl Model {
     pub fn new(request: CreateModelRequest) -> Self {
         Self {
@@ -108,5 +129,70 @@ impl ModelEndpoint {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn endpoint(provider_type: &str, base_url: Option<&str>) -> ModelEndpoint {
+        ModelEndpoint {
+            id: "ep".to_string(),
+            model_id: "m".to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_key: None,
+            weight: 1.0,
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The `Option<Option<_>>` semantics both backends persist and the admin
+    /// API validates against: `None` leaves a field alone, `Some(None)` clears
+    /// it, `Some(Some(v))` sets it.
+    #[test]
+    fn merge_distinguishes_unchanged_from_cleared() {
+        let current = endpoint("openai", Some("https://stored/v1"));
+
+        let untouched = UpdateModelEndpointRequest::default();
+        assert_eq!(
+            untouched.effective_routing_pair(&current),
+            ("openai".to_string(), Some("https://stored/v1".to_string())),
+            "an empty update must reproduce the stored pair"
+        );
+
+        let cleared = UpdateModelEndpointRequest {
+            base_url: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(
+            cleared.effective_routing_pair(&current),
+            ("openai".to_string(), None),
+            "Some(None) must clear the base_url"
+        );
+
+        let switched = UpdateModelEndpointRequest {
+            provider_type: Some("my-vllm".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            switched.effective_routing_pair(&current),
+            ("my-vllm".to_string(), Some("https://stored/v1".to_string())),
+            "changing the type must keep the stored base_url"
+        );
+
+        let both = UpdateModelEndpointRequest {
+            provider_type: Some("groq".to_string()),
+            base_url: Some(Some("https://new/v1".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(
+            both.effective_routing_pair(&current),
+            ("groq".to_string(), Some("https://new/v1".to_string()))
+        );
     }
 }

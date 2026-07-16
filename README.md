@@ -36,16 +36,16 @@ in [`web/`](web/).
   non-streaming), `POST /v1/completions`, `POST /v1/embeddings`,
   `GET /v1/models` — drop-in for OpenAI SDKs and tools.
 - **Tool calling** (`tools` / `tool_choice`) forwarded and translated for all
-  providers, including Anthropic, Gemini, and Bedrock native schemas;
+  providers, including the Anthropic and Gemini native schemas;
   `tool_calls` are surfaced in both regular and streamed responses.
 - Transparent `* /v1/*` passthrough proxy (behind the same auth, body capped
   at 10 MiB) for provider endpoints himadri doesn't model explicitly.
 
 **Providers**
 
-- OpenAI, Anthropic, Gemini, Azure OpenAI, AWS Bedrock, OpenRouter,
-  Together AI, Groq, Fireworks AI, DeepInfra, Cerebras, Novita AI — plus any
-  other OpenAI-compatible endpoint via a custom `base_url`.
+- OpenAI, Anthropic, Gemini, Azure OpenAI, OpenRouter, Together AI, Groq,
+  Fireworks AI, DeepInfra, Cerebras, Novita AI — plus any other
+  OpenAI-compatible endpoint via a custom `base_url`.
 - Providers are enabled simply by setting their API-key environment variables,
   or registered dynamically at runtime through the admin API (with optional
   AES-256-GCM encryption of stored keys).
@@ -170,14 +170,14 @@ before startup, exit non-zero on failure), `--help`.
 
 ## Providers
 
-Set a provider's key env var and it is registered at startup:
+OpenAI, Anthropic and Gemini are always registered. Every other provider is
+registered at startup when its env var(s) are set:
 
 | Env var(s) | Provider |
 |---|---|
 | `OPENAI_API_KEY` (+ `OPENAI_BASE_URL`, `OPENAI_SECONDARY_BASE_URL`) | OpenAI |
-| _(always registered)_ | Anthropic (`ANTHROPIC_API_KEY`), Gemini (`GEMINI_API_KEY`) |
+| _(always registered)_ | Anthropic, Gemini |
 | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT` | Azure OpenAI |
-| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | AWS Bedrock (Bearer-token frontends; no native SigV4) |
 | `OPENROUTER_API_KEY` | OpenRouter |
 | `TOGETHER_API_KEY` | Together AI |
 | `GROQ_API_KEY` | Groq |
@@ -186,11 +186,13 @@ Set a provider's key env var and it is registered at startup:
 | `CEREBRAS_API_KEY` | Cerebras |
 | `NOVITA_API_KEY` | Novita AI |
 
-Providers can also be created at runtime via `POST /admin/providers` (stored
-in the database, optionally encrypted at rest, and routable immediately —
-including after restarts). Provider base URLs set through the admin API are
-validated by an SSRF guard (no loopback/private/metadata hosts unless
-`ALLOW_PRIVATE_PROVIDER_URLS=1`).
+Providers can also be added at runtime as model endpoints via
+`POST /admin/models/{id}/endpoints` (stored in the database, optionally
+encrypted at rest, and routable immediately — including after restarts). Base
+URLs set through the admin API are validated by an SSRF guard (no
+loopback/private/metadata hosts unless `ALLOW_PRIVATE_PROVIDER_URLS=1`), and an
+endpoint whose `provider_type` the gateway cannot build a client for is rejected
+at creation. `GET /admin/known-providers` lists the built-in types.
 
 See [Providers in the configuration guide](docs/configuration.md#providers).
 

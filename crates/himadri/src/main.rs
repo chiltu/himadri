@@ -18,16 +18,13 @@ use tracing::info;
 use himadri_admin::{AdminHandlers, AuthMiddleware, StoreBackend};
 use himadri_core::{AuthContext, AuthScope, Config};
 use himadri_observability::Metrics;
-use himadri_plugins::{
-    BudgetConfig, BudgetPlugin, MaxTokenPlugin, RateLimitConfig, RateLimitPlugin,
-    RequestLoggerPlugin, ResponseCachePlugin, WordFilterPlugin,
-};
 use himadri_provider::{
     AnthropicProvider, GeminiProvider, OpenAiCompatibleConfig, OpenAiCompatibleProvider,
 };
 
 use handlers::{AppState, *};
-use himadri::gateway::Gateway;
+use himadri::gateway::{Gateway, OnEmpty};
+use himadri::wire::providers::non_preset_env;
 
 /// Command-line options. Parsed by hand to avoid an argument-parser
 /// dependency for two flags.
@@ -72,19 +69,13 @@ fn parse_cli_args() -> CliArgs {
 /// Set `REQUIRE_AUTH=1` explicitly, or deploy with `RUST_ENV`/`HIMADRI_ENV`
 /// of `production` / `prod` / `staging`.
 fn auth_is_required() -> bool {
-    env_flag_truthy("REQUIRE_AUTH")
+    himadri_core::env::flag_is_truthy("REQUIRE_AUTH")
         || env_is_nondev_deployment(
             std::env::var("RUST_ENV")
                 .or_else(|_| std::env::var("HIMADRI_ENV"))
                 .ok()
                 .as_deref(),
         )
-}
-
-fn env_flag_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
 }
 
 fn env_is_nondev_deployment(value: Option<&str>) -> bool {
@@ -135,6 +126,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Provider-routing source (HIMADRI_PROVIDER_SOURCE). Fail fast on a value
+    // we don't recognize — a typo must not silently mean "auto" — and on
+    // strict db-source without a database to source from.
+    let provider_source = match himadri::wire::mode::ProviderSource::from_env() {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    };
+    if provider_source == himadri::wire::mode::ProviderSource::Db
+        && std::env::var("DATABASE_URL").is_err()
+    {
+        eprintln!(
+            "FATAL: {}=db requires DATABASE_URL — there is no database to route from.",
+            himadri::wire::mode::PROVIDER_SOURCE_VAR
+        );
+        std::process::exit(1);
+    }
+
     himadri_observability::init_tracing(
         &config.observability.tracing.service_name,
         config.observability.tracing.endpoint.as_deref(),
@@ -162,33 +173,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let gateway = Arc::new(build_gateway(&config).await);
+    let gateway = Arc::new(build_gateway(&config, provider_source).await);
     let (admin, auth) = build_admin(&config).await;
+
+    // Strict db routing is only honored if the database can actually supply
+    // it. `DATABASE_URL` being *set* is not enough: on a bad URL or an
+    // unreachable server the model stores fail to connect and reads simply
+    // return empty, which under strict mode — where no env providers are
+    // registered — would boot a gateway that can never route and whose admin
+    // writes vanish on restart.
+    if provider_source == himadri::wire::mode::ProviderSource::Db && !admin.has_model_stores() {
+        eprintln!(
+            "FATAL: {}=db requires a working database, but the model/endpoint stores \
+             could not be connected — check DATABASE_URL and that the server is reachable. \
+             Refusing to start: strict mode registers no env providers, so nothing could route.",
+            himadri::wire::mode::PROVIDER_SOURCE_VAR
+        );
+        std::process::exit(1);
+    }
 
     // Sync routing targets from DB-registered models/endpoints, so they are
     // active immediately after a restart (previously they stayed inactive
     // until the first model/endpoint mutation triggered a rebuild). A DB
-    // with no *active* targets (no rows, or only disabled ones) — or one
-    // that can't be read right now — leaves the env/file-configured targets
-    // untouched instead of wiping them.
-    match (admin.list_models().await, admin.list_endpoints().await) {
-        (Ok(db_models), Ok(db_endpoints))
-            if Gateway::db_has_active_targets(&db_models, &db_endpoints) =>
-        {
-            gateway
-                .rebuild_targets_from_db(&db_models, &db_endpoints)
+    // that produces no targets — no rows, only disabled ones, or only rows
+    // the provider registry can't build — or one that can't be read right
+    // now, leaves the env/file-configured targets untouched instead of
+    // wiping them (`OnEmpty::KeepPrevious`).
+    let db_routing_active = match (admin.list_models().await, admin.list_endpoints().await) {
+        (Ok(db_models), Ok(db_endpoints)) => {
+            let outcome = gateway
+                .rebuild_targets_from_db(&db_models, &db_endpoints, OnEmpty::KeepPrevious)
                 .await;
-            info!(
-                "Loaded {} model(s) and {} endpoint(s) from database into routing targets",
-                db_models.len(),
-                db_endpoints.len()
-            );
+            if outcome.applied {
+                info!(
+                    "Loaded {} routing target(s) from database ({} endpoint(s) skipped)",
+                    outcome.targets_built,
+                    outcome.skipped.len()
+                );
+            } else if !outcome.skipped.is_empty() {
+                // Enabled rows exist but none routes: keeping env/file targets
+                // instead of wiping routing. Each skip was warned individually
+                // by the rebuild; summarize the decision here.
+                tracing::warn!(
+                    "DB produced no routing targets ({} endpoint(s) unbuildable); keeping env/file-configured targets",
+                    outcome.skipped.len()
+                );
+            }
+            outcome.applied
         }
-        (Ok(_), Ok(_)) => {}
         (Err(e), _) | (_, Err(e)) => {
             tracing::warn!("skipping DB target sync at startup (stores unavailable): {e}");
+            false
         }
-    }
+    };
+    log_provider_routing_mode(provider_source, db_routing_active);
 
     // JWT/OIDC (when JWT_ISSUER is set) runs alongside API-key auth.
     let jwt_discovery = init_jwt_discovery().await;
@@ -239,14 +277,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Announce which source is providing routing targets this boot, and warn
+/// about provider env config that isn't feeding routing. One line every boot,
+/// so "which mode am I in" always has a visible answer instead of being
+/// inferred from side effects.
+fn log_provider_routing_mode(
+    source: himadri::wire::mode::ProviderSource,
+    db_routing_active: bool,
+) {
+    use himadri::wire::mode::{inert_provider_env_vars_from_env, ProviderSource};
+
+    match source {
+        ProviderSource::Db => {
+            info!("Provider routing: database (strict)");
+            if !db_routing_active {
+                tracing::warn!(
+                    "strict database routing has no targets yet; nothing will route \
+                     until models/endpoints are configured via the admin API"
+                );
+            }
+            let inert = inert_provider_env_vars_from_env();
+            if !inert.is_empty() {
+                tracing::warn!(
+                    "provider env vars are ignored under {}=db: {}",
+                    himadri::wire::mode::PROVIDER_SOURCE_VAR,
+                    inert.join(", ")
+                );
+            }
+        }
+        ProviderSource::Auto if db_routing_active => {
+            info!("Provider routing: database");
+            let inert = inert_provider_env_vars_from_env();
+            if !inert.is_empty() {
+                tracing::warn!(
+                    "provider env vars set but not used for routing while the database \
+                     provides targets (they remain the routing fallback if it stops): {}",
+                    inert.join(", ")
+                );
+            }
+        }
+        ProviderSource::Auto => {
+            if std::env::var("DATABASE_URL").is_ok() {
+                info!(
+                    "Provider routing: environment/config (database routing configured \
+                     but has no targets yet)"
+                );
+            } else {
+                info!("Provider routing: environment/config");
+            }
+        }
+    }
+}
+
 /// Build the gateway core: register env-configured providers, wire the
 /// plugin pipeline, and attach the request-log store and response cache.
-async fn build_gateway(config: &Config) -> Gateway {
+async fn build_gateway(
+    config: &Config,
+    provider_source: himadri::wire::mode::ProviderSource,
+) -> Gateway {
     let metrics = Arc::new(Metrics::new());
     let mut gateway = Gateway::new(config.clone(), metrics.clone());
-    register_providers_from_env(&gateway);
-    let plugins = wire_plugins(config, gateway.config_handle(), &metrics);
-    gateway.set_plugin_manager(plugins);
+    // Strict db-source deployments must never route with env-configured
+    // providers, so their clients are never registered at all.
+    if provider_source == himadri::wire::mode::ProviderSource::Auto {
+        register_providers_from_env(&gateway);
+    }
+    let wired = himadri::wire::plugins::build(
+        himadri::wire::plugins::PluginSettings::from_env(),
+        config,
+        gateway.config_handle(),
+        &metrics,
+    );
+    gateway.set_plugin_manager(wired.manager);
+    if let Some(cache) = wired.response_cache {
+        gateway.set_response_cache(cache);
+    }
 
     // Persist request logs to Postgres when configured; otherwise they remain
     // in-memory and are lost on restart.
@@ -269,21 +374,6 @@ async fn build_gateway(config: &Config) -> Gateway {
         }
     }
 
-    // Enable response caching if configured (CACHE_TTL_SECS, optional CACHE_MAX_ENTRIES).
-    if let Ok(ttl_secs) = std::env::var("CACHE_TTL_SECS") {
-        if let Ok(ttl) = ttl_secs.parse::<u64>() {
-            let max_entries = std::env::var("CACHE_MAX_ENTRIES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(10_000);
-            let cache = ResponseCachePlugin::new(max_entries, std::time::Duration::from_secs(ttl));
-            gateway.set_response_cache(cache);
-            info!(
-                "Registered response cache ({}s TTL, {} max entries)",
-                ttl, max_entries
-            );
-        }
-    }
 
     gateway
 }
@@ -294,7 +384,7 @@ async fn build_gateway(config: &Config) -> Gateway {
 fn register_providers_from_env(gateway: &Gateway) {
     // Register OpenAI (default, supports custom base URL via OPENAI_BASE_URL)
     let mut openai_config = OpenAiCompatibleConfig::openai();
-    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+    if let Ok(base_url) = std::env::var(non_preset_env::OPENAI_BASE_URL) {
         openai_config.base_url = base_url;
         info!("OpenAI base URL overridden: {}", openai_config.base_url);
     }
@@ -302,7 +392,7 @@ fn register_providers_from_env(gateway: &Gateway) {
 
     // Register a secondary OpenAI-compatible upstream (for multi-endpoint /
     // failover setups). Provider name: "openai-secondary".
-    if let Ok(base_url) = std::env::var("OPENAI_SECONDARY_BASE_URL") {
+    if let Ok(base_url) = std::env::var(non_preset_env::OPENAI_SECONDARY_BASE_URL) {
         let mut cfg = OpenAiCompatibleConfig::openai();
         cfg.name = "openai-secondary".to_string();
         cfg.display_name = "OpenAI Secondary".to_string();
@@ -319,11 +409,11 @@ fn register_providers_from_env(gateway: &Gateway) {
 
     // Register Azure OpenAI if configured
     if let (Some(api_key), Some(base_url), Some(deployment)) = (
-        std::env::var("AZURE_OPENAI_API_KEY").ok(),
-        std::env::var("AZURE_OPENAI_ENDPOINT").ok(),
-        std::env::var("AZURE_OPENAI_DEPLOYMENT").ok(),
+        std::env::var(non_preset_env::AZURE_OPENAI_API_KEY).ok(),
+        std::env::var(non_preset_env::AZURE_OPENAI_ENDPOINT).ok(),
+        std::env::var(non_preset_env::AZURE_OPENAI_DEPLOYMENT).ok(),
     ) {
-        let api_version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
+        let api_version = std::env::var(non_preset_env::AZURE_OPENAI_API_VERSION).ok();
         gateway.register_provider(Arc::new(OpenAiCompatibleProvider::azure(
             &api_key,
             &base_url,
@@ -334,251 +424,28 @@ fn register_providers_from_env(gateway: &Gateway) {
     }
 
     // OpenAI-compatible vendors: registered when their API-key env var is set.
-    // Adding a vendor is one table row (plus its `OpenAiCompatibleConfig`
-    // preset). Row = (API-key env var, config factory, display name).
-    // Keep in sync with `himadri_core::KNOWN_PROVIDER_TYPES` and the preset
-    // match in `gateway::providers::build_provider_client` (drift there is
-    // caught by `build_provider_client_agrees_with_known_provider_registry`).
-    type ProviderPreset = (&'static str, fn() -> OpenAiCompatibleConfig, &'static str);
-    let openai_compatible: &[ProviderPreset] = &[
-        (
-            "OPENROUTER_API_KEY",
-            OpenAiCompatibleConfig::openrouter,
-            "OpenRouter",
-        ),
-        (
-            "TOGETHER_API_KEY",
-            OpenAiCompatibleConfig::together_ai,
-            "Together AI",
-        ),
-        ("GROQ_API_KEY", OpenAiCompatibleConfig::groq, "Groq"),
-        (
-            "FIREWORKS_API_KEY",
-            OpenAiCompatibleConfig::fireworks,
-            "Fireworks AI",
-        ),
-        (
-            "DEEPINFRA_API_KEY",
-            OpenAiCompatibleConfig::deepinfra,
-            "DeepInfra",
-        ),
-        (
-            "CEREBRAS_API_KEY",
-            OpenAiCompatibleConfig::cerebras,
-            "Cerebras",
-        ),
-        (
-            "NOVITA_API_KEY",
-            OpenAiCompatibleConfig::novita,
-            "Novita AI",
-        ),
-    ];
-    for &(env_var, config_fn, display_name) in openai_compatible {
-        if std::env::var(env_var).is_ok() {
-            gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(config_fn())));
-            info!("Registered {} provider", display_name);
+    //
+    // The vendor list, its display names, and its type names all come from the
+    // one preset table in `himadri_provider::compatible` — the same table DB
+    // mode's registry builds from. Adding a row there enables the vendor in both
+    // modes; there is nothing to edit here.
+    //
+    // `openai` is skipped: it is registered unconditionally above (with its
+    // OPENAI_BASE_URL override) rather than gated on a key.
+    for (provider_type, preset) in himadri_provider::compatible::presets() {
+        if provider_type == "openai" {
+            continue;
         }
+        if std::env::var(himadri::wire::providers::api_key_env_var(provider_type)).is_err() {
+            continue;
+        }
+        let config = preset();
+        info!("Registered {} provider", config.display_name);
+        gateway.register_provider(Arc::new(OpenAiCompatibleProvider::new(config)));
     }
 }
 
-/// Whether any scope of `config` turns the PII guardrail on. Presence of
-/// an org/team `pii` section counts even when currently disabled: the
-/// operator clearly intends to manage guardrails via config, so an engine
-/// build failure must be fatal, not silent.
-#[cfg(feature = "guardrails")]
-fn config_mentions_pii(config: &Config) -> bool {
-    config.guardrails.pii.enabled
-        || config.orgs.values().any(|org| {
-            org.guardrails.pii.is_some()
-                || org
-                    .teams
-                    .values()
-                    .any(|team| team.guardrails.pii.is_some())
-        })
-}
 
-fn config_mentions_pii_response(config: &Config) -> bool {
-    use himadri_core::PiiResponseModeConfig;
-    config.guardrails.pii.response_mode != PiiResponseModeConfig::Off
-        || config.orgs.values().any(|org| {
-            org.guardrails
-                .pii
-                .as_ref()
-                .map_or(false, |pii| pii.response_mode != PiiResponseModeConfig::Off)
-                || org
-                    .teams
-                    .values()
-                    .any(|team| {
-                        team.guardrails
-                            .pii
-                            .as_ref()
-                            .map_or(false, |pii| pii.response_mode != PiiResponseModeConfig::Off)
-                    })
-        })
-}
-
-/// Assemble the plugin pipeline (PII guardrail, word filter, max-token,
-/// request logger, and the env-configured budget and rate-limit plugins).
-#[allow(unused_variables)] // config/handle/metrics unused without the guardrails feature
-fn wire_plugins(
-    config: &Config,
-    config_handle: Arc<tokio::sync::RwLock<Config>>,
-    metrics: &Arc<Metrics>,
-) -> himadri_plugin::PluginManager {
-    let mut plugin_manager = himadri_plugin::PluginManager::new();
-
-    // PII guardrail: always registered (feature-gated) and resolved per
-    // request against the live config, so orgs can be onboarded/opted out
-    // via /admin/config reloads without a restart. Runtime activation is
-    // GUARDRAILS_PII_MODE (global default) and/or `guardrails.pii` config
-    // sections; with neither, the plugin no-ops per request. Registered
-    // first so every downstream plugin (word filter, logger, budget) and
-    // the response cache see redacted content.
-    #[cfg(feature = "guardrails")]
-    {
-        let defaults = himadri_plugins::PiiGuardrailSettings::from_env();
-        let response_defaults = himadri_plugins::PiiResponseSettings::from_env();
-        // Fail closed if guardrails (request or response) are configured.
-        let configured = defaults.is_some()
-            || response_defaults.is_some()
-            || config_mentions_pii(config)
-            || config_mentions_pii_response(config);
-        match himadri_plugins::RedactCoreEngine::new(himadri_plugins::EngineSecrets::from_env()) {
-            Ok(engine) => {
-                match &defaults {
-                    Some(settings) => info!(
-                        "Registered PII guardrail (global default mode: {:?}, strategy: {:?})",
-                        settings.mode, settings.options.strategy
-                    ),
-                    None => info!(
-                        "Registered PII guardrail (no global default; config-driven per org/team)"
-                    ),
-                }
-                let engine: std::sync::Arc<dyn himadri_plugins::PiiEngine> = engine;
-                plugin_manager.register(himadri_plugins::PiiGuardrailPlugin::with_config(
-                    engine.clone(),
-                    defaults,
-                    config_handle.clone(),
-                    Some(metrics.clone()),
-                ));
-                // Response-side scanning (mode from `response_mode` config
-                // fields / GUARDRAILS_PII_RESPONSE_MODE). Same engine, same
-                // per-scope resolution. Off by default.
-                plugin_manager.register_response_guardrail(
-                    himadri_plugins::PiiResponseGuardrail::with_config(
-                        engine,
-                        himadri_plugins::PiiResponseSettings::from_env(),
-                        config_handle,
-                        Some(metrics.clone()),
-                    ),
-                );
-            }
-            // Refuse to start rather than silently run without a guardrail
-            // the operator explicitly configured (fail-closed, SPEC §6.3).
-            Err(e) if configured => {
-                panic!("PII guardrail configured but engine failed to build: {e}")
-            }
-            Err(e) => tracing::error!(
-                "PII guardrail engine failed to build; guardrails unavailable: {e}"
-            ),
-        }
-    }
-
-    // Word filter is opt-in: WORD_FILTER_BLOCKLIST is a comma-separated
-    // list of blocked words. (A hardcoded default blocklist used to reject
-    // any prompt containing e.g. "password" on every deployment.)
-    if let Ok(blocklist) = std::env::var("WORD_FILTER_BLOCKLIST") {
-        let words: Vec<String> = blocklist
-            .split(',')
-            .map(|w| w.trim().to_string())
-            .filter(|w| !w.is_empty())
-            .collect();
-        if !words.is_empty() {
-            info!(
-                "Registered word filter with {} blocked word(s)",
-                words.len()
-            );
-            plugin_manager.register(WordFilterPlugin::new(words));
-        }
-    }
-
-    // Global max_tokens cap is opt-in via MAX_TOKENS_LIMIT (used to be a
-    // hardcoded 4096 that rejected any larger request).
-    if let Some(limit) = std::env::var("MAX_TOKENS_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    {
-        info!("Registered max-token cap of {}", limit);
-        plugin_manager.register(MaxTokenPlugin::new(limit));
-    }
-
-    plugin_manager.register(RequestLoggerPlugin::new());
-
-    // Register the budget plugin when a global spend limit and/or token pricing
-    // is configured. Pricing alone is enough: per-principal caps (e.g. a JWT
-    // `budget_limit_usd` claim) are enforced against accumulated cost, which
-    // requires pricing but not a global limit.
-    let global_spend_limit = std::env::var("BUDGET_SPEND_LIMIT_USD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok());
-    let input_per_m = std::env::var("BUDGET_INPUT_PER_M_TOKENS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok());
-    let output_per_m = std::env::var("BUDGET_OUTPUT_PER_M_TOKENS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok());
-
-    if global_spend_limit.is_some() || input_per_m.is_some() || output_per_m.is_some() {
-        match BudgetPlugin::new(BudgetConfig {
-            spend_limit_usd: Some(global_spend_limit.unwrap_or(0.0)),
-            input_per_m_tokens: input_per_m,
-            output_per_m_tokens: output_per_m,
-            ..Default::default()
-        }) {
-            Ok(budget_plugin) => {
-                plugin_manager.register(budget_plugin);
-                match global_spend_limit {
-                    Some(limit) => info!(
-                        "Registered budget plugin (global ${:.2} limit; per-principal caps honored)",
-                        limit
-                    ),
-                    None => info!(
-                        "Registered budget plugin (no global limit; per-principal caps honored)"
-                    ),
-                }
-            }
-            Err(e) => tracing::error!("Budget plugin not registered: {}", e),
-        }
-    }
-
-    // Register the rate-limit plugin when a per-key and/or per-IP limit is
-    // configured. Both scopes share one plugin, and the global limiter stays
-    // unset so configuring a key/IP limit doesn't silently impose an
-    // unrelated global request cap.
-    let key_rpm = std::env::var("RATE_LIMIT_KEY_RPM")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    let ip_rpm = std::env::var("RATE_LIMIT_IP_RPM")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
-    if key_rpm.is_some() || ip_rpm.is_some() {
-        if let Ok(rl_plugin) = RateLimitPlugin::new(RateLimitConfig {
-            key_rpm,
-            ip_rpm,
-            ..Default::default()
-        }) {
-            plugin_manager.register(rl_plugin);
-            if let Some(rpm) = key_rpm {
-                info!("Registered rate limit: {} RPM per key", rpm);
-            }
-            if let Some(rpm) = ip_rpm {
-                info!("Registered rate limit: {} RPM per IP", rpm);
-            }
-        }
-    }
-
-    plugin_manager
-}
 
 /// Connect the API-key store and admin handlers (with provider/model stores
 /// when DATABASE_URL is set), plus the master-key auth middleware.
@@ -639,10 +506,8 @@ async fn init_jwt_discovery() -> Option<Arc<himadri_auth::OidcDiscovery>> {
                     info!("JWT/OIDC authentication enabled (issuer: {})", issuer);
                     // Periodically refresh the JWKS so rotated signing keys are
                     // picked up without a restart.
-                    let refresh_secs = std::env::var("JWT_JWKS_REFRESH_SECS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(3600);
+                    let refresh_secs =
+                        himadri_core::env::parse_var("JWT_JWKS_REFRESH_SECS").unwrap_or(3600u64);
                     let refresher = discovery.clone();
                     tokio::spawn(async move {
                         let interval = std::time::Duration::from_secs(refresh_secs);

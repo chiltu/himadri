@@ -17,6 +17,17 @@ use himadri_core::{
     Config, ContentPart, MessageContent, PiiGuardrailConfig, PiiModeConfig, PiiStrategyConfig,
     Role,
 };
+
+/// The org/team PII section governing this request, if any: the most specific
+/// scope with an explicit `guardrails.pii` wins wholesale — including
+/// `enabled: false` to opt out of a global policy. Interpretation of the
+/// section (request mode vs response mode) stays with each caller.
+fn scoped_pii_section<'a>(cfg: &'a Config, ctx: &PluginContext) -> Option<&'a PiiGuardrailConfig> {
+    cfg.scopes(ctx.org_id(), ctx.team_id())
+        .iter()
+        .rev()
+        .find_map(|scope| scope.guardrails.pii.as_ref())
+}
 use himadri_observability::Metrics;
 use tokio::sync::RwLock;
 use himadri_plugin::context::PluginContext;
@@ -157,37 +168,28 @@ fn options_from_env() -> RedactOptions {
         }
     }
     if let Ok(v) = std::env::var("GUARDRAILS_PII_ENTITIES") {
-        let set: std::collections::HashSet<String> = v
-            .split(',')
-            .map(|e| e.trim().to_ascii_uppercase())
-            .filter(|e| !e.is_empty())
+        let set: std::collections::HashSet<String> = himadri_core::env::split_csv(&v)
+            .into_iter()
+            .map(|e| e.to_ascii_uppercase())
             .collect();
         if !set.is_empty() {
             options.entities = Some(set);
         }
     }
-    if let Some(v) = std::env::var("GUARDRAILS_PII_MIN_CONFIDENCE")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-    {
+    if let Some(v) = himadri_core::env::parse_var::<f32>("GUARDRAILS_PII_MIN_CONFIDENCE") {
         options.min_confidence = v;
     }
     options
 }
 
 fn fail_open_from_env() -> bool {
-    std::env::var("GUARDRAILS_PII_FAIL_OPEN")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    himadri_core::env::flag_is_truthy("GUARDRAILS_PII_FAIL_OPEN")
 }
 
 /// Above this total scanned size the engine runs on the blocking pool.
 /// Deployment-wide operational knob (env), not per-scope policy.
 fn inline_limit_from_env() -> usize {
-    std::env::var("GUARDRAILS_INLINE_LIMIT_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16 * 1024)
+    himadri_core::env::parse_var("GUARDRAILS_INLINE_LIMIT_BYTES").unwrap_or(16 * 1024)
 }
 
 /// Where a scanned string lives in the request, for write-back.
@@ -253,16 +255,10 @@ impl PiiGuardrailPlugin {
     async fn effective_settings(&self, ctx: &PluginContext) -> Option<PiiGuardrailSettings> {
         if let Some(handle) = &self.config {
             let cfg = handle.read().await;
-            if let Some(org) = ctx.org_id().and_then(|org_id| cfg.orgs.get(org_id)) {
-                let team_pii = ctx
-                    .team_id()
-                    .and_then(|team_id| org.teams.get(team_id))
-                    .and_then(|team| team.guardrails.pii.as_ref());
-                if let Some(pii) = team_pii.or(org.guardrails.pii.as_ref()) {
-                    // Wholesale override: an explicit section decides
-                    // entirely, including disabling a global policy.
-                    return pii.enabled.then(|| PiiGuardrailSettings::from_config(pii));
-                }
+            if let Some(pii) = scoped_pii_section(&cfg, ctx) {
+                // Wholesale override: an explicit section decides
+                // entirely, including disabling a global policy.
+                return pii.enabled.then(|| PiiGuardrailSettings::from_config(pii));
             }
             if cfg.guardrails.pii.enabled {
                 return Some(PiiGuardrailSettings::from_config(&cfg.guardrails.pii));
@@ -638,16 +634,10 @@ impl PiiResponseGuardrail {
 
         if let Some(handle) = &self.config {
             let cfg = handle.read().await;
-            if let Some(org) = ctx.org_id().and_then(|org_id| cfg.orgs.get(org_id)) {
-                let team_pii = ctx
-                    .team_id()
-                    .and_then(|team_id| org.teams.get(team_id))
-                    .and_then(|team| team.guardrails.pii.as_ref());
-                if let Some(pii) = team_pii.or(org.guardrails.pii.as_ref()) {
-                    // Wholesale override: a present section decides
-                    // entirely, including turning response scanning off.
-                    return active(pii);
-                }
+            if let Some(pii) = scoped_pii_section(&cfg, ctx) {
+                // Wholesale override: a present section decides
+                // entirely, including turning response scanning off.
+                return active(pii);
             }
             if let Some(settings) = active(&cfg.guardrails.pii) {
                 return Some(settings);

@@ -39,6 +39,16 @@ impl AdminHandlers {
         }
     }
 
+    /// Whether the model/endpoint stores are connected — i.e. whether the
+    /// database can actually supply routing.
+    ///
+    /// False both when no `DATABASE_URL` is configured *and* when connecting
+    /// failed: the stores are optional, so a connection failure is otherwise
+    /// indistinguishable from "not configured" (reads just return empty).
+    pub fn has_model_stores(&self) -> bool {
+        self.model_store.is_some() && self.model_endpoint_store.is_some()
+    }
+
     pub fn with_model_stores(
         mut self,
         model_store: ModelStoreBackend,

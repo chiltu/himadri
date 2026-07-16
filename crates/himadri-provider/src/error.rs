@@ -28,6 +28,15 @@ pub enum ProviderError {
 
     #[error("operation not supported: {0}")]
     Unsupported(String),
+
+    #[error("unknown provider type: {0}")]
+    UnknownType(String),
+
+    #[error("missing base_url for provider: {0}")]
+    MissingBaseUrl(String),
+
+    #[error("invalid provider configuration: {0}")]
+    InvalidConfiguration(String),
 }
 
 impl ProviderError {
@@ -60,6 +69,9 @@ impl ProviderError {
             ProviderError::Parse(_) => 500,
             ProviderError::Internal(_) => 500,
             ProviderError::Unsupported(_) => 501,
+            ProviderError::UnknownType(_) => 400,
+            ProviderError::MissingBaseUrl(_) => 400,
+            ProviderError::InvalidConfiguration(_) => 400,
         }
     }
 }
@@ -159,6 +171,13 @@ impl From<ProviderError> for himadri_core::GatewayError {
             ProviderError::Internal(msg) => G::Internal(msg),
             ProviderError::Unsupported(msg) => {
                 G::BadRequest(format!("operation not supported: {}", msg))
+            }
+            ProviderError::UnknownType(msg) => G::BadRequest(format!("unknown provider type: {}", msg)),
+            ProviderError::MissingBaseUrl(msg) => {
+                G::BadRequest(format!("missing base_url for provider: {}", msg))
+            }
+            ProviderError::InvalidConfiguration(msg) => {
+                G::BadRequest(format!("invalid provider configuration: {}", msg))
             }
         }
     }

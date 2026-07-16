@@ -1,13 +1,15 @@
-//! Single source of truth for the provider types the gateway knows how to
-//! build a client for without an explicit `base_url`.
+//! The provider types the gateway *advertises*: the admin API serves this list
+//! on `GET /admin/known-providers`, the web UI's provider picker fetches it
+//! from there, and `/v1/models` filters against it.
 //!
-//! Three places previously hardcoded this list independently (the gateway's
-//! client factory, env-var provider registration, and the web UI's provider
-//! picker), so adding a vendor meant editing all three and forgetting one
-//! produced models that list in `/v1/models` but 404 on completion. The
-//! gateway's client factory must keep constructing a client for every entry
-//! here (enforced by a test in `himadri::gateway`), the admin API serves the
-//! list on `GET /admin/known-providers`, and the web UI fetches it from there.
+//! The *executable* truth is `himadri_provider`'s `ProviderRegistry` — what the
+//! target rebuild actually builds clients from. This list mirrors it statically
+//! for consumers that cannot reach it (himadri-admin depends on himadri-core
+//! only). The two are pinned to exactly the same set, in both directions, by
+//! the tests in `himadri::wire::providers`: a type advertised here that the
+//! registry cannot build would list in `/v1/models` and then 404 on every
+//! completion, and a registered type missing here would route but never be
+//! offered in the UI.
 
 /// Provider types with a built-in preset (default base URL, auth scheme,
 /// extra headers). Endpoints of any other `provider_type` are routable only
@@ -31,10 +33,14 @@ pub fn is_known_provider_type(provider_type: &str) -> bool {
 }
 
 /// Whether a model endpoint can actually be routed: a known preset type, or
-/// any type with an explicit non-empty `base_url`. This is the same rule the
-/// gateway's target rebuild applies when it skips endpoints, and `/v1/models`
-/// must apply it too — otherwise a model advertises in the catalog and then
-/// 404s on every completion.
+/// any type with an explicit non-empty `base_url`.
+///
+/// The static mirror of the rule `ProviderRegistry::build` applies when the
+/// target rebuild skips an endpoint. `/v1/models` must apply the same rule —
+/// otherwise a model advertises in the catalog and then 404s on every
+/// completion — but cannot reach the registry from himadri-admin, hence the
+/// duplicate; the drift tests in `himadri::wire::providers` keep them in
+/// agreement.
 pub fn endpoint_is_routable(provider_type: &str, base_url: Option<&str>) -> bool {
     is_known_provider_type(provider_type) || base_url.map(str::trim).is_some_and(|s| !s.is_empty())
 }

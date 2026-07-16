@@ -17,7 +17,7 @@ use himadri_core::{
 };
 use himadri_observability::Metrics;
 
-use himadri::gateway::Gateway;
+use himadri::gateway::{Gateway, OnEmpty};
 
 /// Maximum buffered body size for the `/v1/*` passthrough proxy (10 MiB).
 /// Large enough for typical multimodal/base64 payloads, bounded to prevent
@@ -654,8 +654,23 @@ impl AppState {
                 return;
             }
         };
+        // An empty result means "nothing routes" only when the database
+        // already owned routing — there the operator just disabled or deleted
+        // the last endpoint, and keeping the old targets would leave a
+        // disabled endpoint serving traffic.
+        //
+        // While env/config targets are live, an empty DB must not replace
+        // them: creating the first model of an onboarding flow — before it
+        // has any endpoint — produces zero targets, and applying that would
+        // take routing down on a mutation the operator never meant as a
+        // shutdown. Skips are warned by the rebuild itself.
+        let on_empty = if self.gateway.db_owns_routing().await {
+            OnEmpty::Apply
+        } else {
+            OnEmpty::KeepPrevious
+        };
         self.gateway
-            .rebuild_targets_from_db(&models, &endpoints)
+            .rebuild_targets_from_db(&models, &endpoints, on_empty)
             .await;
     }
 
@@ -666,8 +681,11 @@ impl AppState {
     /// tables are populated they are the source of truth, so a config save
     /// would otherwise silently drop every DB-registered provider/model from
     /// routing until the next provider/model mutation. Re-running the DB
-    /// rebuild here keeps the two in sync. When the DB has no providers the
-    /// config-supplied targets stand, preserving env/file-driven deployments.
+    /// rebuild here keeps the two in sync. When the DB produces no targets the
+    /// config-supplied targets stand (`OnEmpty::KeepPrevious`), preserving
+    /// env/file-driven deployments — including when the DB holds enabled rows
+    /// whose provider types the registry can't build, a case the old
+    /// enabled-flags guard couldn't see and that wiped routing entirely.
     async fn reassert_db_targets_after_config(&self) {
         // A store error keeps the config-supplied targets (same reasoning as
         // `rebuild_targets`: never replace live routing over a failed read).
@@ -681,15 +699,44 @@ impl AppState {
                 return;
             }
         };
-        // Guard on *active* targets, not merely on rows existing: a DB whose
-        // endpoints are all disabled would rebuild to an empty target list and
-        // wipe the config's own targets — a full routing outage.
-        if !Gateway::db_has_active_targets(&models, &endpoints) {
-            return;
-        }
-        self.gateway
-            .rebuild_targets_from_db(&models, &endpoints)
+        let outcome = self
+            .gateway
+            .rebuild_targets_from_db(&models, &endpoints, OnEmpty::KeepPrevious)
             .await;
+        if !outcome.applied && !outcome.skipped.is_empty() {
+            tracing::warn!(
+                "DB produced no routing targets after config apply ({} endpoint(s) unbuildable); config targets kept",
+                outcome.skipped.len()
+            );
+        }
+    }
+
+    /// Reject an endpoint whose `provider_type`/`base_url` pair the gateway
+    /// could never build a client for.
+    ///
+    /// Without this the row persists and is then silently skipped on every
+    /// rebuild: the endpoint shows up in the admin UI but never routes, and the
+    /// only evidence is a log line. Asking the registry — the same thing rebuild
+    /// asks — means the answer cannot drift from what actually routes.
+    fn validate_endpoint_provider(
+        &self,
+        provider_type: &str,
+        base_url: Option<&str>,
+    ) -> Result<(), ApiError> {
+        self.gateway
+            .provider_registry()
+            .validate(provider_type, base_url)
+            .map_err(|e| {
+                tracing::warn!("Rejected endpoint provider_type on write: {e}");
+                ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "{e}. Use a built-in provider type (see GET /admin/known-providers), \
+                         or supply a base_url to route a custom vendor through a generic \
+                         OpenAI-compatible client."
+                    ),
+                )
+            })
     }
 
     /// 201 + entity on success (rebuilding targets); errors map per
@@ -855,6 +902,8 @@ pub(crate) async fn create_model_endpoint(
     Path(model_id): Path<String>,
     Json(request): Json<himadri_admin::CreateModelEndpointRequest>,
 ) -> Result<(StatusCode, Json<himadri_admin::ModelEndpoint>), ApiError> {
+    state.validate_endpoint_provider(&request.provider_type, request.base_url.as_deref())?;
+
     // Redact before the HTTP response — create may return a plaintext key for
     // internal use, but clients (and logs that capture bodies) must never see it.
     let result = state
@@ -883,6 +932,29 @@ pub(crate) async fn update_model_endpoint(
     Path(id): Path<String>,
     Json(request): Json<himadri_admin::UpdateModelEndpointRequest>,
 ) -> Result<Json<himadri_admin::ModelEndpoint>, ApiError> {
+    // Validate the pair the update will actually produce, not the request fields
+    // in isolation. Checking those alone is wrong in both directions: a
+    // base_url-only edit (including `Some(None)`, which clears it) would skip the
+    // check entirely, and switching provider_type to a custom vendor would be
+    // rejected for lacking a base_url the stored row already carries.
+    //
+    // `effective_routing_pair` is the same merge both store backends persist
+    // with, so validation and the write cannot disagree about it.
+    //
+    // Not atomic with the write: two concurrent updates can each validate
+    // against a pre-merge snapshot and still land an unroutable pair. Closing
+    // that needs validation inside the store's write transaction (its error
+    // type would have to carry a client-visible rejection, not just
+    // `sqlx::Error` → 500), and a process-local lock would not close it across
+    // replicas anyway. The rebuild's skip-and-warn is the backstop.
+    let current = state
+        .admin
+        .get_endpoint(&id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    let (provider_type, base_url) = request.effective_routing_pair(&current);
+    state.validate_endpoint_provider(&provider_type, base_url.as_deref())?;
+
     let result = state
         .admin
         .update_endpoint(&id, request)
@@ -904,6 +976,20 @@ pub(crate) async fn toggle_model_endpoint(
     Path(id): Path<String>,
     Json(body): Json<ToggleBody>,
 ) -> Result<Json<himadri_admin::ModelEndpoint>, ApiError> {
+    // Enabling re-creates exactly the state create/update reject: a row the
+    // registry can't build shows as enabled in the UI and is then skipped on
+    // every rebuild, with only a log line as evidence. Disabling needs no
+    // check — and must keep working, so an unroutable legacy row can still be
+    // turned off.
+    if body.enabled {
+        let current = state
+            .admin
+            .get_endpoint(&id)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+        state.validate_endpoint_provider(&current.provider_type, current.base_url.as_deref())?;
+    }
+
     let result = state
         .admin
         .toggle_endpoint(&id, body.enabled)
@@ -1071,6 +1157,326 @@ fn trusted_proxy_ip(headers: &axum::http::HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod endpoint_provider_validation_tests {
+    use super::*;
+
+    /// Real `AppState` over a temp sqlite store, plus a model to hang endpoints
+    /// off. The e2e suites wrap `AdminHandlers` directly, so they never exercise
+    /// these handlers — this covers them.
+    async fn state_with_model() -> (AppState, String) {
+        let db_path =
+            std::env::temp_dir().join(format!("himadri-epval-{}.db", uuid::Uuid::new_v4()));
+        let db_url = format!("sqlite://{}", db_path.display());
+
+        let sqlite = himadri_admin::store::SqliteStore::new(&db_url)
+            .await
+            .expect("sqlite store should connect");
+        let (model_store, endpoint_store) = himadri_admin::connect_model_stores(&db_url, None)
+            .await
+            .expect("sqlite model stores should connect");
+        let admin = AdminHandlers::new(himadri_admin::StoreBackend::Sqlite(Arc::new(sqlite)))
+            .with_model_stores(model_store, endpoint_store);
+
+        let gateway = Arc::new(Gateway::new(Config::default(), Arc::new(Metrics::new())));
+        let state = AppState {
+            metrics: gateway.metrics(),
+            gateway,
+            admin: Arc::new(admin),
+            admin_login: None,
+        };
+
+        let model = state
+            .admin
+            .create_model(himadri_admin::CreateModelRequest {
+                name: "m1".to_string(),
+                display_name: None,
+                enabled: true,
+            })
+            .await
+            .expect("model create should succeed");
+
+        (state, model.id)
+    }
+
+    /// Targets reduced to their identity, since `Target` isn't `PartialEq`.
+    fn snapshot(targets: &[himadri_core::Target]) -> Vec<(Option<String>, String)> {
+        targets
+            .iter()
+            .map(|t| (t.id.clone(), t.provider.clone()))
+            .collect()
+    }
+
+    fn create_req(
+        provider_type: &str,
+        base_url: Option<&str>,
+    ) -> himadri_admin::CreateModelEndpointRequest {
+        himadri_admin::CreateModelEndpointRequest {
+            provider_type: provider_type.to_string(),
+            base_url: base_url.map(str::to_string),
+            api_key: Some("sk-test".to_string()),
+            weight: 1.0,
+            enabled: true,
+        }
+    }
+
+    async fn create(
+        state: &AppState,
+        model_id: &str,
+        provider_type: &str,
+        base_url: Option<&str>,
+    ) -> Result<himadri_admin::ModelEndpoint, ApiError> {
+        create_model_endpoint(
+            State(state.clone()),
+            Path(model_id.to_string()),
+            Json(create_req(provider_type, base_url)),
+        )
+        .await
+        .map(|(_, Json(ep))| ep)
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unregistered_type_without_base_url() {
+        let (state, model_id) = state_with_model().await;
+
+        let err = create(&state, &model_id, "mystery-vendor", None)
+            .await
+            .expect_err("an unroutable endpoint must not be created");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("mystery-vendor"),
+            "message should name the offending type, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn create_accepts_builtin_type_and_custom_vendor_with_base_url() {
+        let (state, model_id) = state_with_model().await;
+
+        assert!(create(&state, &model_id, "openai", None).await.is_ok());
+        assert!(
+            create(&state, &model_id, "my-vllm", Some("https://vllm.example/v1"))
+                .await
+                .is_ok(),
+            "a custom vendor with an explicit base_url is routable"
+        );
+    }
+
+    /// The pair that matters is the one the update *produces*. Clearing the
+    /// base_url of a custom vendor leaves it unroutable, so it must be rejected —
+    /// a check that only looked at `request.provider_type` would miss this
+    /// entirely, since provider_type isn't being changed.
+    #[tokio::test]
+    async fn update_rejects_clearing_the_base_url_a_custom_vendor_depends_on() {
+        let (state, model_id) = state_with_model().await;
+        let ep = create(&state, &model_id, "my-vllm", Some("https://vllm.example/v1"))
+            .await
+            .expect("custom vendor with base_url should create");
+
+        let err = update_model_endpoint(
+            State(state.clone()),
+            Path(ep.id.clone()),
+            Json(himadri_admin::UpdateModelEndpointRequest {
+                base_url: Some(None), // clear it
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("clearing the base_url must not leave an unroutable endpoint");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The mirror case: switching to a custom vendor while the stored base_url
+    /// stays put is valid. Validating `request.provider_type` against
+    /// `request.base_url` (which is None here, meaning "unchanged") would reject
+    /// this for a missing base_url the row already has.
+    #[tokio::test]
+    async fn update_accepts_switching_type_when_the_stored_base_url_still_serves_it() {
+        let (state, model_id) = state_with_model().await;
+        let ep = create(&state, &model_id, "openai", Some("https://proxy.example/v1"))
+            .await
+            .expect("openai with a base_url override should create");
+
+        let updated = update_model_endpoint(
+            State(state.clone()),
+            Path(ep.id.clone()),
+            Json(himadri_admin::UpdateModelEndpointRequest {
+                provider_type: Some("my-vllm".to_string()),
+                ..Default::default() // base_url untouched
+            }),
+        )
+        .await
+        .expect("the stored base_url still makes this routable");
+
+        assert_eq!(updated.0.provider_type, "my-vllm");
+        assert_eq!(
+            updated.0.base_url.as_deref(),
+            Some("https://proxy.example/v1")
+        );
+    }
+
+    /// First test for `reassert_db_targets_after_config` (three call sites,
+    /// previously untested). The DB holds an enabled model with an enabled but
+    /// unbuildable endpoint — created through `state.admin` directly, which
+    /// bypasses the handler's registry validation exactly like a row predating
+    /// it or one written straight to the DB. The old `db_has_active_targets`
+    /// guard approved this shape and the rebuild then wiped the config's own
+    /// targets; now the empty result must leave them standing.
+    #[tokio::test]
+    async fn reassert_keeps_config_targets_when_db_rows_are_unbuildable() {
+        let (state, model_id) = state_with_model().await;
+
+        state
+            .admin
+            .create_endpoint(&model_id, create_req("mystery-vendor", None))
+            .await
+            .expect("direct store write bypasses handler validation");
+
+        let before = snapshot(&state.gateway.config_handle().read().await.targets);
+        assert!(!before.is_empty(), "default config must supply a target");
+
+        state.reassert_db_targets_after_config().await;
+
+        let after = snapshot(&state.gateway.config_handle().read().await.targets);
+        assert_eq!(
+            after, before,
+            "an unbuildable-only DB must not replace config targets"
+        );
+    }
+
+    /// Onboarding, the natural first step: an env-routed gateway with an empty
+    /// database, and the operator creates their first model — which has no
+    /// endpoint yet, so the rebuild computes zero targets. Applying that would
+    /// wipe the env/config targets and take routing down on a mutation the
+    /// operator never meant as a shutdown.
+    #[tokio::test]
+    async fn creating_a_model_before_its_endpoint_keeps_env_routing() {
+        // `state_with_model` writes through the store, so no rebuild has run:
+        // the gateway is still on its config/env targets.
+        let (state, _) = state_with_model().await;
+        let before = snapshot(&state.gateway.config_handle().read().await.targets);
+        assert!(!before.is_empty(), "default config must supply an env target");
+        assert!(
+            !state.gateway.db_owns_routing().await,
+            "precondition: env/config owns routing"
+        );
+
+        // The handler path is what triggers the rebuild.
+        create_model(
+            State(state.clone()),
+            Json(himadri_admin::CreateModelRequest {
+                name: "second-model".to_string(),
+                display_name: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .map(|(_, Json(m))| m)
+        .expect("creating a model should succeed");
+
+        let after = snapshot(&state.gateway.config_handle().read().await.targets);
+        assert_eq!(
+            after, before,
+            "an endpoint-less model must not wipe env/config routing"
+        );
+    }
+
+    /// The mirror: once the database owns routing, disabling the last endpoint
+    /// is a real "nothing routes" and must apply — keeping the previous targets
+    /// would leave a disabled endpoint serving traffic.
+    #[tokio::test]
+    async fn disabling_the_last_endpoint_empties_db_routing() {
+        let (state, model_id) = state_with_model().await;
+        let ep = create(&state, &model_id, "openai", None)
+            .await
+            .expect("endpoint create should succeed");
+        assert!(
+            state.gateway.db_owns_routing().await,
+            "precondition: the database owns routing once it has an endpoint"
+        );
+
+        toggle_model_endpoint(
+            State(state.clone()),
+            Path(ep.id.clone()),
+            Json(ToggleBody { enabled: false }),
+        )
+        .await
+        .map(|Json(ep)| ep)
+        .expect("disabling should succeed");
+
+        assert!(
+            state
+                .gateway
+                .config_handle()
+                .read()
+                .await
+                .targets
+                .is_empty(),
+            "disabling the last endpoint must empty routing, not leave it serving"
+        );
+    }
+
+    /// A legacy row the registry can't build must not become enableable through
+    /// the toggle route — that re-creates the "enabled in the UI, skipped on
+    /// every rebuild" state the create/update validation exists to prevent.
+    /// Disabling one must stay possible.
+    #[tokio::test]
+    async fn toggle_rejects_enabling_an_unroutable_endpoint_but_allows_disabling() {
+        let (state, model_id) = state_with_model().await;
+        // Written through the store, bypassing the handler's validation — the
+        // shape a row predating that check (or a direct DB write) has.
+        let ep = state
+            .admin
+            .create_endpoint(&model_id, create_req("mystery-vendor", None))
+            .await
+            .expect("direct store write bypasses handler validation");
+
+        let err = toggle_model_endpoint(
+            State(state.clone()),
+            Path(ep.id.clone()),
+            Json(ToggleBody { enabled: true }),
+        )
+        .await
+        .expect_err("enabling an unroutable endpoint must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("mystery-vendor"),
+            "message should name the offending type, got: {}",
+            err.1
+        );
+
+        toggle_model_endpoint(
+            State(state.clone()),
+            Path(ep.id.clone()),
+            Json(ToggleBody { enabled: false }),
+        )
+        .await
+        .map(|Json(ep)| ep)
+        .expect("disabling an unroutable row must stay possible");
+    }
+
+    /// A rejected write must not reach the store.
+    #[tokio::test]
+    async fn rejected_create_persists_nothing() {
+        let (state, model_id) = state_with_model().await;
+
+        let _ = create(&state, &model_id, "mystery-vendor", None).await;
+
+        let endpoints = state
+            .admin
+            .list_endpoints_by_model(&model_id)
+            .await
+            .expect("listing should succeed");
+        assert!(
+            endpoints.is_empty(),
+            "a rejected endpoint must not be persisted, found: {endpoints:?}"
+        );
+    }
 }
 
 #[cfg(test)]

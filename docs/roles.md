@@ -164,7 +164,7 @@ Access to ML-specific models and providers.
 {
   "ml-engineer": {
     "models": ["gpt-4o", "claude-3-5-sonnet", "*-large"],
-    "providers": ["openai", "bedrock", "anthropic"]
+    "providers": ["openai", "gemini", "anthropic"]
   }
 }
 ```
@@ -419,7 +419,7 @@ User                 →  user
       },
       "ml-engineer": {
         "models": ["gpt-4o", "claude-3-5-sonnet", "*-large"],
-        "providers": ["openai", "bedrock", "anthropic"]
+        "providers": ["openai", "gemini", "anthropic"]
       },
       "data-scientist": {
         "models": ["gpt-4o", "*-large"],

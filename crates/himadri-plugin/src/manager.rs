@@ -37,6 +37,24 @@ impl PluginManager {
         self.response_guardrails.push(guardrail);
     }
 
+    /// Names of the plugins registered for a stage, in execution order.
+    /// This is how composition is observed (wire-up tests, diagnostics) —
+    /// the stage vecs themselves stay private.
+    pub fn stage_names(&self, stage: Stage) -> Vec<&str> {
+        let plugins = match stage {
+            Stage::BeforeRequest => &self.before_request,
+            Stage::AfterRequest => &self.after_request,
+            Stage::AfterResponse => &self.after_response,
+            Stage::OnError => &self.on_error,
+        };
+        plugins.iter().map(|p| p.name()).collect()
+    }
+
+    /// Names of the response guardrails, in execution order.
+    pub fn response_guardrail_names(&self) -> Vec<&str> {
+        self.response_guardrails.iter().map(|g| g.name()).collect()
+    }
+
     #[instrument(skip(self, ctx), fields(plugin_count = self.before_request.len()))]
     pub async fn run_before(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
         for plugin in &self.before_request {

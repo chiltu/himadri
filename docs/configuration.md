@@ -106,6 +106,7 @@ JSON file.
 | `GATEWAY_CONFIG` | _(unset)_ | Path to a `.json` config file. Unset → built-in default config. |
 | `MASTER_KEY` | _(unset)_ | Bearer token for `/admin/*` and a global super-key for `/v1/*`. **Unset disables all authentication** (see [Authentication](#authentication)). |
 | `DATABASE_URL` | _(unset)_ | `sqlite://...` or `postgres://...`. Unset → in-memory store. See [Database](./database.md). |
+| `HIMADRI_PROVIDER_SOURCE` | `auto` | Provider-routing source. `auto`: env/config targets route until the database produces targets, which then own routing (env keys stay as the fallback). `db`: strict — env provider registration is skipped entirely; boot **fails** without `DATABASE_URL` or on an unrecognized value. Every boot logs one `Provider routing: …` line stating the active source. |
 | `PROVIDER_ENCRYPTION_KEY` | _(unset)_ | Base64-encoded 32-byte AES-256-GCM key (e.g. `openssl rand -base64 32`). Encrypts the `providers.api_key` column at rest. **Unset stores upstream provider API keys in plaintext** — set this in production. See [Encryption at rest](#encryption-at-rest). |
 
 ### Authentication (JWT/OIDC — e.g. Zitadel)
@@ -167,7 +168,7 @@ token, never the master key itself.
 | `GUARDRAILS_PII_ENTITIES` | _(all)_ | Comma-separated entity types to act on (e.g. `EMAIL_ADDRESS,US_SSN,CREDIT_CARD`). |
 | `GUARDRAILS_PII_MIN_CONFIDENCE` | `0.6` | Detections below this confidence are ignored. |
 | `GUARDRAILS_PII_SCAN_TOOL_ARGS` | `false` | Also scan tool-call argument strings. |
-| `GUARDRAILS_PII_FAIL_OPEN` | `false` | On engine errors, forward unscanned instead of failing the request (response side: allow instead of withholding). |
+| `GUARDRAILS_PII_FAIL_OPEN` | `false` | On engine errors, forward unscanned instead of failing the request (response side: allow instead of withholding). Truthy values are `1`, `true`, `yes` (previously only `true` was honored — `1`/`yes` were silently ignored and failed closed). |
 | `GUARDRAILS_PII_RESPONSE_MODE` | `off` | Global default for scanning **model output**: `observe`, `redact`, or `block`. Non-streaming only; for streams the check is post-hoc at stream end. |
 | `GUARDRAILS_HASH_SALT` | _(unset)_ | Salt for the `hash` strategy. Env-only secret — never part of the config file. |
 | `GUARDRAILS_ENCRYPTION_KEY` | _(unset)_ | Key for the `encrypt` strategy (required to use it). Env-only secret. |
@@ -186,20 +187,24 @@ token, never the master key itself.
 
 See [Budget limits](#budget-limits) for how global and per-principal caps interact.
 
-> **Bedrock note:** the Bedrock provider currently authenticates with a
-> `Bearer` token, which suits Bearer-compatible Bedrock frontends (e.g. AWS's
-> `bedrock-access-gateway`). Native AWS SigV4 signing is **not implemented**,
-> so it cannot talk to the AWS Bedrock runtime API directly; the
-> `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` variables only gate registration.
+### Provider registration
 
-### Providers (presence of the key registers the provider)
+OpenAI, Anthropic and Gemini are always registered. Every other provider is
+registered only when its variable(s) below are set. Each OpenAI-compatible vendor
+is gated on `{PROVIDER_TYPE}_API_KEY` — `openrouter` on `OPENROUTER_API_KEY`, and
+so on for the rest.
+
+This whole section applies to env/config routing. Once the database provides
+routing targets (models + endpoints via the admin API), it owns routing and the
+variables below stop feeding it — the gateway warns at boot naming any that are
+set, and they remain the routing *fallback* if the database stops producing
+targets. Under `HIMADRI_PROVIDER_SOURCE=db` they are never registered at all.
 
 | Variable(s) | Provider |
 |---|---|
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_SECONDARY_BASE_URL` | OpenAI (always registered; secondary base URL adds a fallback OpenAI target) |
 | _(always registered)_ | Anthropic, Gemini |
 | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT` (+ `AZURE_OPENAI_API_VERSION`, default `2024-10-21`) | Azure OpenAI |
-| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_REGION`, `AWS_SESSION_TOKEN`) | AWS Bedrock |
 | `OPENROUTER_API_KEY` | OpenRouter |
 | `TOGETHER_API_KEY` | Together AI |
 | `GROQ_API_KEY` | Groq |
@@ -270,7 +275,7 @@ file containing only `{ "targets": [...] }` is fine.
 
 | Field | Default | Description |
 |---|---|---|
-| `provider` | _(required)_ | Provider name: `openai`, `anthropic`, `gemini`, `azure`, `bedrock`, `openrouter`, `together`, `groq`, `fireworks`, `deepinfra`, `cerebras`, `novita`. |
+| `provider` | _(required)_ | The name the provider is registered under: `openai`, `openai-secondary`, `anthropic`, `gemini`, `azure-openai`, `openrouter`, `together`, `groq`, `fireworks`, `deepinfra`, `cerebras`, `novita`. Must match a registered provider (see [Provider registration](#provider-registration)) or the target never resolves. |
 | `weight` | `1.0` | Relative weight for `loadbalance`. |
 | `models` | `null` | Restrict this target to specific model IDs. |
 | `api_key_env` | `null` | Env var holding the API key for this target. |
@@ -459,7 +464,7 @@ Configured under `rbac` in the JSON config:
     "roles": {
       "analyst":     { "models": ["gpt-4o-mini"] },
       "engineer":    { "models": ["gpt-4o", "o1", "claude-*"] },
-      "ml-platform": { "providers": ["openai", "bedrock"] },
+      "ml-platform": { "providers": ["openai", "anthropic"] },
       "gateway-admin": {}
     }
   }
@@ -472,7 +477,7 @@ Semantics:
 - **`models` / `providers`** are allow-lists supporting `*` wildcards
   (`claude-*`, `*-mini`, `*`). A **missing/`null`** field means *no restriction*
   on that dimension for the role (e.g. `ml-platform` above may use any model but
-  only the `openai`/`bedrock` providers; `gateway-admin` with `{}` may use
+  only the `openai`/`anthropic` providers; `gateway-admin` with `{}` may use
   anything).
 - **Union across roles** — a principal holding multiple roles gets the most
   permissive combination.
@@ -521,7 +526,18 @@ The `orgs` map enforces per-organization policy, keyed by the principal's
 
 Guardrails (allowed/blocked models, blocked words, max tokens) are enforced on
 `/v1/chat/completions` and `/v1/embeddings`. Team config narrows org config for
-principals carrying a matching `team_id`.
+principals carrying a matching `team_id`:
+
+- **Cumulative rules** — model allow/block lists, token budgets, blocked words,
+  and `max_tokens_per_request` are enforced at *every* scope that states them;
+  a team can only add restrictions, never widen the org's.
+- **Per-scope switch** — each scope's `guardrails.enabled` gates only that
+  scope's own words/token guardrails (an org with guardrails off does not
+  switch off a team's).
+- **PII is the exception** — a scope's `guardrails.pii` section overrides
+  wholesale: the most specific scope with one decides entirely, including
+  `enabled: false` to opt a team out of a global or org policy (see
+  [PII guardrail](#pii-guardrail-guardrailspii)).
 
 > **Note:** these checks run on the typed inference endpoints. The transparent
 > `/v1/*` proxy fallback does **not** currently apply org guardrails.

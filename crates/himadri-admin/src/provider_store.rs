@@ -231,8 +231,9 @@ impl ModelEndpointStore {
     ) -> Result<Option<ModelEndpoint>, sqlx::Error> {
         let current = self.get(id).await?.ok_or(sqlx::Error::RowNotFound)?;
 
-        let provider_type = request.provider_type.unwrap_or(current.provider_type);
-        let base_url = request.base_url.unwrap_or(current.base_url);
+        // One definition of the merge, shared with the other backend and with
+        // the admin API's pre-write validation.
+        let (provider_type, base_url) = request.effective_routing_pair(&current);
         let weight = request.weight.unwrap_or(current.weight);
         let enabled = request.enabled.unwrap_or(current.enabled);
         let now = chrono::Utc::now().to_rfc3339();
